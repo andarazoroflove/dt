@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=dtPics
+Comment=dtPics — CDE Universal Image Viewer & Photo/Markup Studio.
+Exec=__HOME__/.local/bin/dtpics %f
+Icon=__HOME__/.dt/icons/dtpics.l.pm
+Terminal=false
+MimeType=image/png;image/jpeg;image/bmp;image/gif;image/heic;image/avif;image/jxl;image/webp;image/tiff;image/svg+xml;image/x-icon;

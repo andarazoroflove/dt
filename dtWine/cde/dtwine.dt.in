@@ -1,0 +1,22 @@
+set DtDbVersion=1.0
+
+ACTION dtWine
+{
+     LABEL         dtWine
+     ICON          dtwine
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtwine "%(File)Arg_1%"
+     DESCRIPTION   dtWine — CDE Classic Windows Game & Application Prefix Manager.
+}
+
+ACTION dtWine
+{
+     LABEL         dtWine
+     ARG_COUNT     0
+     ICON          dtwine
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtwine
+     DESCRIPTION   dtWine — CDE Classic Windows Game & Application Prefix Manager.
+}

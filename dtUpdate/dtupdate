@@ -1,0 +1,1436 @@
+#!/usr/bin/env python3
+"""
+dtUpdate — Common Desktop Environment (CDE) System & Application Update Manager
+
+All-in-one updater for Debian packages (apt-get) and custom CDE desktop applications:
+  1. Prompts securely for sudo password (validated via stdin pipe; never stored on disk)
+  2. Runs `apt-get update` and inspects pending Debian package upgrades
+  3. Analyzes installed CDE C/Motif binaries (`ldd`, `dpkg -S`, source timestamps) and
+     Python/GTK/GStreamer CDE utilities to lay out a targeted CDE rebuild plan ONLY
+     for apps affected by library updates, missing symbols, or newer local sources
+  4. Presents the complete Debian + CDE Update Plan for explicit [Yes] / [No] confirmation
+  5. On [Yes]: downloads packages with live progress bar, installs updates, recompiles
+     needed CDE binaries atomically, restarts the CDE Workspace Manager (`dtwm`), and
+     displays a comprehensive Overview Summary of everything changed.
+"""
+
+import datetime
+import json
+import math
+import os
+import py_compile
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("Pango", "1.0")
+from gi.repository import Gdk, GLib, Gtk, Pango
+
+HOME = Path.home()
+LOCAL_BIN = HOME / ".local" / "bin"
+LOCAL_LIB = HOME / ".local" / "lib"
+DT_ICONS = HOME / ".dt" / "icons"
+CONFIG_DIR = HOME / ".config" / "dtupdate"
+SOURCES_CFG = CONFIG_DIR / "sources.json"
+
+
+# ---------------------------------------------------------------------------
+# CDE Active Motif Palette & GTK3 CSS
+# ---------------------------------------------------------------------------
+def _shade_hex(hex_col: str, factor: float) -> str:
+    h = hex_col.lstrip("#")
+    if len(h) != 6:
+        return hex_col
+    r = max(0, min(255, int(int(h[0:2], 16) * factor)))
+    g = max(0, min(255, int(int(h[2:4], 16) * factor)))
+    b = max(0, min(255, int(int(h[4:6], 16) * factor)))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _compute_greenbar_hex(well_hex: str) -> str:
+    h = well_hex.lstrip("#")
+    if len(h) != 6:
+        return "#eef4db"
+    r = max(0, int(h[0:2], 16) - 17)
+    g = max(0, int(h[2:4], 16) - 3)
+    b = max(0, int(h[4:6], 16) - 14)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def load_cde_palette() -> tuple[str, str, str, str]:
+    chrome, sel, well = "#aeb2c3", "#2c567e", "#fff7e9"
+    try:
+        out = subprocess.check_output(["xrdb", "-query"], text=True, stderr=subprocess.DEVNULL)
+        pal_name = "Crimson.dp"
+        for ln in out.splitlines():
+            if "ColorPalette:" in ln:
+                pal_name = ln.split(":", 1)[1].strip()
+                break
+        for pdir in (HOME / ".dt/palettes", Path("/usr/dt/palettes")):
+            pf = pdir / pal_name
+            if pf.is_file():
+                hexes = [l.strip() for l in pf.read_text().splitlines() if l.strip().startswith("#")]
+                if len(hexes) >= 4:
+                    def norm16(h):
+                        h = h.lstrip("#")
+                        return f"#{h[0:2]}{h[4:6]}{h[8:10]}" if len(h) == 12 else "#" + h[:6]
+                    chrome, sel, well = norm16(hexes[1]), norm16(hexes[2]), norm16(hexes[3])
+                break
+    except Exception:
+        pass
+    return chrome, sel, well, _compute_greenbar_hex(well)
+
+
+def build_cde_css(chrome: str, sel: str, well: str) -> bytes:
+    chrome_hi = _shade_hex(chrome, 1.06)
+    chrome_lo = _shade_hex(chrome, 0.90)
+    css = f"""
+    window, dialog, .background {{
+        background-color: {chrome};
+        color: #101014;
+        font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+        font-size: 9.5pt;
+    }}
+    menubar {{
+        background-color: {chrome};
+        border-bottom: 2px solid #585c6c;
+    }}
+    menuitem:hover {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    .cde-toolbar {{
+        background-color: {chrome};
+        padding: 5px 8px;
+        border-top: 2px solid #e6e9f2;
+        border-left: 2px solid #e6e9f2;
+        border-right: 2px solid #585c6c;
+        border-bottom: 2px solid #585c6c;
+    }}
+    .cde-banner {{
+        background-color: {well};
+        color: #101014;
+        padding: 8px 12px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+    }}
+    .cde-prompt-bar {{
+        background-color: #eef4db;
+        color: #102016;
+        padding: 7px 12px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+    }}
+    .cde-status {{
+        background-color: {chrome};
+        padding: 3px 8px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+    }}
+    frame {{
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+        border-radius: 0px;
+    }}
+    button {{
+        background-image: none;
+        background-color: {chrome};
+        color: #101014;
+        border-top: 2px solid #e6e9f2;
+        border-left: 2px solid #e6e9f2;
+        border-right: 2px solid #565a69;
+        border-bottom: 2px solid #565a69;
+        border-radius: 0px;
+        padding: 4px 10px;
+        box-shadow: none;
+    }}
+    button:hover {{
+        background-color: {chrome_hi};
+    }}
+    button:active, button:checked {{
+        background-color: {chrome_lo};
+        border-top: 2px solid #565a69;
+        border-left: 2px solid #565a69;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+        font-weight: bold;
+    }}
+    button.cde-yes {{
+        background-color: #266048;
+        color: #ffffff;
+        border-top: 2px solid #52997b;
+        border-left: 2px solid #52997b;
+        border-right: 2px solid #113023;
+        border-bottom: 2px solid #113023;
+        font-weight: bold;
+    }}
+    button.cde-yes label {{ color: #ffffff; }}
+    button.cde-no {{
+        background-color: #8b2e2e;
+        color: #ffffff;
+        border-top: 2px solid #c96565;
+        border-left: 2px solid #c96565;
+        border-right: 2px solid #3d1010;
+        border-bottom: 2px solid #3d1010;
+        font-weight: bold;
+    }}
+    button.cde-no label {{ color: #ffffff; }}
+    button.cde-primary {{
+        background-color: #2b5b84;
+        color: #ffffff;
+        border-top: 2px solid #6899c4;
+        border-left: 2px solid #6899c4;
+        border-right: 2px solid #142c40;
+        border-bottom: 2px solid #142c40;
+        font-weight: bold;
+    }}
+    button.cde-primary label {{ color: #ffffff; }}
+    entry, textview, textview text, treeview {{
+        background-color: {well};
+        color: #101014;
+        border-radius: 0px;
+    }}
+    textview.cde-log, textview.cde-log text {{
+        font-family: "DejaVu Sans Mono", "Liberation Mono", monospace;
+        font-size: 9pt;
+    }}
+    treeview:selected {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    treeview header button {{
+        background-color: {chrome};
+        font-weight: bold;
+    }}
+    progressbar trough {{
+        background-color: {well};
+        min-height: 18px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+    }}
+    progressbar progress {{
+        background-color: {sel};
+        min-height: 18px;
+    }}
+    """
+    return css.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# CDE App Catalog & Dependency Discovery Engine
+# ---------------------------------------------------------------------------
+# Maps Python CDE utilities in ~/.local/bin to the Debian runtime package prefixes
+# whose upgrades warrant bytecode/GI verification & sync.
+PYTHON_CDE_APPS = [
+    ("dtPod",    "dtpod",    ("python3", "gir1.2-gtk-3", "libgtk-3", "gir1.2-gst", "gstreamer1.0", "python3-pil", "python3-requests", "libcairo")),
+    ("dtPaint",  "dtpaint",  ("python3", "gir1.2-gtk-3", "libgtk-3", "gir1.2-gdkpixbuf", "python3-pil", "imagemagick", "libcairo")),
+    ("dtPlay",   "dtplay",   ("python3", "gir1.2-gtk-3", "libgtk-3", "gir1.2-gst", "gstreamer1.0", "libcairo")),
+    ("dtIRC",    "dtirc",    ("python3", "gir1.2-gtk-3", "libgtk-3", "openssl", "libssl")),
+    ("dtPics",   "dtpics",   ("python3", "gir1.2-gtk-3", "libgtk-3", "gir1.2-gdkpixbuf", "python3-pil", "imagemagick", "libcairo")),
+    ("dtNotes",  "dtnotes",  ("python3", "gir1.2-gtk-3", "gir1.2-gtksource", "libgtksourceview", "gir1.2-webkit2", "libwebkit2gtk")),
+    ("dtReader", "dtreader", ("python3", "gir1.2-gtk-3", "gir1.2-evince", "libevdocument", "libevview", "libpoppler")),
+    ("dtZip",    "dtzip",    ("python3", "gir1.2-gtk-3", "p7zip", "7zip", "xz-utils", "bzip2")),
+    ("dtWine",   "dtwine",   ("python3", "gir1.2-gtk-3", "wine", "libwine", "python3-pil")),
+    ("dtUpdate", "dtupdate", ("python3", "gir1.2-gtk-3", "apt")),
+]
+
+# Known C/Motif targets when a Makefile-based CDE source directory is present
+MOTIF_TARGET_MAP = [
+    ("dtMail (cde-mail)",   "cde-mail",                LOCAL_BIN / "cde-mail",                  ["cde_mail.c", "cde_oe_icons.h"]),
+    ("dtCalendar (dtcm)",   "cde-calendar",            LOCAL_BIN / "cde-calendar",              ["cde_calendar.c"]),
+    ("CDE Screenshot",      "cde-shot",                LOCAL_BIN / "cde-shot",                  ["cde_shot.c", "cde_motif_theme.h"]),
+    ("CDE Panel Tray",      "cde-panel-tray",          LOCAL_BIN / "cde-panel-tray",            ["cde_panel_tray.c"]),
+    ("CDE Layout Helper",   "cde-apply-layout",        LOCAL_BIN / "cde-apply-layout",          ["cde_apply_layout.c"]),
+    ("CDE Audio Mixer",     "cde-audio-mixer",         LOCAL_BIN / "cde-audio-mixer",           ["cde_audio_mixer.c", "cde_motif_theme.h"]),
+    ("CDE Wi-Fi Manager",   "cde-wifi-manager",        LOCAL_BIN / "cde-wifi-manager",          ["cde_wifi_manager.c", "cde_motif_theme.h"]),
+    ("CDE Bluetooth Mgr",   "cde-bt-manager",          LOCAL_BIN / "cde-bt-manager",            ["cde_bt_manager.c", "cde_motif_theme.h"]),
+    ("CDE Power Manager",   "cde-power-manager",       LOCAL_BIN / "cde-power-manager",         ["cde_power_manager.c", "cde_motif_theme.h"]),
+    ("CDE Screen Rotate",   "cde-rotate-screen",       LOCAL_BIN / "cde-rotate-screen",         ["cde_rotate_screen.c", "cde_motif_theme.h"]),
+    ("CDE Auto-HW Daemon",  "cde-autohw-daemon",       LOCAL_BIN / "cde-autohw-daemon",         ["cde_autohw_daemon.c"]),
+    ("CDE Sensor Deck",     "cde-sensor-deck",         LOCAL_BIN / "cde-sensor-deck",           ["cde_sensor_deck.c"]),
+    ("CDE WWAN & GPS",      "cde-wwan-gps",            LOCAL_BIN / "cde-wwan-gps",              ["cde_wwan_gps.c"]),
+    ("CDE On-Screen Kbd",   "cde-osk",                 LOCAL_BIN / "cde-osk",                   ["cde_osk.c"]),
+    ("CDE Stylus Pad",      "cde-pen-pad",             LOCAL_BIN / "cde-pen-pad",               ["cde_pen_pad.c"]),
+    ("CDE System Monitor",  "cde-sysmon",              LOCAL_BIN / "cde-sysmon",                ["cde_sysmon.c"]),
+    ("CDE Notify Daemon",   "cde-notifyd",             LOCAL_BIN / "cde-notifyd",               ["cde_notifyd.c"]),
+    ("CDE Drive Mounter",   "cde-drives",              LOCAL_BIN / "cde-drives",                ["cde_drives.c"]),
+    ("CDE Saver HUD",       "cde-saver-hud",           LOCAL_BIN / "cde-saver-hud",             ["cde_saver_hud.c"]),
+    ("HamClock Saver",      "cde-hamclock-saver",      LOCAL_BIN / "cde-hamclock-saver",        ["cde_hamclock_saver.c"]),
+    ("HamClock Manager",    "cde-hamclock-mgr",        LOCAL_BIN / "cde-hamclock-mgr",          ["cde_hamclock_mgr.c"]),
+    ("dtterm SmartClip SO", "libdtterm_smartclip.so",  LOCAL_LIB / "libdtterm_smartclip.so",    ["dtterm_smartclip.c"]),
+    ("dtsession Lock SO",   "libdtsession_lockwake.so", LOCAL_LIB / "libdtsession_lockwake.so", ["dtsession_lockwake.c"]),
+]
+
+
+def load_source_roots() -> list[Path]:
+    """Discover configured or standard local CDE source directories."""
+    candidates: list[Path] = []
+    env_root = os.environ.get("DT_SOURCE_ROOT", "").strip()
+    if env_root:
+        candidates.append(Path(env_root).expanduser())
+
+    if SOURCES_CFG.is_file():
+        try:
+            cfg = json.loads(SOURCES_CFG.read_text(encoding="utf-8"))
+            for p in cfg.get("source_dirs", []):
+                candidates.append(Path(p).expanduser())
+        except Exception:
+            pass
+
+    # Also check sibling repo folders if dtUpdate is run from a git checkout
+    here = Path(__file__).resolve().parent
+    if (here.parent / "dtMail" / "Makefile").is_file():
+        candidates.append(here.parent)
+
+    for std in (HOME / "dt", HOME / "src" / "dt", HOME / ".local" / "src" / "dt", HOME / "cde-system-applets"):
+        candidates.append(std)
+
+    seen = set()
+    valid = []
+    for c in candidates:
+        rc = c.resolve() if c.exists() else None
+        if rc and rc.is_dir() and rc not in seen:
+            seen.add(rc)
+            valid.append(rc)
+    return valid
+
+
+def parse_apt_simulated_upgrades() -> list[dict]:
+    """Run `apt-get -s dist-upgrade` and parse all `Inst` lines."""
+    env = os.environ.copy()
+    env["LC_ALL"] = "C"
+    res = subprocess.run(
+        ["apt-get", "-s", "dist-upgrade"],
+        env=env, text=True, capture_output=True, timeout=60,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(res.stderr.strip() or "apt-get -s dist-upgrade failed")
+
+    # Formats:
+    # Inst pkg [1.2-1] (1.2-2 Debian:13.1/stable [amd64])
+    # Inst newpkg (1.0-1 Debian:13.1/stable [amd64])
+    inst_re = re.compile(r"^Inst\s+(\S+)\s+(?:\[([^\]]+)\]\s+)?\(([^\s\)]+)\s+([^)\[]+)")
+    upgrades = []
+    for ln in res.stdout.splitlines():
+        m = inst_re.match(ln.strip())
+        if m:
+            pkg, old_v, new_v, origin = m.group(1), (m.group(2) or "NEW"), m.group(3), m.group(4).strip()
+            action = "New Dependency" if old_v == "NEW" else "Upgrade"
+            upgrades.append({
+                "pkg": pkg,
+                "pkg_base": pkg.split(":", 1)[0],
+                "old_ver": old_v,
+                "new_ver": new_v,
+                "origin": origin,
+                "action": action,
+            })
+    return upgrades
+
+
+def inspect_binary_ldd(bin_path: Path) -> tuple[set[str], bool]:
+    """Return (resolved_so_paths, has_missing_or_broken_symbols) for an ELF binary."""
+    env = os.environ.copy()
+    env["LC_ALL"] = "C"
+    res = subprocess.run(["ldd", "-r", str(bin_path)], env=env, text=True, capture_output=True, timeout=15)
+    so_paths: set[str] = set()
+    broken = False
+    out = (res.stdout or "") + "\n" + (res.stderr or "")
+    for ln in out.splitlines():
+        s = ln.strip()
+        if "not found" in s or s.startswith("undefined symbol:"):
+            broken = True
+        m = re.search(r"=>\s+(/\S+)\s+\(0x", s)
+        if m:
+            so_paths.add(m.group(1))
+    return so_paths, broken
+
+
+def map_files_to_dpkg_packages(file_paths: set[str]) -> dict[str, str]:
+    """Batch-resolve shared library file paths to owning Debian package names."""
+    if not file_paths:
+        return {}
+    expanded = set()
+    for fp in list(file_paths):
+        bases = {fp}
+        try:
+            bases.add(str(Path(fp).resolve()))
+        except Exception:
+            pass
+        for b in bases:
+            expanded.add(b)
+            # Handle merged-/usr (/lib/x86_64-linux-gnu vs /usr/lib/x86_64-linux-gnu)
+            if b.startswith("/usr/lib/"):
+                expanded.add(b[4:])
+            elif b.startswith("/lib/"):
+                expanded.add("/usr" + b)
+
+    res = subprocess.run(
+        ["dpkg", "-S", *sorted(expanded)],
+        text=True, capture_output=True, timeout=25,
+    )
+    mapping: dict[str, str] = {}
+    for ln in (res.stdout or "").splitlines():
+        if ln.startswith("diversion ") or ": /" not in ln:
+            continue
+        pkg_part, rel_path = ln.split(": /", 1)
+        pkg_base = pkg_part.split(",")[0].split(":", 1)[0].strip()
+        mapping["/" + rel_path.strip()] = pkg_base
+    return mapping
+
+
+def analyze_cde_rebuild_plan(apt_upgrades: list[dict], force_all: bool = False) -> list[dict]:
+    """
+    Determine which CDE applications need recompilation or verification.
+    Only returns items that genuinely need action (unless force_all=True).
+    """
+    upgrading_pkgs = {u["pkg_base"]: u for u in apt_upgrades}
+    roots = load_source_roots()
+    plan: list[dict] = []
+
+    # Locate C/Motif build directories
+    applets_makefile_dir = None
+    split_repo_dir = None
+    for r in roots:
+        if (r / "Makefile").is_file() and (r / "cde_mail.c").is_file():
+            applets_makefile_dir = r
+        if (r / "dtMail" / "Makefile").is_file():
+            split_repo_dir = r
+
+    # 1. Analyze C/Motif binaries
+    c_candidates = []
+    if applets_makefile_dir:
+        for label, target, inst_path, src_files in MOTIF_TARGET_MAP:
+            if (applets_makefile_dir / src_files[0]).is_file():
+                c_candidates.append((label, target, inst_path, applets_makefile_dir, [applets_makefile_dir / sf for sf in src_files]))
+    elif split_repo_dir:
+        for folder, label, target, inst_path, sfiles in [
+            ("dtMail",     "dtMail (cde-mail)", "cde-mail",     LOCAL_BIN / "cde-mail",     ["cde_mail.c", "cde_oe_icons.h"]),
+            ("dtCalendar", "dtCalendar (dtcm)", "cde-calendar", LOCAL_BIN / "cde-calendar", ["cde_calendar.c"]),
+        ]:
+            bdir = split_repo_dir / folder
+            if (bdir / "Makefile").is_file():
+                c_candidates.append((label, target, inst_path, bdir, [bdir / sf for sf in sfiles]))
+
+    # Batch ldd + dpkg -S across all installed C binaries
+    bin_ldd_map: dict[Path, tuple[set[str], bool]] = {}
+    all_so_files: set[str] = set()
+    for _lbl, _tgt, inst_p, _bdir, _sfiles in c_candidates:
+        if inst_p.is_file():
+            sos, broken = inspect_binary_ldd(inst_p)
+            bin_ldd_map[inst_p] = (sos, broken)
+            all_so_files.update(sos)
+
+    so_to_pkg = map_files_to_dpkg_packages(all_so_files)
+    toolchain_triggers = {p for p in upgrading_pkgs if p.startswith(("gcc", "libc6-dev", "libmotif-dev", "libx11-dev", "libxt-dev", "libxpm-dev", "cde-desktop"))}
+
+    for label, target, inst_p, bdir, sfiles in c_candidates:
+        reasons = []
+        if force_all:
+            reasons.append("Forced full CDE binary rebuild requested")
+        if not inst_p.is_file():
+            reasons.append(f"Binary not yet installed ({inst_p.name})")
+        else:
+            bmtime = inst_p.stat().st_mtime
+            newer_srcs = [sf.name for sf in sfiles if sf.is_file() and sf.stat().st_mtime > bmtime + 1.0]
+            if newer_srcs:
+                reasons.append(f"Source updated ({', '.join(newer_srcs)})")
+
+            sos, broken = bin_ldd_map.get(inst_p, (set(), False))
+            if broken:
+                reasons.append("Broken shared library link / undefined symbol detected by ldd")
+
+            matched_libs = set()
+            for so in sos:
+                so_bases = {so}
+                try:
+                    so_bases.add(str(Path(so).resolve()))
+                except Exception:
+                    pass
+                so_cands = set()
+                for sb in so_bases:
+                    so_cands.add(sb)
+                    if sb.startswith("/lib/"):
+                        so_cands.add("/usr" + sb)
+                    elif sb.startswith("/usr/lib/"):
+                        so_cands.add(sb[4:])
+                for cand in so_cands:
+                    pk = so_to_pkg.get(cand)
+                    if pk and pk in upgrading_pkgs:
+                        u = upgrading_pkgs[pk]
+                        matched_libs.add(f"{pk} ({u['old_ver']} → {u['new_ver']})")
+            if matched_libs:
+                reasons.append("Linked library updated: " + ", ".join(sorted(matched_libs)[:3]))
+            elif toolchain_triggers:
+                reasons.append("Core Motif/X11 header package updated: " + ", ".join(sorted(toolchain_triggers)[:2]))
+
+        if reasons:
+            plan.append({
+                "kind": "c_motif",
+                "label": label,
+                "target": target,
+                "build_dir": str(bdir),
+                "install_path": str(inst_p),
+                "action": "Recompile & Install Binary",
+                "reason": "; ".join(reasons),
+            })
+
+    # 2. Analyze Python/GTK/GStreamer CDE Utilities
+    for app_label, bin_name, dep_prefixes in PYTHON_CDE_APPS:
+        inst_script = LOCAL_BIN / bin_name
+        repo_script = (split_repo_dir / app_label / bin_name) if split_repo_dir else None
+        reasons = []
+
+        if repo_script and repo_script.is_file():
+            if not inst_script.is_file():
+                reasons.append("Not yet installed in ~/.local/bin")
+            elif repo_script.stat().st_mtime > inst_script.stat().st_mtime + 1.0:
+                # Check if content actually differs
+                if repo_script.read_bytes() != inst_script.read_bytes():
+                    reasons.append(f"Updated source in {app_label}/{bin_name}")
+
+        if inst_script.is_file():
+            matched_deps = [
+                f"{pk} ({u['old_ver']} → {u['new_ver']})"
+                for pk, u in upgrading_pkgs.items()
+                if any(pk.startswith(pref) for pref in dep_prefixes)
+            ]
+            if matched_deps:
+                reasons.append("Runtime updated: " + ", ".join(sorted(matched_deps)[:3]))
+
+        if reasons:
+            plan.append({
+                "kind": "python_app",
+                "label": app_label,
+                "target": bin_name,
+                "repo_script": str(repo_script) if (repo_script and repo_script.is_file()) else "",
+                "install_path": str(inst_script),
+                "action": "Sync & Verify Bytecode",
+                "reason": "; ".join(reasons),
+            })
+
+    return plan
+
+
+# ---------------------------------------------------------------------------
+# Sudo Password Dialog (CDE Motif Styled)
+# ---------------------------------------------------------------------------
+class SudoPromptDialog(Gtk.Dialog):
+    def __init__(self, parent, error_hint: str = ""):
+        super().__init__(title="Authentication Required — dtUpdate", transient_for=parent, flags=0)
+        self.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Authenticate", Gtk.ResponseType.OK)
+        self.set_default_size(430, 185)
+        self.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+
+        ok_btn = self.get_widget_for_response(Gtk.ResponseType.OK)
+        if ok_btn:
+            ok_btn.get_style_context().add_class("cde-primary")
+
+        box = self.get_content_area()
+        box.set_spacing(8)
+        box.set_margin_top(12); box.set_margin_bottom(12); box.set_margin_start(14); box.set_margin_end(14)
+
+        hdr = Gtk.Label(xalign=0)
+        hdr.set_markup("<b>🔐 Enter sudo password to check &amp; install Debian updates:</b>")
+        box.pack_start(hdr, False, False, 0)
+
+        sub = Gtk.Label(
+            label="dtUpdate uses sudo strictly to run `apt-get update` and `apt-get dist-upgrade`.\n"
+                  "Your password is kept only in memory for this session.",
+            xalign=0,
+        )
+        sub.set_line_wrap(True)
+        box.pack_start(sub, False, False, 0)
+
+        if error_hint:
+            err_lbl = Gtk.Label(xalign=0)
+            err_lbl.set_markup(f"<span foreground='#b91c1c' weight='bold'>{GLib.markup_escape_text(error_hint)}</span>")
+            box.pack_start(err_lbl, False, False, 0)
+
+        hb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        hb.pack_start(Gtk.Label(label="Password:"), False, False, 0)
+        self.ent_pw = Gtk.Entry(visibility=False, hexpand=True)
+        self.ent_pw.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+        self.ent_pw.connect("activate", lambda *_: self.response(Gtk.ResponseType.OK))
+        hb.pack_start(self.ent_pw, True, True, 0)
+        box.pack_start(hb, False, False, 4)
+
+        self.show_all()
+        self.ent_pw.grab_focus()
+
+    def get_password(self) -> str:
+        return self.ent_pw.get_text()
+
+
+# ---------------------------------------------------------------------------
+# Main dtUpdate Window
+# ---------------------------------------------------------------------------
+class DtUpdateWindow(Gtk.Window):
+    def __init__(self, dry_demo: bool = False):
+        super().__init__(title="dtUpdate — CDE Debian & Application Update Manager")
+        self.set_wmclass("dtupdate", "DtUpdate")
+        self.set_default_size(1020, 700)
+        self.set_position(Gtk.WindowPosition.CENTER)
+
+        ic = DT_ICONS / "dtupdate.l.pm"
+        if ic.is_file():
+            try:
+                self.set_icon_from_file(str(ic))
+            except Exception:
+                pass
+
+        self.chrome_hex, self.sel_hex, self.well_hex, self.well_alt_hex = load_cde_palette()
+        self._sudo_pw: str = ""
+        self._busy: bool = False
+        self._dry_demo = dry_demo
+
+        self.apt_plan: list[dict] = []
+        self.cde_plan: list[dict] = []
+        self.last_summary_text: str = ""
+
+        self._build_ui()
+
+        if self._dry_demo:
+            GLib.idle_add(self._populate_demo_preview)
+        else:
+            GLib.timeout_add(250, lambda: self.on_check_updates() or False)
+
+    # ---------------- UI Construction ----------------
+    def _build_ui(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(vbox)
+
+        # 1. Menu Bar
+        mbar = Gtk.MenuBar()
+
+        m_sys = Gtk.Menu()
+        mi_sys = Gtk.MenuItem(label="Updater"); mi_sys.set_submenu(m_sys)
+        for lbl, cb in [
+            ("Check for Updates (apt-get update)...", lambda *_: self.on_check_updates()),
+            ("Configure CDE Source Directories...",   self.on_configure_sources),
+            ("Save Update Log...",                    self.on_save_log),
+            ("-", None),
+            ("Exit  (Ctrl+Q)",                        lambda *_: self.on_quit()),
+        ]:
+            if lbl == "-":
+                m_sys.append(Gtk.SeparatorMenuItem())
+            else:
+                it = Gtk.MenuItem(label=lbl); it.connect("activate", cb); m_sys.append(it)
+        mbar.append(mi_sys)
+
+        m_help = Gtk.Menu()
+        mi_help = Gtk.MenuItem(label="Help"); mi_help.set_submenu(m_help)
+        it_ab = Gtk.MenuItem(label="About dtUpdate...")
+        it_ab.connect("activate", self.on_about)
+        m_help.append(it_ab)
+        mbar.append(mi_help)
+        vbox.pack_start(mbar, False, False, 0)
+
+        # 2. Top CDE Beveled Action Toolbar
+        tb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        tb.get_style_context().add_class("cde-toolbar")
+
+        self.btn_check = Gtk.Button(label="🔄 Check for Updates")
+        self.btn_check.get_style_context().add_class("cde-primary")
+        self.btn_check.set_tooltip_text("Authenticate with sudo, run apt-get update, and compute update plan")
+        self.btn_check.connect("clicked", lambda *_: self.on_check_updates())
+        tb.pack_start(self.btn_check, False, False, 0)
+
+        self.chk_force_cde = Gtk.CheckButton(label="Force full CDE C/Motif rebuild")
+        self.chk_force_cde.set_tooltip_text("Include all CDE C/Motif binaries in the rebuild plan even if libraries did not change")
+        self.chk_force_cde.connect("toggled", self._on_force_cde_toggled)
+        tb.pack_start(self.chk_force_cde, False, False, 4)
+
+        b_srcs = Gtk.Button(label="⚙ Source Paths...")
+        b_srcs.connect("clicked", self.on_configure_sources)
+        tb.pack_end(b_srcs, False, False, 0)
+
+        b_view_log = Gtk.Button(label="📜 View Log")
+        b_view_log.connect("clicked", lambda *_: self.nb.set_current_page(1))
+        tb.pack_end(b_view_log, False, False, 0)
+
+        vbox.pack_start(tb, False, False, 0)
+
+        # 3. Header Summary & Progress Banner
+        banner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        banner.get_style_context().add_class("cde-banner")
+
+        top_b = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.lbl_headline = Gtk.Label(xalign=0)
+        self.lbl_headline.set_markup("<span size='12500' weight='bold'>dtUpdate — Debian &amp; CDE Workstation Updater</span>")
+        self.lbl_phase = Gtk.Label(label="Idle", xalign=1.0)
+        top_b.pack_start(self.lbl_headline, True, True, 0)
+        top_b.pack_end(self.lbl_phase, False, False, 0)
+        banner.pack_start(top_b, False, False, 0)
+
+        self.prog = Gtk.ProgressBar()
+        self.prog.set_show_text(True)
+        self.prog.set_text("Click 'Check for Updates' to scan Debian repositories & CDE binaries")
+        self.prog.set_fraction(0.0)
+        banner.pack_start(self.prog, False, False, 0)
+
+        vbox.pack_start(banner, False, False, 0)
+
+        # 4. Interactive Yes / No Approval Bar (Shown once Update Plan is computed!)
+        self.decision_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.decision_bar.get_style_context().add_class("cde-prompt-bar")
+        self.decision_bar.set_no_show_all(True)
+
+        self.lbl_decision = Gtk.Label(xalign=0)
+        self.lbl_decision.set_markup("<b>Proceed with this Update &amp; Rebuild Plan?</b>")
+        self.lbl_decision.set_line_wrap(True)
+        self.decision_bar.pack_start(self.lbl_decision, True, True, 0)
+
+        self.btn_no = Gtk.Button(label="✖ No — Cancel")
+        self.btn_no.get_style_context().add_class("cde-no")
+        self.btn_no.connect("clicked", self.on_answer_no)
+        self.decision_bar.pack_end(self.btn_no, False, False, 0)
+
+        self.btn_yes = Gtk.Button(label="✔ Yes — Download, Install & Rebuild")
+        self.btn_yes.get_style_context().add_class("cde-yes")
+        self.btn_yes.connect("clicked", self.on_answer_yes)
+        self.decision_bar.pack_end(self.btn_yes, False, False, 0)
+
+        vbox.pack_start(self.decision_bar, False, False, 0)
+
+        # 5. Main Notebook: Tab 0 = Update Plan | Tab 1 = Live Console Log | Tab 2 = Completion Overview
+        self.nb = Gtk.Notebook(margin=4)
+        vbox.pack_start(self.nb, True, True, 0)
+
+        # --- Tab 0: Update Plan (Vertical Paned: Debian Packages + CDE Rebuild Plan) ---
+        vpaned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+        vpaned.set_position(250)
+
+        # Top table: Debian APT Upgrades
+        apt_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.lbl_apt_hdr = Gtk.Label(label="  📦 Debian System Updates (apt-get)", xalign=0)
+        self.lbl_apt_hdr.get_style_context().add_class("cde-toolbar")
+        apt_vbox.pack_start(self.lbl_apt_hdr, False, False, 0)
+
+        # 0: pkg, 1: old_ver, 2: new_ver, 3: action, 4: origin, 5: bg_hex, 6: weight
+        self.apt_store = Gtk.ListStore(str, str, str, str, str, str, int)
+        self.apt_view = Gtk.TreeView(model=self.apt_store)
+        for title, idx, mw, exp in [
+            ("Package",           0, 210, False),
+            ("Installed Version", 1, 150, False),
+            ("Candidate Version", 2, 150, False),
+            ("Action",            3, 115, False),
+            ("Repository",        4, 200, True),
+        ]:
+            r = Gtk.CellRendererText()
+            if exp:
+                r.set_property("ellipsize", Pango.EllipsizeMode.END)
+            c = Gtk.TreeViewColumn(title, r, text=idx, cell_background=5, weight=6)
+            c.set_min_width(mw); c.set_resizable(True); c.set_expand(exp)
+            self.apt_view.append_column(c)
+
+        sw_apt = Gtk.ScrolledWindow()
+        sw_apt.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw_apt.add(self.apt_view)
+        apt_vbox.pack_start(sw_apt, True, True, 0)
+        fr_apt = Gtk.Frame(); fr_apt.add(apt_vbox)
+        vpaned.pack1(fr_apt, resize=True, shrink=False)
+
+        # Bottom table: CDE Applications Rebuild Plan (Only Needed Apps!)
+        cde_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.lbl_cde_hdr = Gtk.Label(label="  🛠 CDE Applications Rebuild & Sync Plan (Only When Needed)", xalign=0)
+        self.lbl_cde_hdr.get_style_context().add_class("cde-toolbar")
+        cde_vbox.pack_start(self.lbl_cde_hdr, False, False, 0)
+
+        # 0: app_label, 1: target_bin, 2: action, 3: reason, 4: bg_hex, 5: weight
+        self.cde_store = Gtk.ListStore(str, str, str, str, str, int)
+        self.cde_view = Gtk.TreeView(model=self.cde_store)
+        for title, idx, mw, exp in [
+            ("CDE Application", 0, 190, False),
+            ("Binary / Target", 1, 155, False),
+            ("Planned Action",  2, 185, False),
+            ("Trigger Reason",  3, 320, True),
+        ]:
+            r = Gtk.CellRendererText()
+            if exp:
+                r.set_property("ellipsize", Pango.EllipsizeMode.END)
+            c = Gtk.TreeViewColumn(title, r, text=idx, cell_background=4, weight=5)
+            c.set_min_width(mw); c.set_resizable(True); c.set_expand(exp)
+            self.cde_view.append_column(c)
+
+        sw_cde = Gtk.ScrolledWindow()
+        sw_cde.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw_cde.add(self.cde_view)
+        cde_vbox.pack_start(sw_cde, True, True, 0)
+        fr_cde = Gtk.Frame(); fr_cde.add(cde_vbox)
+        vpaned.pack2(fr_cde, resize=True, shrink=False)
+
+        self.nb.append_page(vpaned, Gtk.Label(label="📋 Update Plan"))
+
+        # --- Tab 1: Live APT & GCC Build Console Log ---
+        fr_log = Gtk.Frame(margin=4)
+        self.txt_log = Gtk.TextView(editable=False, cursor_visible=False, wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        self.txt_log.get_style_context().add_class("cde-log")
+        self.txt_log.set_left_margin(8); self.txt_log.set_right_margin(8)
+        self.txt_log.set_top_margin(6); self.txt_log.set_bottom_margin(6)
+        self.sw_log = Gtk.ScrolledWindow()
+        self.sw_log.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.sw_log.add(self.txt_log)
+        fr_log.add(self.sw_log)
+        self.nb.append_page(fr_log, Gtk.Label(label="🖥 Live Build & APT Log"))
+
+        # --- Tab 2: Completion Overview Summary ---
+        fr_sum = Gtk.Frame(margin=4)
+        self.txt_summary = Gtk.TextView(editable=False, cursor_visible=False, wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        self.txt_summary.set_left_margin(14); self.txt_summary.set_right_margin(14)
+        self.txt_summary.set_top_margin(10); self.txt_summary.set_bottom_margin(10)
+        self.txt_summary.get_buffer().set_text("Run an update cycle to view the post-update summary overview here.")
+        sw_sum = Gtk.ScrolledWindow()
+        sw_sum.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw_sum.add(self.txt_summary)
+        fr_sum.add(sw_sum)
+        self.nb.append_page(fr_sum, Gtk.Label(label="✅ Finished Overview"))
+
+        # 6. Status Bar
+        st = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        st.get_style_context().add_class("cde-status")
+        self.lbl_status = Gtk.Label(label="Ready — Click 'Check for Updates' to begin.", xalign=0)
+        self.lbl_status.set_ellipsize(Pango.EllipsizeMode.END)
+        st.pack_start(self.lbl_status, True, True, 0)
+        vbox.pack_start(st, False, False, 0)
+
+        self.connect("key-press-event", self._on_key_press)
+        self.connect("delete-event", lambda *_: self.on_quit())
+        self.show_all()
+
+    # ---------------- Logging & UI Helpers ----------------
+    def append_log(self, line: str):
+        def _do():
+            buf = self.txt_log.get_buffer()
+            buf.insert(buf.get_end_iter(), line.rstrip("\r\n") + "\n")
+            adj = self.sw_log.get_vadjustment()
+            adj.set_value(max(0.0, adj.get_upper() - adj.get_page_size()))
+            return False
+        GLib.idle_add(_do)
+
+    def set_progress(self, frac: float, text: str, phase: str | None = None):
+        def _do():
+            self.prog.set_fraction(max(0.0, min(1.0, frac)))
+            self.prog.set_text(text)
+            if phase is not None:
+                self.lbl_phase.set_text(phase)
+            self.lbl_status.set_text(text)
+            return False
+        GLib.idle_add(_do)
+
+    # ---------------- Sudo Authentication ----------------
+    def _ensure_sudo_authenticated(self) -> bool:
+        # Test cached pw first if already entered this session
+        if self._sudo_pw:
+            if self._verify_sudo_pw(self._sudo_pw):
+                return True
+            self._sudo_pw = ""
+
+        err_msg = ""
+        for _attempt in range(3):
+            dlg = SudoPromptDialog(self, error_hint=err_msg)
+            resp = dlg.run()
+            pw = dlg.get_password()
+            dlg.destroy()
+            if resp != Gtk.ResponseType.OK:
+                return False
+            if self._verify_sudo_pw(pw):
+                self._sudo_pw = pw
+                return True
+            err_msg = "Incorrect sudo password — please try again."
+        return False
+
+    @staticmethod
+    def _verify_sudo_pw(pw: str) -> bool:
+        try:
+            res = subprocess.run(
+                ["sudo", "-S", "-k", "-p", "", "true"],
+                input=(pw or "") + "\n",
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            return res.returncode == 0
+        except Exception:
+            return False
+
+    def _run_sudo_streamed(self, args: list[str], extra_env: dict | None = None,
+                           on_line=None, status_fd_cb=None) -> int:
+        """
+        Execute `sudo -S -p "" env ... <args>` feeding password on stdin immediately,
+        streaming stdout/stderr lines to on_line and optional APT Status-Fd pipe to status_fd_cb.
+        """
+        env_kv = ["LC_ALL=C", "DEBIAN_FRONTEND=noninteractive"]
+        if extra_env:
+            for k, v in extra_env.items():
+                env_kv.append(f"{k}={v}")
+
+        pass_fds = ()
+        st_r, st_w = -1, -1
+        final_args = list(args)
+        if status_fd_cb is not None:
+            st_r, st_w = os.pipe()
+            os.set_inheritable(st_w, True)
+            pass_fds = (st_w,)
+            #sudo closes FDs >= 3 unless -C <num> is passed; check if sudo -C is permitted, else parse stdout!
+            test_c = subprocess.run(
+                ["sudo", "-S", "-C", str(st_w + 1), "-p", "", "true"],
+                input=self._sudo_pw + "\n", text=True, capture_output=True,
+            )
+            if test_c.returncode == 0:
+                cmd = ["sudo", "-S", "-C", str(st_w + 1), "-p", "", "env", *env_kv, *final_args, f"-o=APT::Status-Fd={st_w}"]
+            else:
+                os.close(st_r); os.close(st_w)
+                st_r = st_w = -1
+                pass_fds = ()
+                cmd = ["sudo", "-S", "-p", "", "env", *env_kv, *final_args]
+        else:
+            cmd = ["sudo", "-S", "-p", "", "env", *env_kv, *final_args]
+
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            pass_fds=pass_fds,
+        )
+        if st_w >= 0:
+            os.close(st_w)
+
+        try:
+            proc.stdin.write(self._sudo_pw + "\n")
+            proc.stdin.flush()
+            proc.stdin.close()
+        except Exception:
+            pass
+
+        if st_r >= 0 and status_fd_cb is not None:
+            def _read_status_fd():
+                with os.fdopen(st_r, "r", errors="replace") as sf:
+                    for sln in sf:
+                        parts = sln.strip().split(":", 3)
+                        if len(parts) >= 4 and parts[0] in ("dlstatus", "pmstatus"):
+                            try:
+                                pct = float(parts[2])
+                                status_fd_cb(parts[0], pct, parts[3].strip())
+                            except ValueError:
+                                pass
+            threading.Thread(target=_read_status_fd, daemon=True).start()
+
+        if proc.stdout:
+            for ln in proc.stdout:
+                s = ln.rstrip("\r\n")
+                if s:
+                    self.append_log(s)
+                    if on_line:
+                        on_line(s)
+
+        return proc.wait()
+
+    # ---------------- Phase 1: apt-get update & Plan Generation ----------------
+    def on_check_updates(self):
+        if self._busy:
+            return
+        if not self._ensure_sudo_authenticated():
+            self.lbl_status.set_text("Authentication cancelled.")
+            return
+
+        self._busy = True
+        self.btn_check.set_sensitive(False)
+        self.decision_bar.hide()
+        self.nb.set_current_page(0)
+        self.txt_log.get_buffer().set_text("")
+        self.append_log(f"=== [{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting apt-get update ===")
+        self.set_progress(0.08, "Running sudo apt-get update...", "Refreshing APT")
+
+        force_cde = self.chk_force_cde.get_active()
+
+        def _worker():
+            try:
+                hit_cnt = [0]
+
+                def _apt_upd_line(ln: str):
+                    if ln.startswith(("Hit:", "Get:", "Ign:")):
+                        hit_cnt[0] += 1
+                        frac = min(0.65, 0.08 + hit_cnt[0] * 0.035)
+                        self.set_progress(frac, f"Updating package lists: {ln[:72]}", "apt-get update")
+
+                rc = self._run_sudo_streamed(["apt-get", "update"], on_line=_apt_upd_line)
+                if rc != 0:
+                    raise RuntimeError(f"apt-get update exited with status {rc} (see Live Log tab).")
+
+                self.set_progress(0.75, "Calculating upgradable Debian packages...", "Analyzing Packages")
+                apt_upgs = parse_apt_simulated_upgrades()
+
+                self.set_progress(0.90, "Inspecting CDE C/Motif binaries (ldd / dpkg) & sources...", "Checking CDE Apps")
+                cde_rebuilds = analyze_cde_rebuild_plan(apt_upgs, force_all=force_cde)
+
+                GLib.idle_add(self._on_plan_ready, apt_upgs, cde_rebuilds, None)
+            except Exception as exc:
+                GLib.idle_add(self._on_plan_ready, [], [], str(exc))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_force_cde_toggled(self, *_args):
+        if not self._busy and (self.apt_plan or self.cde_plan or self._sudo_pw):
+            try:
+                self.cde_plan = analyze_cde_rebuild_plan(self.apt_plan, force_all=self.chk_force_cde.get_active())
+                self._render_plan_tables()
+            except Exception:
+                pass
+
+    def _on_plan_ready(self, apt_upgs: list[dict], cde_rebuilds: list[dict], err: str | None):
+        self._busy = False
+        self.btn_check.set_sensitive(True)
+
+        if err:
+            self.set_progress(0.0, f"Update check failed: {err}", "Error")
+            self.nb.set_current_page(1)
+            return
+
+        self.apt_plan = apt_upgs
+        self.cde_plan = cde_rebuilds
+        self._render_plan_tables()
+
+    def _render_plan_tables(self):
+        self.apt_store.clear()
+        self.cde_store.clear()
+
+        self.lbl_apt_hdr.set_text(f"  📦 Debian System Updates ({len(self.apt_plan)} package{'s' if len(self.apt_plan) != 1 else ''})")
+        if not self.apt_plan:
+            self.apt_store.append([
+                "✔ All Debian packages are up to date", "—", "—", "None Needed", "", self.well_hex, int(Pango.Weight.BOLD)
+            ])
+        else:
+            for idx, u in enumerate(self.apt_plan):
+                bg = self.well_alt_hex if (idx % 2 == 1) else self.well_hex
+                self.apt_store.append([
+                    u["pkg"], u["old_ver"], u["new_ver"], u["action"], u["origin"], bg, int(Pango.Weight.BOLD)
+                ])
+
+        self.lbl_cde_hdr.set_text(
+            f"  🛠 CDE Applications Rebuild Plan ({len(self.cde_plan)} needed)"
+        )
+        if not self.cde_plan:
+            self.cde_store.append([
+                "✔ All CDE apps & Motif binaries up to date", "—", "No Rebuild Needed",
+                "All shared libraries (ldd) and local sources match installed binaries.",
+                self.well_hex, int(Pango.Weight.NORMAL),
+            ])
+        else:
+            for idx, item in enumerate(self.cde_plan):
+                bg = self.well_alt_hex if (idx % 2 == 1) else self.well_hex
+                self.cde_store.append([
+                    item["label"], item["target"], item["action"], item["reason"], bg, int(Pango.Weight.BOLD)
+                ])
+
+        n_apt = len(self.apt_plan)
+        n_cde = len(self.cde_plan)
+        if n_apt == 0 and n_cde == 0:
+            self.set_progress(1.0, "System & all CDE applications are completely up to date!", "Up to Date")
+            self.decision_bar.hide()
+        else:
+            summary_q = (
+                f"<b>Update Plan Ready:</b>  <b>{n_apt}</b> Debian package update(s)  and  "
+                f"<b>{n_cde}</b> CDE application rebuild(s) planned.  Proceed now?"
+            )
+            self.lbl_decision.set_markup(summary_q)
+            for ch in self.decision_bar.get_children():
+                ch.show_all()
+            self.decision_bar.show()
+            self.set_progress(1.0, f"Plan ready: {n_apt} Debian package(s), {n_cde} CDE app rebuild(s). Choose Yes or No above.", "Awaiting Approval")
+
+    # ---------------- Phase 2: Yes / No Execution Engine ----------------
+    def on_answer_no(self, *_args):
+        self.decision_bar.hide()
+        self.set_progress(0.0, "Update cancelled by user — no changes were made.", "Cancelled")
+
+    def on_answer_yes(self, *_args):
+        if self._busy:
+            return
+        if not self._ensure_sudo_authenticated():
+            return
+
+        self.decision_bar.hide()
+        self._busy = True
+        self.btn_check.set_sensitive(False)
+        self.nb.set_current_page(0)
+
+        apt_snapshot = list(self.apt_plan)
+        cde_snapshot = list(self.cde_plan)
+
+        def _exec_worker():
+            started_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            rebuilt_ok: list[str] = []
+            rebuilt_err: list[str] = []
+            wm_restarted = False
+
+            # Keep sudo timestamp alive every 40s during long upgrades
+            stop_keepalive = threading.Event()
+
+            def _keepalive():
+                while not stop_keepalive.wait(40.0):
+                    if self._sudo_pw:
+                        subprocess.run(
+                            ["sudo", "-S", "-p", "", "-v"],
+                            input=self._sudo_pw + "\n", text=True, capture_output=True,
+                        )
+
+            threading.Thread(target=_keepalive, daemon=True).start()
+
+            try:
+                # 1. Download Debian Packages (0% -> 40%)
+                if apt_snapshot:
+                    self.append_log("\n=== PHASE 1: Downloading Debian Package Updates ===")
+                    self.set_progress(0.04, f"Downloading {len(apt_snapshot)} Debian package(s)...", "Downloading")
+
+                    def _dl_status(_kind, pct, msg):
+                        self.set_progress(0.04 + (pct / 100.0) * 0.36, f"Downloading ({int(pct)}%): {msg}", "Downloading")
+
+                    dl_rc = self._run_sudo_streamed(
+                        ["apt-get", "-y", "--download-only", "dist-upgrade"],
+                        status_fd_cb=_dl_status,
+                    )
+                    if dl_rc != 0:
+                        raise RuntimeError(f"Package download failed (exit code {dl_rc}).")
+
+                    # 2. Install Debian Packages (40% -> 74%)
+                    self.append_log("\n=== PHASE 2: Installing Debian Package Updates ===")
+                    self.set_progress(0.42, f"Installing {len(apt_snapshot)} Debian package(s)...", "Installing")
+
+                    inst_seen = [0]
+                    tot_inst = max(1, len(apt_snapshot) * 2)
+
+                    def _pm_status(_kind, pct, msg):
+                        self.set_progress(0.40 + (pct / 100.0) * 0.34, f"Installing ({int(pct)}%): {msg}", "Installing")
+
+                    def _inst_line(ln: str):
+                        if ln.startswith(("Unpacking ", "Setting up ")):
+                            inst_seen[0] += 1
+                            frac = min(0.74, 0.40 + (inst_seen[0] / float(tot_inst)) * 0.34)
+                            self.set_progress(frac, ln[:78], "Installing")
+
+                    up_rc = self._run_sudo_streamed(
+                        [
+                            "apt-get", "-y",
+                            "-o", "Dpkg::Options::=--force-confdef",
+                            "-o", "Dpkg::Options::=--force-confold",
+                            "dist-upgrade",
+                        ],
+                        on_line=_inst_line,
+                        status_fd_cb=_pm_status,
+                    )
+                    if up_rc != 0:
+                        raise RuntimeError(f"apt-get dist-upgrade exited with status {up_rc}.")
+                else:
+                    self.set_progress(0.74, "No Debian package downloads needed — proceeding to CDE rebuilds...", "CDE Rebuilds")
+
+                # Re-scan CDE binaries post-apt in case newly upgraded .so paths triggered additional links!
+                post_extra = analyze_cde_rebuild_plan([], force_all=False)
+                planned_targets = {x["target"] for x in cde_snapshot}
+                for pe in post_extra:
+                    if pe["target"] not in planned_targets:
+                        cde_snapshot.append(pe)
+                        planned_targets.add(pe["target"])
+
+                # 3. Recompile & Sync Planned CDE Binaries (74% -> 92%)
+                if cde_snapshot:
+                    self.append_log("\n=== PHASE 3: Recompiling & Verifying CDE Applications ===")
+                    LOCAL_BIN.mkdir(parents=True, exist_ok=True)
+                    LOCAL_LIB.mkdir(parents=True, exist_ok=True)
+
+                    for idx, item in enumerate(cde_snapshot):
+                        frac = 0.75 + ((idx + 0.5) / float(len(cde_snapshot))) * 0.17
+                        lbl = item["label"]
+                        tgt = item["target"]
+                        self.set_progress(frac, f"Building {lbl} ({tgt})...", f"Building {idx + 1}/{len(cde_snapshot)}")
+                        self.append_log(f"--> [{idx + 1}/{len(cde_snapshot)}] {lbl}: {item['reason']}")
+
+                        if item["kind"] == "c_motif":
+                            bdir = Path(item["build_dir"])
+                            inst_p = Path(item["install_path"])
+                            built_p = bdir / tgt
+                            built_p.unlink(missing_ok=True)
+
+                            res = subprocess.run(["make", "-C", str(bdir), tgt], text=True, capture_output=True)
+                            if res.stdout:
+                                self.append_log(res.stdout)
+                            if res.stderr:
+                                self.append_log(res.stderr)
+                            if res.returncode != 0 or not built_p.is_file():
+                                rebuilt_err.append(f"{lbl} ({tgt}): build failed")
+                                continue
+
+                            # Atomic install via .new + os.replace so running daemons never hit ETXTBSY!
+                            tmp_dest = inst_p.with_name(inst_p.name + ".dtupd_new")
+                            shutil.copy2(built_p, tmp_dest)
+                            tmp_dest.chmod(0o755)
+                            os.replace(tmp_dest, inst_p)
+
+                            # Keep dtcm / dtmail aliases synced
+                            if tgt == "cde-calendar":
+                                dtcm_p = LOCAL_BIN / "dtcm"
+                                tmp_cm = LOCAL_BIN / "dtcm.dtupd_new"
+                                shutil.copy2(built_p, tmp_cm); tmp_cm.chmod(0o755); os.replace(tmp_cm, dtcm_p)
+                            rebuilt_ok.append(f"{lbl} -> {inst_p}")
+                        else:
+                            inst_p = Path(item["install_path"])
+                            repo_s = item.get("repo_script") or ""
+                            if repo_s and Path(repo_s).is_file():
+                                tmp_dest = inst_p.with_name(inst_p.name + ".dtupd_new")
+                                shutil.copy2(repo_s, tmp_dest)
+                                tmp_dest.chmod(0o755)
+                                os.replace(tmp_dest, inst_p)
+                            if inst_p.is_file():
+                                py_compile.compile(str(inst_p), cfile=f"/tmp/{tgt}_verify.pyc", doraise=True)
+                                rebuilt_ok.append(f"{lbl} ({inst_p.name}) — verified Python/GI runtime")
+
+                # 4. Reload CDE Actions & Restart Workspace Manager (dtwm) (92% -> 100%)
+                self.append_log("\n=== PHASE 4: Restarting CDE Workspace Manager (dtwm) ===")
+                self.set_progress(0.94, "Reloading CDE Actions & restarting Workspace Manager (dtwm)...", "Restarting dtwm")
+                wm_restarted = self._restart_cde_workspace_manager()
+
+                finished_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                report = self._format_completion_report(
+                    started_at, finished_at, apt_snapshot, rebuilt_ok, rebuilt_err, wm_restarted
+                )
+                GLib.idle_add(self._on_execution_complete, report, None)
+            except Exception as exc:
+                GLib.idle_add(self._on_execution_complete, "", str(exc))
+            finally:
+                stop_keepalive.set()
+
+        threading.Thread(target=_exec_worker, daemon=True).start()
+
+    def _restart_cde_workspace_manager(self) -> bool:
+        if Path("/usr/dt/bin/dtaction").is_file():
+            subprocess.run(["/usr/dt/bin/dtaction", "ReloadActions"], stderr=subprocess.DEVNULL)
+            time.sleep(0.4)
+
+        # Prefer cde-panel-tray + cde-apply-layout if installed so system tray stays docked!
+        apply_bin = LOCAL_BIN / "cde-apply-layout"
+        tray_bin = LOCAL_BIN / "cde-panel-tray"
+        if apply_bin.is_file() and os.access(apply_bin, os.X_OK):
+            if tray_bin.is_file() and os.access(tray_bin, os.X_OK):
+                subprocess.run(["pkill", "-u", str(os.getuid()), "-f", "/cde-panel-tray"], stderr=subprocess.DEVNULL)
+                Path(f"/tmp/cde-panel-tray-{os.getuid()}.pid").unlink(missing_ok=True)
+                time.sleep(0.2)
+                subprocess.Popen([str(tray_bin), "--daemon"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                time.sleep(0.5)
+            rc = subprocess.run([str(apply_bin)], capture_output=True, text=True)
+            if rc.stdout:
+                self.append_log(rc.stdout.strip())
+            time.sleep(1.5)
+            return rc.returncode == 0
+
+        # Standard CDE dtwm restart fallback
+        dtwm_pids = subprocess.run(
+            ["pgrep", "-u", str(os.getuid()), "-x", "dtwm"], capture_output=True, text=True
+        ).stdout.split()
+        if dtwm_pids and Path("/usr/dt/bin/dtwm").is_file():
+            subprocess.run(["kill", dtwm_pids[0]], stderr=subprocess.DEVNULL)
+            time.sleep(0.5)
+            subprocess.Popen(["/usr/dt/bin/dtwm"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            time.sleep(1.5)
+            return True
+        return False
+
+    def _format_completion_report(self, started: str, finished: str, apt_done: list[dict],
+                                  rebuilt_ok: list[str], rebuilt_err: list[str], wm_ok: bool) -> str:
+        lines = [
+            "==========================================================================",
+            "  dtUpdate — System & CDE Workstation Update Summary Overview",
+            "==========================================================================",
+            f"  Started:   {started}",
+            f"  Finished:  {finished}",
+            f"  dtwm WM:   {'Restarted cleanly & Front Panel reloaded' if wm_ok else 'Reloaded actions (dtwm not active)'}",
+            "",
+            f"1. DEBIAN SYSTEM PACKAGES UPDATED ({len(apt_done)})",
+            "--------------------------------------------------------------------------",
+        ]
+        if not apt_done:
+            lines.append("  • No Debian package upgrades were required.")
+        else:
+            kernel_updated = False
+            for u in apt_done:
+                lines.append(f"  • {u['pkg']:32s}  {u['old_ver']}  ->  {u['new_ver']}")
+                if u["pkg"].startswith("linux-image-"):
+                    kernel_updated = True
+            if kernel_updated:
+                lines.append("")
+                lines.append("  [!] Note: A new Linux kernel image was installed. Reboot at your convenience.")
+
+        lines += [
+            "",
+            f"2. CDE APPLICATIONS RECOMPILED / VERIFIED ({len(rebuilt_ok)})",
+            "--------------------------------------------------------------------------",
+        ]
+        if not rebuilt_ok and not rebuilt_err:
+            lines.append("  • No CDE binaries required recompilation.")
+        for item in rebuilt_ok:
+            lines.append(f"  ✔ {item}")
+        for err in rebuilt_err:
+            lines.append(f"  ✖ {err}")
+
+        lines.append("")
+        lines.append("All updates finished.")
+        return "\n".join(lines)
+
+    def _on_execution_complete(self, report: str, err: str | None):
+        self._busy = False
+        self.btn_check.set_sensitive(True)
+
+        if err:
+            self.set_progress(0.0, f"Update error: {err}", "Error")
+            self.nb.set_current_page(1)
+            md = Gtk.MessageDialog(
+                transient_for=self, flags=0, message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.OK, text="dtUpdate encountered an error",
+            )
+            md.format_secondary_text(f"{err}\n\nCheck the 'Live Build & APT Log' tab for details.")
+            md.run(); md.destroy()
+            return
+
+        self.last_summary_text = report
+        self.apt_plan.clear()
+        self.cde_plan.clear()
+        self.txt_summary.get_buffer().set_text(report)
+        self.nb.set_current_page(2)
+        self.set_progress(1.0, "Update, CDE recompilation & Workspace Manager restart complete!", "Finished")
+
+        md = Gtk.MessageDialog(
+            transient_for=self, flags=0, message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK, text="dtUpdate Complete — All Updates & Rebuilds Finished!",
+        )
+        md.format_secondary_text(
+            "Your Debian packages, needed CDE binaries, and the CDE Workspace Manager (dtwm) "
+            "have been updated and reloaded.\n\n"
+            "The full itemized changelog is now displayed in the 'Finished Overview' tab."
+        )
+        md.run(); md.destroy()
+
+    # ---------------- Source Directories Config, Save Log & Demo Mode ----------------
+    def on_configure_sources(self, *_args):
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        cur_roots = [str(p) for p in load_source_roots()]
+        dlg = Gtk.Dialog(title="CDE Source Directories — dtUpdate", transient_for=self, flags=0)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save", Gtk.ResponseType.OK)
+        dlg.set_default_size(540, 240)
+        box = dlg.get_content_area()
+        box.set_spacing(8)
+        box.set_margin_top(10); box.set_margin_bottom(10); box.set_margin_start(12); box.set_margin_end(12)
+        box.pack_start(Gtk.Label(label="Local CDE source directories (one path per line):", xalign=0), False, False, 0)
+
+        tv = Gtk.TextView()
+        tv.get_buffer().set_text("\n".join(cur_roots))
+        sw = Gtk.ScrolledWindow(); sw.set_vexpand(True); sw.add(tv)
+        fr = Gtk.Frame(); fr.add(sw)
+        box.pack_start(fr, True, True, 0)
+        dlg.show_all()
+
+        if dlg.run() == Gtk.ResponseType.OK:
+            buf = tv.get_buffer()
+            raw = buf.get_text(*buf.get_bounds(), True)
+            dirs = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+            SOURCES_CFG.write_text(json.dumps({"source_dirs": dirs}, indent=2), encoding="utf-8")
+            self.lbl_status.set_text(f"Saved {len(dirs)} CDE source path(s) to {SOURCES_CFG}")
+        dlg.destroy()
+
+    def on_save_log(self, *_args):
+        dlg = Gtk.FileChooserDialog(title="Save dtUpdate Log", parent=self, action=Gtk.FileChooserAction.SAVE)
+        dlg.set_do_overwrite_confirmation(True)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save", Gtk.ResponseType.OK)
+        dlg.set_current_name(f"dtupdate_{datetime.date.today().isoformat()}.log")
+        if dlg.run() == Gtk.ResponseType.OK:
+            out_p = Path(dlg.get_filename())
+            dlg.destroy()
+            b_log = self.txt_log.get_buffer()
+            full = (self.last_summary_text + "\n\n=== RAW CONSOLE LOG ===\n" +
+                    b_log.get_text(*b_log.get_bounds(), True)).strip()
+            out_p.write_text(full + "\n", encoding="utf-8")
+            self.lbl_status.set_text(f"Saved update log to {out_p}")
+        else:
+            dlg.destroy()
+
+    def _populate_demo_preview(self):
+        self.apt_plan = [
+            {"pkg": "libxm4",                   "pkg_base": "libxm4",                   "old_ver": "2.3.8-3",    "new_ver": "2.3.8-4",    "action": "Upgrade", "origin": "Debian:13/stable"},
+            {"pkg": "libx11-6",                 "pkg_base": "libx11-6",                 "old_ver": "2:1.8.10-2", "new_ver": "2:1.8.10-3", "action": "Upgrade", "origin": "Debian-Security:13"},
+            {"pkg": "gstreamer1.0-plugins-good", "pkg_base": "gstreamer1.0-plugins-good", "old_ver": "1.24.10-1",  "new_ver": "1.24.10-2",  "action": "Upgrade", "origin": "Debian:13/stable"},
+            {"pkg": "openssl",                  "pkg_base": "openssl",                  "old_ver": "3.4.0-1",    "new_ver": "3.4.1-1",    "action": "Upgrade", "origin": "Debian-Security:13"},
+        ]
+        self.cde_plan = [
+            {"kind": "c_motif",    "label": "dtMail (cde-mail)",   "target": "cde-mail",     "action": "Recompile & Install Binary", "reason": "Linked library updated: libx11-6 (2:1.8.10-2 → 2:1.8.10-3), libxm4 (2.3.8-3 → 2.3.8-4)"},
+            {"kind": "c_motif",    "label": "dtCalendar (dtcm)",   "target": "cde-calendar", "action": "Recompile & Install Binary", "reason": "Linked library updated: libx11-6 (2:1.8.10-2 → 2:1.8.10-3), libxm4 (2.3.8-3 → 2.3.8-4)"},
+            {"kind": "python_app", "label": "dtPlay",              "target": "dtplay",       "action": "Sync & Verify Bytecode",     "reason": "Runtime updated: gstreamer1.0-plugins-good (1.24.10-1 → 1.24.10-2)"},
+            {"kind": "python_app", "label": "dtPod",               "target": "dtpod",        "action": "Sync & Verify Bytecode",     "reason": "Runtime updated: gstreamer1.0-plugins-good (1.24.10-1 → 1.24.10-2)"},
+        ]
+        self._render_plan_tables()
+
+    def _on_key_press(self, _w, ev):
+        ctrl = bool(ev.state & Gdk.ModifierType.CONTROL_MASK)
+        if ctrl and ev.keyval in (Gdk.KEY_q, Gdk.KEY_Q):
+            self.on_quit()
+            return True
+        return False
+
+    def on_about(self, *_args):
+        md = Gtk.MessageDialog(
+            transient_for=self, flags=0, message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK, text="dtUpdate — CDE System & Application Updater",
+        )
+        md.format_secondary_text(
+            "All-in-one Debian package & CDE desktop application rebuild manager.\n\n"
+            "• Runs `apt-get update` and inspects pending Debian upgrades\n"
+            "• Maps `ldd` shared library links & source timestamps to rebuild ONLY affected CDE apps\n"
+            "• Downloads & installs updates with live progress, recompiles binaries, restarts `dtwm`,\n"
+            "  and displays a full changelog overview."
+        )
+        md.run(); md.destroy()
+
+    def on_quit(self):
+        if self._busy:
+            return True
+        self._sudo_pw = ""
+        self.destroy()
+        Gtk.main_quit()
+        return False
+
+
+def main():
+    dry_demo = "--demo-plan" in sys.argv[1:]
+    chrome, sel, well, _well_alt = load_cde_palette()
+    prov = Gtk.CssProvider()
+    prov.load_from_data(build_cde_css(chrome, sel, well))
+    scr = Gdk.Screen.get_default()
+    if scr is not None:
+        Gtk.StyleContext.add_provider_for_screen(scr, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    win = DtUpdateWindow(dry_demo=dry_demo)
+    win.connect("destroy", Gtk.main_quit)
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

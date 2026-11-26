@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=dtPlay
+Comment=dtPlay — CDE Music & Movie Player with 60s Clip Studio.
+Exec=__HOME__/.local/bin/dtplay %f
+Icon=__HOME__/.dt/icons/dtplay.l.pm
+Terminal=false
+MimeType=audio/wav;audio/mpeg;audio/mp4;audio/flac;audio/ogg;audio/opus;video/mp4;video/quicktime;video/x-msvideo;video/mpeg;video/x-matroska;video/webm;

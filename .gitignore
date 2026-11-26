@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.o
+cde-mail
+cde-calendar
+tokens.json
+config.json
+*.db
+*.db-wal
+*.db-shm
+.DS_Store

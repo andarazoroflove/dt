@@ -1,0 +1,22 @@
+set DtDbVersion=1.0
+
+ACTION dtPaint
+{
+     LABEL         dtPaint
+     ICON          dtpaint
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtpaint "%(File)Arg_1%"
+     DESCRIPTION   dtPaint — CDE MS Paint Clone & Universal Image Editor.
+}
+
+ACTION dtPaint
+{
+     LABEL         dtPaint
+     ARG_COUNT     0
+     ICON          dtpaint
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtpaint
+     DESCRIPTION   dtPaint — CDE MS Paint Clone & Universal Image Editor.
+}

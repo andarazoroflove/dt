@@ -1,0 +1,2070 @@
+#!/usr/bin/env python3
+"""
+dtIRC — Common Desktop Environment (CDE) Full-Featured IRC Client
+Pre-wired for Libera.Chat TLS (irc.libera.chat:6697) with Saved NickServ Identity.
+
+Features:
+  - Direct TLS connection to irc.libera.chat:6697 (or custom server)
+  - Saved NickServ account/password + customizable IDENTIFY command & SASL PLAIN support
+  - Left-hand Channel User List sorted by rank (~ & @ % +) with Right-Click Op Menu
+    (Op/Deop, Voice/Devoice, HalfOp, Kick, Ban *!*@host, Kick+Ban, Quiet/Unquiet, WHOIS, PM, CTCP)
+  - Channel Topic bar editable directly at the top of the window (Enter / Set Topic)
+  - Full mIRC 00-99 color & formatting engine (\x03FG,BG, Bold, Italic, Underline, Reverse)
+    specifically refactored for high legibility on CDE's warm cream (#FFF7E9) well background!
+  - Instant Text Size scaling buttons ([A−] [12pt] [A＋] + Ctrl++/Ctrl+-) for easy reading
+  - Complete / command suite (/join, /part, /msg, /query, /me, /nick, /ns, /cs, /identify,
+    /whois, /whowas, /who, /topic, /mode, /op, /deop, /voice, /devoice, /kick, /ban, /unban,
+    /kb, /quiet, /unquiet, /invite, /list, /names, /away, /back, /ctcp, /ping, /ignore, /raw...)
+"""
+
+import base64
+import datetime
+import getpass
+import json
+import os
+import re
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import webbrowser
+from pathlib import Path
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("Pango", "1.0")
+from gi.repository import Gdk, GLib, Gtk, Pango
+
+HOME = Path.home()
+DT_ICONS = HOME / ".dt" / "icons"
+CONFIG_DIR = HOME / ".config" / "dtirc"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+LOG_DIR = CONFIG_DIR / "logs"
+
+DEFAULT_HOST = "irc.libera.chat"
+DEFAULT_PORT = 6697
+
+# ---------------------------------------------------------------------------
+# Refactored mIRC Color Palette for Warm Cream (#FFF7E9) CDE Background
+# ---------------------------------------------------------------------------
+# Foreground palette: tuned so light colors (yellow, lime, cyan, silver, white)
+# remain vivid yet crisp and high-contrast on #FFF7E9 cream!
+MIRC_FG_CREAM = {
+    0:  "#F8FAFC",  # 00 White (given dark slate pill bg if no explicit BG is set!)
+    1:  "#101218",  # 01 Black
+    2:  "#1A365D",  # 02 Navy Blue
+    3:  "#166534",  # 03 Forest Green
+    4:  "#C5221F",  # 04 Crisp Red
+    5:  "#7F1D1D",  # 05 Maroon / Brown
+    6:  "#6B21A8",  # 06 Royal Purple
+    7:  "#B45309",  # 07 Rich Orange
+    8:  "#8A5A00",  # 08 Goldenrod Amber (replaces unreadable neon yellow on cream!)
+    9:  "#15803D",  # 09 Emerald Green (replaces washed-out lime on cream!)
+    10: "#0F766E",  # 10 Deep Teal
+    11: "#0369A1",  # 11 Ocean Cyan (replaces pale aqua on cream!)
+    12: "#1D4ED8",  # 12 Royal Blue
+    13: "#BE185D",  # 13 Crimson Magenta
+    14: "#475569",  # 14 Slate Grey
+    15: "#64748B",  # 15 Medium Steel Grey (replaces invisible light grey!)
+}
+
+# True mIRC background colors when ',BG' highlight is explicitly used
+MIRC_BG_TRUE = {
+    0:  "#FFFFFF",
+    1:  "#18181B",
+    2:  "#1E3A8A",
+    3:  "#DCFCE7",
+    4:  "#FEE2E2",
+    5:  "#F5D0C5",
+    6:  "#F3E8FF",
+    7:  "#FFEDD5",
+    8:  "#FEF08A",
+    9:  "#BBF7D0",
+    10: "#CCFBF1",
+    11: "#E0F2FE",
+    12: "#DBEAFE",
+    13: "#FCE7F3",
+    14: "#E2E8F0",
+    15: "#F1F5F9",
+}
+
+# Extended mIRC 16-98 cube fallback helper
+def get_mirc_fg(code: int) -> str:
+    if code in MIRC_FG_CREAM:
+        return MIRC_FG_CREAM[code]
+    if 16 <= code <= 87:
+        idx = code - 16
+        r = (idx // 12) * 36
+        g = ((idx // 2) % 6) * 36
+        b = (idx % 2) * 140
+        # Clamp overly bright luma on cream
+        if 0.299 * r + 0.587 * g + 0.114 * b > 185:
+            r, g, b = int(r * 0.55), int(g * 0.55), int(b * 0.55)
+        return f"#{r:02X}{g:02X}{b:02X}"
+    return "#1E293B"
+
+
+def get_mirc_bg(code: int) -> str:
+    return MIRC_BG_TRUE.get(code % 16, "#E2E8F0")
+
+
+NICK_PALETTE_CREAM = [
+    "#1D4ED8", "#B45309", "#15803D", "#6B21A8", "#BE185D",
+    "#0F766E", "#991B1B", "#1E3A8A", "#0369A1", "#4338CA",
+]
+
+
+def nick_color(nick: str) -> str:
+    clean = nick.lstrip("~&@%+")
+    h = sum(ord(c) * (i + 3) for i, c in enumerate(clean.lower()))
+    return NICK_PALETTE_CREAM[h % len(NICK_PALETTE_CREAM)]
+
+
+# ---------------------------------------------------------------------------
+# CDE Active Motif Palette & GTK3 CSS
+# ---------------------------------------------------------------------------
+def _shade_hex(hex_col: str, factor: float) -> str:
+    h = hex_col.lstrip("#")
+    if len(h) != 6:
+        return hex_col
+    r = max(0, min(255, int(int(h[0:2], 16) * factor)))
+    g = max(0, min(255, int(int(h[2:4], 16) * factor)))
+    b = max(0, min(255, int(int(h[4:6], 16) * factor)))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def load_cde_palette() -> tuple[str, str, str]:
+    chrome, sel, well = "#aeb2c3", "#2c567e", "#fff7e9"
+    try:
+        out = subprocess.check_output(["xrdb", "-query"], text=True, stderr=subprocess.DEVNULL)
+        pal_name = "Crimson.dp"
+        for ln in out.splitlines():
+            if "ColorPalette:" in ln:
+                pal_name = ln.split(":", 1)[1].strip()
+                break
+        for pdir in (HOME / ".dt/palettes", Path("/usr/dt/palettes")):
+            pf = pdir / pal_name
+            if pf.is_file():
+                hexes = [l.strip() for l in pf.read_text().splitlines() if l.strip().startswith("#")]
+                if len(hexes) >= 4:
+                    def norm16(h):
+                        h = h.lstrip("#")
+                        return f"#{h[0:2]}{h[4:6]}{h[8:10]}" if len(h) == 12 else "#" + h[:6]
+                    chrome, sel, well = norm16(hexes[1]), norm16(hexes[2]), norm16(hexes[3])
+                break
+    except Exception:
+        pass
+    return chrome, sel, well
+
+
+def build_cde_css(chrome: str, sel: str, well: str, font_pt: int) -> bytes:
+    chrome_hi = _shade_hex(chrome, 1.06)
+    chrome_lo = _shade_hex(chrome, 0.88)
+    list_pt = max(9, font_pt - 1)
+    css = f"""
+    window, dialog, .background {{
+        background-color: {chrome};
+        color: #101014;
+        font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+        font-size: 9.5pt;
+    }}
+    menubar {{
+        background-color: {chrome};
+        border-bottom: 2px solid #585c6c;
+    }}
+    menuitem:hover {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    .cde-toolbar {{
+        background-color: {chrome};
+        padding: 4px 6px;
+        border-top: 2px solid #e6e9f2;
+        border-left: 2px solid #e6e9f2;
+        border-right: 2px solid #585c6c;
+        border-bottom: 2px solid #585c6c;
+    }}
+    .cde-topicbar {{
+        background-color: {chrome};
+        padding: 4px 6px;
+        border-bottom: 2px solid #585c6c;
+    }}
+    .cde-tabbar {{
+        background-color: {chrome_lo};
+        padding: 3px 5px;
+        border-top: 2px solid #585c6c;
+        border-bottom: 2px solid #e6e9f2;
+    }}
+    .cde-status {{
+        background-color: {chrome};
+        padding: 3px 8px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+    }}
+    frame {{
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+        border-radius: 0px;
+    }}
+    button {{
+        background-image: none;
+        background-color: {chrome};
+        color: #101014;
+        border-top: 2px solid #e6e9f2;
+        border-left: 2px solid #e6e9f2;
+        border-right: 2px solid #565a69;
+        border-bottom: 2px solid #565a69;
+        border-radius: 0px;
+        padding: 3px 8px;
+        box-shadow: none;
+    }}
+    button:hover {{
+        background-color: {chrome_hi};
+    }}
+    button:active, button:checked {{
+        background-color: {well};
+        border-top: 2px solid #565a69;
+        border-left: 2px solid #565a69;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+        font-weight: bold;
+    }}
+    button.cde-tab-unread {{
+        color: #1d4ed8;
+        font-weight: bold;
+    }}
+    button.cde-tab-ping {{
+        background-color: #fde68a;
+        color: #7c2d12;
+        font-weight: bold;
+    }}
+    button.cde-connect {{
+        background-color: #266048;
+        color: #ffffff;
+        border-top: 2px solid #52997b;
+        border-left: 2px solid #52997b;
+        border-right: 2px solid #113023;
+        border-bottom: 2px solid #113023;
+        font-weight: bold;
+    }}
+    button.cde-connect label {{ color: #ffffff; }}
+    button.cde-ident {{
+        background-color: #2b5b84;
+        color: #ffffff;
+        border-top: 2px solid #6899c4;
+        border-left: 2px solid #6899c4;
+        border-right: 2px solid #142c40;
+        border-bottom: 2px solid #142c40;
+        font-weight: bold;
+    }}
+    button.cde-ident label {{ color: #ffffff; }}
+    textview.irc-chat, textview.irc-chat text {{
+        background-color: {well};
+        color: #101218;
+        font-family: "DejaVu Sans Mono", "Liberation Mono", monospace;
+        font-size: {font_pt}pt;
+    }}
+    entry.irc-input {{
+        background-color: {well};
+        color: #101218;
+        font-family: "DejaVu Sans Mono", "Liberation Mono", monospace;
+        font-size: {font_pt}pt;
+        border-radius: 0px;
+    }}
+    entry {{
+        background-color: {well};
+        color: #101218;
+        border-radius: 0px;
+    }}
+    treeview.irc-users {{
+        background-color: {well};
+        color: #101218;
+        font-size: {list_pt}pt;
+    }}
+    treeview:selected {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    """
+    return css.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# mIRC Formatting Parser & Tokenizer
+# ---------------------------------------------------------------------------
+MIRC_COLOR_RE = re.compile(r"^\x03(\d{1,2})?(?:,(\d{1,2}))?")
+URL_RE = re.compile(r"(https?://[^\s<>()\"']+)")
+
+
+def strip_mirc_codes(text: str) -> str:
+    s = re.sub(r"\x03\d{0,2}(?:,\d{1,2})?", "", text)
+    return re.sub(r"[\x02\x1d\x1f\x16\x0f]", "", s)
+
+
+def parse_mirc_spans(text: str) -> list[tuple[str, dict]]:
+    """
+    Parse mIRC control codes into [(substring, style_dict), ...].
+    Handles \x02 (bold), \x1D (italic), \x1F (underline), \x16 (reverse),
+    \x03FG,BG (colors 00-99), and \x0F (reset).
+    """
+    spans: list[tuple[str, dict]] = []
+    cur_style = {"bold": False, "italic": False, "underline": False, "reverse": False, "fg": None, "bg": None}
+    buf = []
+    i = 0
+    n = len(text)
+
+    def _flush():
+        if buf:
+            spans.append(("".join(buf), dict(cur_style)))
+            buf.clear()
+
+    while i < n:
+        ch = text[i]
+        if ch == "\x02":
+            _flush(); cur_style["bold"] = not cur_style["bold"]; i += 1
+        elif ch == "\x1d":
+            _flush(); cur_style["italic"] = not cur_style["italic"]; i += 1
+        elif ch == "\x1f":
+            _flush(); cur_style["underline"] = not cur_style["underline"]; i += 1
+        elif ch == "\x16":
+            _flush(); cur_style["reverse"] = not cur_style["reverse"]; i += 1
+        elif ch == "\x0f":
+            _flush()
+            cur_style = {"bold": False, "italic": False, "underline": False, "reverse": False, "fg": None, "bg": None}
+            i += 1
+        elif ch == "\x03":
+            _flush()
+            m = MIRC_COLOR_RE.match(text[i:])
+            if m:
+                fg_s, bg_s = m.group(1), m.group(2)
+                if fg_s is None and bg_s is None:
+                    cur_style["fg"] = None
+                    cur_style["bg"] = None
+                else:
+                    if fg_s is not None:
+                        cur_style["fg"] = int(fg_s)
+                    if bg_s is not None:
+                        cur_style["bg"] = int(bg_s)
+                i += m.end()
+            else:
+                i += 1
+        else:
+            buf.append(ch)
+            i += 1
+
+    _flush()
+    return spans
+
+
+# ---------------------------------------------------------------------------
+# IRC Protocol Line Parser (RFC 1459 / IRCv3)
+# ---------------------------------------------------------------------------
+def parse_irc_line(line: str) -> tuple[str, str, list[str]]:
+    """Return (prefix, command, params_list)."""
+    s = line.rstrip("\r\n")
+    if s.startswith("@"):
+        # Strip IRCv3 message tags if any
+        sp = s.find(" ")
+        s = s[sp + 1:].lstrip() if sp != -1 else ""
+    prefix = ""
+    if s.startswith(":"):
+        sp = s.find(" ")
+        if sp != -1:
+            prefix = s[1:sp]
+            s = s[sp + 1:].lstrip()
+        else:
+            return s[1:], "", []
+
+    trailing = None
+    if " :" in s:
+        idx = s.find(" :")
+        trailing = s[idx + 2:]
+        s = s[:idx]
+    elif s.startswith(":"):
+        trailing = s[1:]
+        s = ""
+
+    parts = s.split() if s else []
+    cmd = parts.pop(0).upper() if parts else ""
+    if trailing is not None:
+        parts.append(trailing)
+    return prefix, cmd, parts
+
+
+def split_prefix(prefix: str) -> tuple[str, str, str]:
+    """Split nick!user@host -> (nick, user, host)."""
+    if "!" in prefix:
+        nick, rest = prefix.split("!", 1)
+        if "@" in rest:
+            user, host = rest.split("@", 1)
+            return nick, user, host
+        return nick, rest, ""
+    return prefix, "", ""
+
+
+RANK_ORDER = {"~": 0, "&": 1, "@": 2, "%": 3, "+": 4, "": 5}
+MODE_TO_PREFIX = {"q": "~", "a": "&", "o": "@", "h": "%", "v": "+"}
+
+
+# ---------------------------------------------------------------------------
+# Per-Buffer Data Model (Server Tab, #Channel Tab, or Private Message Tab)
+# ---------------------------------------------------------------------------
+class IrcBuffer:
+    def __init__(self, name: str, kind: str):
+        self.name = name          # e.g. "*Libera.Chat*", "#cde", "Alice"
+        self.kind = kind          # "server", "channel", "query"
+        self.topic: str = ""
+        self.topic_meta: str = ""
+        self.users: dict[str, set[str]] = {}  # lower_nick -> set of prefix chars ('@', '+', etc.)
+        self.display_nicks: dict[str, str] = {}  # lower_nick -> exact-case nick
+        self.unread: bool = False
+        self.highlight: bool = False
+
+        self.textbuf = Gtk.TextBuffer()
+        self.textview = Gtk.TextView(buffer=self.textbuf, editable=False, cursor_visible=False)
+        self.textview.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.textview.set_left_margin(8)
+        self.textview.set_right_margin(8)
+        self.textview.set_top_margin(6)
+        self.textview.set_bottom_margin(6)
+        self.textview.get_style_context().add_class("irc-chat")
+
+        self.scroll = Gtk.ScrolledWindow()
+        self.scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.scroll.add(self.textview)
+        self._tag_cache: dict[tuple, Gtk.TextTag] = {}
+
+    def highest_prefix(self, lnick: str) -> str:
+        prefs = self.users.get(lnick, set())
+        for p in ("~", "&", "@", "%", "+"):
+            if p in prefs:
+                return p
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Server & NickServ Identity Setup Dialog
+# ---------------------------------------------------------------------------
+class IdentityDialog(Gtk.Dialog):
+    def __init__(self, parent, cfg: dict):
+        super().__init__(title="Libera.Chat & NickServ Identity — dtIRC", transient_for=parent, flags=0)
+        self.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save & Apply", Gtk.ResponseType.OK)
+        self.set_default_size(500, 420)
+
+        box = self.get_content_area()
+        box.set_spacing(8)
+        box.set_margin_top(10); box.set_margin_bottom(10); box.set_margin_start(12); box.set_margin_end(12)
+
+        fr_srv = Gtk.Frame(label=" IRC Server (Default: Libera.Chat TLS) ")
+        gs = Gtk.Grid(column_spacing=8, row_spacing=6, margin=8)
+        fr_srv.add(gs)
+        self.ent_host = Gtk.Entry(text=cfg.get("host", DEFAULT_HOST), hexpand=True)
+        self.sp_port = Gtk.SpinButton.new_with_range(1, 65535, 1)
+        self.sp_port.set_value(int(cfg.get("port", DEFAULT_PORT)))
+        self.chk_tls = Gtk.CheckButton(label="Use SSL/TLS (Port 6697)", active=bool(cfg.get("tls", True)))
+        gs.attach(Gtk.Label(label="Server Host:", xalign=0), 0, 0, 1, 1); gs.attach(self.ent_host, 1, 0, 1, 1)
+        gs.attach(Gtk.Label(label="Port:", xalign=0), 0, 1, 1, 1);        gs.attach(self.sp_port, 1, 1, 1, 1)
+        gs.attach(self.chk_tls, 1, 2, 1, 1)
+        box.pack_start(fr_srv, False, False, 0)
+
+        fr_id = Gtk.Frame(label=" Nickname & Saved NickServ Authentication ")
+        gi_grid = Gtk.Grid(column_spacing=8, row_spacing=6, margin=8)
+        fr_id.add(gi_grid)
+
+        self.ent_nick = Gtk.Entry(text=cfg.get("nick", ""), hexpand=True)
+        self.ent_altnick = Gtk.Entry(text=cfg.get("alt_nick", ""), hexpand=True)
+        self.ent_user = Gtk.Entry(text=cfg.get("username", ""), hexpand=True)
+        self.ent_real = Gtk.Entry(text=cfg.get("realname", "CDE dtIRC User"), hexpand=True)
+        self.ent_ns_acct = Gtk.Entry(text=cfg.get("ns_account", ""), hexpand=True)
+        self.ent_ns_acct.set_placeholder_text("Leave blank to use Nickname")
+        self.ent_ns_pass = Gtk.Entry(text=cfg.get("ns_password", ""), visibility=False, hexpand=True)
+        self.ent_ns_pass.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+        self.chk_show_pw = Gtk.CheckButton(label="Show password")
+        self.chk_show_pw.connect("toggled", lambda c: self.ent_ns_pass.set_visibility(c.get_active()))
+
+        self.ent_ns_cmd = Gtk.Entry(
+            text=cfg.get("ns_command", "/msg NickServ IDENTIFY {account} {password}"),
+            hexpand=True,
+        )
+        self.chk_auto_id = Gtk.CheckButton(
+            label="Auto-Identify on connect (SASL PLAIN + NickServ IDENTIFY)",
+            active=bool(cfg.get("auto_identify", True)),
+        )
+        self.ent_chans = Gtk.Entry(text=cfg.get("auto_channels", "#libera, #linux"), hexpand=True)
+
+        rows = [
+            ("Nickname:", self.ent_nick),
+            ("Alt Nickname:", self.ent_altnick),
+            ("Username:", self.ent_user),
+            ("Real Name:", self.ent_real),
+            ("NickServ Account:", self.ent_ns_acct),
+            ("NickServ Password:", self.ent_ns_pass),
+            ("", self.chk_show_pw),
+            ("Ident Command:", self.ent_ns_cmd),
+            ("", self.chk_auto_id),
+            ("Auto-Join Channels:", self.ent_chans),
+        ]
+        for r_idx, (lbl_t, wdg) in enumerate(rows):
+            if lbl_t:
+                gi_grid.attach(Gtk.Label(label=lbl_t, xalign=0), 0, r_idx, 1, 1)
+            gi_grid.attach(wdg, 1, r_idx, 1, 1)
+
+        box.pack_start(fr_id, False, False, 0)
+        self.show_all()
+
+    def get_updated_config(self, base: dict) -> dict:
+        out = dict(base)
+        out["host"] = self.ent_host.get_text().strip() or DEFAULT_HOST
+        out["port"] = int(self.sp_port.get_value())
+        out["tls"] = self.chk_tls.get_active()
+        out["nick"] = self.ent_nick.get_text().strip() or f"cde_{getpass.getuser()}"
+        out["alt_nick"] = self.ent_altnick.get_text().strip() or (out["nick"] + "_")
+        out["username"] = self.ent_user.get_text().strip() or getpass.getuser()
+        out["realname"] = self.ent_real.get_text().strip() or "CDE dtIRC User"
+        out["ns_account"] = self.ent_ns_acct.get_text().strip()
+        out["ns_password"] = self.ent_ns_pass.get_text()
+        out["ns_command"] = self.ent_ns_cmd.get_text().strip() or "/msg NickServ IDENTIFY {account} {password}"
+        out["auto_identify"] = self.chk_auto_id.get_active()
+        out["auto_channels"] = self.ent_chans.get_text().strip()
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Main dtIRC Window & IRC Client Engine
+# ---------------------------------------------------------------------------
+class DtIrcWindow(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="dtIRC — Libera.Chat CDE IRC Client")
+        self.set_wmclass("dtirc", "DtIrc")
+        self.set_default_size(1120, 720)
+        self.set_position(Gtk.WindowPosition.CENTER)
+
+        ic = DT_ICONS / "dtirc.l.pm"
+        if ic.is_file():
+            try:
+                self.set_icon_from_file(str(ic))
+            except Exception:
+                pass
+
+        self.chrome_hex, self.sel_hex, self.well_hex = load_cde_palette()
+        self.css_provider = Gtk.CssProvider()
+        scr = Gdk.Screen.get_default()
+        if scr is not None:
+            Gtk.StyleContext.add_provider_for_screen(scr, self.css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        # Load persistent config & NickServ credentials
+        self.cfg = self._load_config()
+        self.font_pt: int = int(self.cfg.get("font_pt", 11))
+        self._apply_css()
+
+        # IRC Networking & Protocol state
+        self.sock: socket.socket | None = None
+        self.sock_lock = threading.Lock()
+        self.connected: bool = False
+        self.registered: bool = False
+        self.current_nick: str = self.cfg["nick"]
+        self.user_hosts: dict[str, str] = {}   # lower_nick -> user@host (for accurate *!*@host bans!)
+        self.ignored_nicks: set[str] = set(x.lower() for x in self.cfg.get("ignored", []))
+        self._names_accum: set[str] = set()    # channels currently receiving 353 NAMES
+        self._sasl_in_progress: bool = False
+        self._ident_sent_this_session: bool = False
+
+        # UI Buffers & Input History
+        self.buffers: dict[str, IrcBuffer] = {}
+        self.buffer_order: list[str] = []
+        self.active_buf_key: str = ""
+        self.cmd_history: list[str] = []
+        self.hist_idx: int = 0
+
+        self._build_ui()
+
+        # Create primary *Libera.Chat* server buffer
+        srv_buf = self._ensure_buffer("*Libera.Chat*", "server", switch=True)
+        self._append_system(
+            srv_buf,
+            "Welcome to dtIRC for Common Desktop Environment (CDE)!\n"
+            "• Wired to irc.libera.chat:6697 (TLS). Click [🔑 NickServ Setup] to save your password & ident command.\n"
+            "• Use [A−] / [A＋] in the top-right toolbar anytime to scale text size up or down!",
+        )
+
+        if self.cfg.get("auto_connect", True):
+            GLib.timeout_add(300, lambda: self.connect_irc() or False)
+
+    # ---------------- Configuration (0600 Protected) ----------------
+    def _load_config(self) -> dict:
+        user = getpass.getuser() or "cdeuser"
+        defaults = {
+            "host": DEFAULT_HOST,
+            "port": DEFAULT_PORT,
+            "tls": True,
+            "nick": f"{user}_cde",
+            "alt_nick": f"{user}_cde_",
+            "username": user,
+            "realname": "CDE Desktop User",
+            "ns_account": "",
+            "ns_password": "",
+            "ns_command": "/msg NickServ IDENTIFY {account} {password}",
+            "auto_identify": True,
+            "auto_connect": True,
+            "auto_channels": "#libera",
+            "font_pt": 11,
+            "ignored": [],
+        }
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        if CONFIG_FILE.is_file():
+            try:
+                loaded = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                defaults.update(loaded)
+            except Exception:
+                pass
+        return defaults
+
+    def _save_config(self):
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        self.cfg["font_pt"] = self.font_pt
+        self.cfg["ignored"] = sorted(list(self.ignored_nicks))
+        tmp = CONFIG_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.cfg, indent=2), encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        tmp.replace(CONFIG_FILE)
+
+    def _apply_css(self):
+        self.css_provider.load_from_data(
+            build_cde_css(self.chrome_hex, self.sel_hex, self.well_hex, self.font_pt)
+        )
+
+    # ---------------- UI Construction ----------------
+    def _build_ui(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(vbox)
+
+        # 1. Menu Bar
+        mbar = Gtk.MenuBar()
+
+        m_irc = Gtk.Menu()
+        mi_irc = Gtk.MenuItem(label="IRC"); mi_irc.set_submenu(m_irc)
+        for lbl, cb in [
+            ("Connect to Libera.Chat",          lambda *_: self.connect_irc()),
+            ("Disconnect",                      lambda *_: self.disconnect_irc("Disconnected by user")),
+            ("-", None),
+            ("NickServ & Server Identity...",   self.on_identity_dialog),
+            ("Send Saved NickServ Identify Now", lambda *_: self.send_nickserv_identify(manual=True)),
+            ("-", None),
+            ("Join Channel...  (Ctrl+J)",       self.on_join_dialog),
+            ("Save Chat Transcript...",         self.on_save_log),
+            ("-", None),
+            ("Quit dtIRC  (Ctrl+Q)",            lambda *_: self.on_quit()),
+        ]:
+            if lbl == "-":
+                m_irc.append(Gtk.SeparatorMenuItem())
+            else:
+                it = Gtk.MenuItem(label=lbl); it.connect("activate", cb); m_irc.append(it)
+        mbar.append(mi_irc)
+
+        m_chan = Gtk.Menu()
+        mi_chan = Gtk.MenuItem(label="Channel"); mi_chan.set_submenu(m_chan)
+        for lbl, cb in [
+            ("Part / Close Current Tab  (Ctrl+W)", lambda *_: self.close_active_buffer()),
+            ("Focus Editable Topic Bar  (Ctrl+T)", lambda *_: self.ent_topic.grab_focus()),
+            ("Refresh User List (/NAMES)",         lambda *_: self._refresh_active_names()),
+            ("List Channels on Server (/LIST)",    lambda *_: self.send_raw("LIST >20")),
+            ("Clear Active Buffer  (Ctrl+L)",      lambda *_: self.clear_active_buffer()),
+        ]:
+            it = Gtk.MenuItem(label=lbl); it.connect("activate", cb); m_chan.append(it)
+        mbar.append(mi_chan)
+
+        m_view = Gtk.Menu()
+        mi_view = Gtk.MenuItem(label="View"); mi_view.set_submenu(m_view)
+        for lbl, cb in [
+            ("Increase Text Size  (Ctrl++)", lambda *_: self.step_font_size(1)),
+            ("Decrease Text Size  (Ctrl+-)", lambda *_: self.step_font_size(-1)),
+            ("Reset Text Size (11pt)",       lambda *_: self.set_font_size(11)),
+        ]:
+            it = Gtk.MenuItem(label=lbl); it.connect("activate", cb); m_view.append(it)
+        mbar.append(mi_view)
+
+        m_help = Gtk.Menu()
+        mi_help = Gtk.MenuItem(label="Help"); mi_help.set_submenu(m_help)
+        it_cmd = Gtk.MenuItem(label="Supported / Commands Reference...")
+        it_cmd.connect("activate", self.on_commands_help)
+        it_ab = Gtk.MenuItem(label="About dtIRC...")
+        it_ab.connect("activate", self.on_about)
+        m_help.append(it_cmd)
+        m_help.append(it_ab)
+        mbar.append(mi_help)
+        vbox.pack_start(mbar, False, False, 0)
+
+        # 2. Top CDE Beveled Action Toolbar + Text Scaling Controls
+        tb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        tb.get_style_context().add_class("cde-toolbar")
+
+        self.btn_connect = Gtk.Button(label="⚡ Connect Libera.Chat")
+        self.btn_connect.get_style_context().add_class("cde-connect")
+        self.btn_connect.connect("clicked", self._on_connect_btn)
+        tb.pack_start(self.btn_connect, False, False, 0)
+
+        b_ns_cfg = Gtk.Button(label="🔑 NickServ Setup")
+        b_ns_cfg.set_tooltip_text("Configure Nickname, Saved NickServ Password & Ident Command")
+        b_ns_cfg.connect("clicked", self.on_identity_dialog)
+        tb.pack_start(b_ns_cfg, False, False, 0)
+
+        b_ns_now = Gtk.Button(label="✔ Identify")
+        b_ns_now.get_style_context().add_class("cde-ident")
+        b_ns_now.set_tooltip_text("Send your saved NickServ IDENTIFY command right now")
+        b_ns_now.connect("clicked", lambda *_: self.send_nickserv_identify(manual=True))
+        tb.pack_start(b_ns_now, False, False, 0)
+
+        tb.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 3)
+
+        b_join = Gtk.Button(label="＃ Join...")
+        b_join.connect("clicked", self.on_join_dialog)
+        tb.pack_start(b_join, False, False, 0)
+
+        b_part = Gtk.Button(label="✖ Part/Close")
+        b_part.connect("clicked", lambda *_: self.close_active_buffer())
+        tb.pack_start(b_part, False, False, 0)
+
+        b_clear = Gtk.Button(label="🧹 Clear")
+        b_clear.connect("clicked", lambda *_: self.clear_active_buffer())
+        tb.pack_start(b_clear, False, False, 0)
+
+        # Right side: Text Scaling Buttons ([A−] [11pt] [A＋])!
+        b_f_up = Gtk.Button(label="A＋")
+        b_f_up.set_tooltip_text("Scale IRC Text Larger (Ctrl++)")
+        b_f_up.connect("clicked", lambda *_: self.step_font_size(1))
+        tb.pack_end(b_f_up, False, False, 0)
+
+        self.lbl_font_sz = Gtk.Label(label=f"{self.font_pt}pt")
+        tb.pack_end(self.lbl_font_sz, False, False, 4)
+
+        b_f_dn = Gtk.Button(label="A−")
+        b_f_dn.set_tooltip_text("Scale IRC Text Smaller (Ctrl+-)")
+        b_f_dn.connect("clicked", lambda *_: self.step_font_size(-1))
+        tb.pack_end(b_f_dn, False, False, 0)
+
+        tb.pack_end(Gtk.Label(label="Text Size:"), False, False, 2)
+        vbox.pack_start(tb, False, False, 0)
+
+        # 3. Editable Channel Topic Bar Directly at Top of Window!
+        topic_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        topic_bar.get_style_context().add_class("cde-topicbar")
+        self.lbl_chan_badge = Gtk.Label(label="*Libera.Chat*", xalign=0)
+        self.lbl_chan_badge.set_markup("<b>*Libera.Chat*</b>")
+        topic_bar.pack_start(self.lbl_chan_badge, False, False, 4)
+
+        topic_bar.pack_start(Gtk.Label(label="Topic:"), False, False, 0)
+        self.ent_topic = Gtk.Entry()
+        self.ent_topic.set_placeholder_text("Channel topic (edit here and press Enter or click Set Topic)...")
+        self.ent_topic.connect("activate", self.on_set_topic_activate)
+        topic_bar.pack_start(self.ent_topic, True, True, 0)
+
+        self.btn_set_topic = Gtk.Button(label="Set Topic")
+        self.btn_set_topic.set_tooltip_text("Send TOPIC command to update channel topic")
+        self.btn_set_topic.connect("clicked", self.on_set_topic_activate)
+        topic_bar.pack_start(self.btn_set_topic, False, False, 0)
+        vbox.pack_start(topic_bar, False, False, 0)
+
+        # 4. Channel / Query Buffer Switcher Strip
+        tab_scroll = Gtk.ScrolledWindow()
+        tab_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        self.tab_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        self.tab_box.get_style_context().add_class("cde-tabbar")
+        tab_scroll.add(self.tab_box)
+        vbox.pack_start(tab_scroll, False, False, 0)
+
+        # 5. Main Horizontal Split: LEFT = Channel User List | RIGHT = Cream Chat View + Input Bar
+        self.hpaned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        self.hpaned.set_position(215)
+        vbox.pack_start(self.hpaned, True, True, 0)
+
+        # --- LEFT PANE: Channel Users List (Right-click for Op commands, Double-click for PM) ---
+        left_frame = Gtk.Frame(margin=4)
+        left_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        self.lbl_users_hdr = Gtk.Label(label="  Users (0)", xalign=0)
+        self.lbl_users_hdr.get_style_context().add_class("cde-toolbar")
+        left_vbox.pack_start(self.lbl_users_hdr, False, False, 0)
+
+        # Columns: 0=rank_badge, 1=display_nick, 2=fg_color, 3=weight, 4=raw_nick
+        self.user_store = Gtk.ListStore(str, str, str, int, str)
+        self.user_view = Gtk.TreeView(model=self.user_store, headers_visible=False)
+        self.user_view.get_style_context().add_class("irc-users")
+
+        r_prefix = Gtk.CellRendererText()
+        r_prefix.set_property("xalign", 0.5)
+        c_prefix = Gtk.TreeViewColumn("P", r_prefix, text=0, foreground=2, weight=3)
+        c_prefix.set_fixed_width(24)
+
+        r_unick = Gtk.CellRendererText()
+        r_unick.set_property("ellipsize", Pango.EllipsizeMode.END)
+        c_unick = Gtk.TreeViewColumn("Nick", r_unick, text=1, foreground=2, weight=3)
+        c_unick.set_expand(True)
+
+        self.user_view.append_column(c_prefix)
+        self.user_view.append_column(c_unick)
+        self.user_view.connect("button-press-event", self._on_user_list_button_press)
+        self.user_view.connect("row-activated", self._on_user_row_activated)
+
+        sw_users = Gtk.ScrolledWindow()
+        sw_users.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw_users.add(self.user_view)
+        left_vbox.pack_start(sw_users, True, True, 0)
+        left_frame.add(left_vbox)
+        self.hpaned.pack1(left_frame, resize=False, shrink=False)
+
+        # --- RIGHT PANE: Chat Buffer Stack + mIRC Color Picker + Command/Message Input ---
+        right_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin=4)
+
+        fr_chat = Gtk.Frame()
+        self.chat_stack = Gtk.Stack()
+        self.chat_stack.set_transition_type(Gtk.StackTransitionType.NONE)
+        fr_chat.add(self.chat_stack)
+        right_vbox.pack_start(fr_chat, True, True, 0)
+
+        # Input Row
+        in_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        self.lbl_my_nick = Gtk.Label(label=f"[{self.current_nick}]")
+        in_hbox.pack_start(self.lbl_my_nick, False, False, 2)
+
+        self.ent_input = Gtk.Entry()
+        self.ent_input.get_style_context().add_class("irc-input")
+        self.ent_input.set_placeholder_text("Type a message or /command (/join, /msg, /ns, /whois, /me, /op, /kick...) — Tab completes nicks")
+        self.ent_input.connect("activate", self.on_input_submit)
+        self.ent_input.connect("key-press-event", self._on_input_key_press)
+        in_hbox.pack_start(self.ent_input, True, True, 0)
+
+        # mIRC Color & Formatting Insert MenuButton!
+        self.btn_mirc_fmt = Gtk.MenuButton(label="🎨 mIRC")
+        self.btn_mirc_fmt.set_tooltip_text("Insert mIRC Color, Bold, Italic, or Reset codes")
+        self.btn_mirc_fmt.set_popover(self._build_mirc_popover())
+        in_hbox.pack_start(self.btn_mirc_fmt, False, False, 0)
+
+        b_send = Gtk.Button(label="Send ↵")
+        b_send.get_style_context().add_class("cde-ident")
+        b_send.connect("clicked", self.on_input_submit)
+        in_hbox.pack_start(b_send, False, False, 0)
+
+        right_vbox.pack_start(in_hbox, False, False, 0)
+        self.hpaned.pack2(right_vbox, resize=True, shrink=False)
+
+        # 6. Status Bar
+        st = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        st.get_style_context().add_class("cde-status")
+        self.lbl_status = Gtk.Label(label="Disconnected — Ready to connect to irc.libera.chat:6697 (TLS).", xalign=0)
+        self.lbl_status.set_ellipsize(Pango.EllipsizeMode.END)
+        self.lbl_lag = Gtk.Label(label="TLS 6697", xalign=1.0)
+        st.pack_start(self.lbl_status, True, True, 0)
+        st.pack_end(self.lbl_lag, False, False, 4)
+        vbox.pack_start(st, False, False, 0)
+
+        self.connect("key-press-event", self._on_window_key_press)
+        self.connect("delete-event", lambda *_: self.on_quit())
+        self.show_all()
+        self.ent_input.grab_focus()
+
+    def _build_mirc_popover(self) -> Gtk.Popover:
+        pop = Gtk.Popover()
+        vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=8)
+        hb_fmt = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        for lbl, code in [("Bold (^B)", "\x02"), ("Italic (^I)", "\x1d"), ("Underline (^U)", "\x1f"), ("Reset (^O)", "\x0f")]:
+            b = Gtk.Button(label=lbl)
+            b.connect("clicked", lambda _b, c=code: (self._insert_input_text(c), pop.popdown()))
+            hb_fmt.pack_start(b, False, False, 0)
+        vb.pack_start(hb_fmt, False, False, 0)
+
+        vb.pack_start(Gtk.Label(label="Insert mIRC Color Code (00–15):", xalign=0), False, False, 0)
+        grid = Gtk.Grid(column_spacing=3, row_spacing=3)
+        for idx in range(16):
+            fg_hex = MIRC_FG_CREAM[idx]
+            b = Gtk.Button(label=f"{idx:02d}")
+            p = Gtk.CssProvider()
+            bg_c = "#334155" if idx == 0 else self.well_hex
+            p.load_from_data(f"button {{ background-color: {bg_c}; color: {fg_hex}; font-weight: bold; min-width: 28px; }}".encode())
+            b.get_style_context().add_provider(p, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+            b.connect("clicked", lambda _b, code=idx: (self._insert_input_text(f"\x03{code:02d}"), pop.popdown()))
+            grid.attach(b, idx % 8, idx // 8, 1, 1)
+        vb.pack_start(grid, False, False, 0)
+        vb.show_all()
+        pop.add(vb)
+        return pop
+
+    def _insert_input_text(self, s: str):
+        pos = self.ent_input.get_position()
+        self.ent_input.insert_text(s, pos)
+        self.ent_input.set_position(pos + len(s))
+        self.ent_input.grab_focus()
+
+    # ---------------- Font Scaling ----------------
+    def step_font_size(self, delta: int):
+        self.set_font_size(self.font_pt + delta)
+
+    def set_font_size(self, new_pt: int):
+        self.font_pt = max(8, min(26, new_pt))
+        self.lbl_font_sz.set_text(f"{self.font_pt}pt")
+        self._apply_css()
+        self._save_config()
+
+    # ---------------- Buffer & Tab Management ----------------
+    def _buf_key(self, name: str) -> str:
+        return name.lower()
+
+    def _ensure_buffer(self, name: str, kind: str, switch: bool = False) -> IrcBuffer:
+        key = self._buf_key(name)
+        if key not in self.buffers:
+            buf = IrcBuffer(name, kind)
+            buf.textview.connect("button-release-event", self._on_chat_click_url)
+            self.buffers[key] = buf
+            self.buffer_order.append(key)
+            self.chat_stack.add_named(buf.scroll, key)
+            buf.scroll.show_all()
+            self._rebuild_tab_bar()
+        buf = self.buffers[key]
+        if switch:
+            self.switch_buffer(key)
+        return buf
+
+    def switch_buffer(self, key: str):
+        if key not in self.buffers:
+            return
+        self.active_buf_key = key
+        buf = self.buffers[key]
+        buf.unread = False
+        buf.highlight = False
+        self.chat_stack.set_visible_child_name(key)
+        self.lbl_chan_badge.set_markup(f"<b>{GLib.markup_escape_text(buf.name)}</b>")
+
+        is_chan = buf.kind == "channel"
+        self.ent_topic.set_sensitive(is_chan)
+        self.btn_set_topic.set_sensitive(is_chan)
+        self.ent_topic.set_text(strip_mirc_codes(buf.topic) if is_chan else f"Connected to {self.cfg['host']}:{self.cfg['port']}")
+        self.ent_topic.set_tooltip_text(buf.topic_meta or "Channel Topic")
+
+        self._rebuild_user_list()
+        self._rebuild_tab_bar()
+        self._scroll_to_bottom(buf)
+        self.ent_input.grab_focus()
+
+    def close_active_buffer(self):
+        if not self.active_buf_key or self.active_buf_key == "*libera.chat*":
+            return
+        buf = self.buffers[self.active_buf_key]
+        if buf.kind == "channel" and self.connected:
+            self.send_raw(f"PART {buf.name} :dtIRC — Common Desktop Environment")
+        self._remove_buffer(self.active_buf_key)
+
+    def _remove_buffer(self, key: str):
+        if key not in self.buffers or key == "*libera.chat*":
+            return
+        buf = self.buffers.pop(key)
+        if key in self.buffer_order:
+            self.buffer_order.remove(key)
+        self.chat_stack.remove(buf.scroll)
+        if self.active_buf_key == key:
+            self.switch_buffer(self.buffer_order[-1] if self.buffer_order else "*libera.chat*")
+        else:
+            self._rebuild_tab_bar()
+
+    def _rebuild_tab_bar(self):
+        for ch in self.tab_box.get_children():
+            self.tab_box.remove(ch)
+        for key in self.buffer_order:
+            buf = self.buffers[key]
+            prefix = "★ " if buf.highlight else ("• " if buf.unread else "")
+            tb = Gtk.ToggleButton(label=f"{prefix}{buf.name}")
+            tb.set_active(key == self.active_buf_key)
+            ctx = tb.get_style_context()
+            if buf.highlight and key != self.active_buf_key:
+                ctx.add_class("cde-tab-ping")
+            elif buf.unread and key != self.active_buf_key:
+                ctx.add_class("cde-tab-unread")
+            tb.connect("clicked", lambda _b, k=key: self.switch_buffer(k))
+            self.tab_box.pack_start(tb, False, False, 0)
+        self.tab_box.show_all()
+
+    def clear_active_buffer(self):
+        if self.active_buf_key in self.buffers:
+            self.buffers[self.active_buf_key].textbuf.set_text("")
+
+    # ---------------- Rendering mIRC Spans & Messages into Cream TextBuffer ----------------
+    def _get_style_tag(self, buf: IrcBuffer, style: dict, extra_fg: str | None = None, url: str | None = None) -> Gtk.TextTag:
+        fg_code = style.get("fg")
+        bg_code = style.get("bg")
+        rev = style.get("reverse", False)
+        bold = style.get("bold", False)
+        ital = style.get("italic", False)
+        und = style.get("underline", False) or bool(url)
+
+        fg_hex = extra_fg
+        bg_hex = None
+        if fg_code is not None:
+            fg_hex = get_mirc_fg(fg_code)
+            # If mIRC 00 (White) is used on cream with no explicit BG, give it a dark slate pill so it's readable!
+            if fg_code == 0 and bg_code is None:
+                bg_hex = "#334155"
+        if bg_code is not None:
+            bg_hex = get_mirc_bg(bg_code)
+
+        if rev:
+            fg_hex, bg_hex = (bg_hex or self.well_hex), (fg_hex or "#101218")
+
+        if url and not fg_hex:
+            fg_hex = "#1D4ED8"
+
+        key = (fg_hex, bg_hex, bold, ital, und, url)
+        if key in buf._tag_cache:
+            return buf._tag_cache[key]
+
+        tag = buf.textbuf.create_tag(None)
+        if fg_hex:
+            tag.set_property("foreground", fg_hex)
+        if bg_hex:
+            tag.set_property("background", bg_hex)
+        if bold:
+            tag.set_property("weight", Pango.Weight.BOLD)
+        if ital:
+            tag.set_property("style", Pango.Style.ITALIC)
+        if und:
+            tag.set_property("underline", Pango.Underline.SINGLE)
+        if url:
+            tag.url_target = url
+        buf._tag_cache[key] = tag
+        return tag
+
+    def _insert_mirc_text(self, buf: IrcBuffer, text: str, default_fg: str | None = None, bold_all: bool = False):
+        tb = buf.textbuf
+        for chunk, style in parse_mirc_spans(text):
+            if bold_all:
+                style = dict(style, bold=True)
+            # Detect clickable URLs inside chunk
+            pos = 0
+            for m in URL_RE.finditer(chunk):
+                if m.start() > pos:
+                    plain = chunk[pos:m.start()]
+                    tag = self._get_style_tag(buf, style, extra_fg=default_fg)
+                    tb.insert_with_tags(tb.get_end_iter(), plain, tag)
+                u = m.group(1)
+                utag = self._get_style_tag(buf, style, extra_fg=default_fg, url=u)
+                tb.insert_with_tags(tb.get_end_iter(), u, utag)
+                pos = m.end()
+            if pos < len(chunk):
+                rem = chunk[pos:]
+                tag = self._get_style_tag(buf, style, extra_fg=default_fg)
+                tb.insert_with_tags(tb.get_end_iter(), rem, tag)
+
+    def _scroll_to_bottom(self, buf: IrcBuffer):
+        adj = buf.scroll.get_vadjustment()
+        GLib.idle_add(lambda: adj.set_value(max(0.0, adj.get_upper() - adj.get_page_size())) or False)
+
+    def _append_line(self, buf: IrcBuffer, prefix_str: str, prefix_col: str, body: str,
+                     body_fg: str | None = None, is_highlight: bool = False):
+        tb = buf.textbuf
+        if tb.get_char_count() > 0:
+            tb.insert(tb.get_end_iter(), "\n")
+
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        ts_tag = self._get_style_tag(buf, {"bold": False}, extra_fg="#64748B")
+        tb.insert_with_tags(tb.get_end_iter(), f"[{ts}] ", ts_tag)
+
+        if prefix_str:
+            p_style = {"bold": True, "bg": 8 if is_highlight else None}
+            p_tag = self._get_style_tag(buf, p_style, extra_fg=prefix_col)
+            tb.insert_with_tags(tb.get_end_iter(), f"{prefix_str} ", p_tag)
+
+        self._insert_mirc_text(buf, body, default_fg=body_fg, bold_all=is_highlight)
+
+        if self._buf_key(buf.name) != self.active_buf_key:
+            buf.unread = True
+            if is_highlight:
+                buf.highlight = True
+            self._rebuild_tab_bar()
+        else:
+            self._scroll_to_bottom(buf)
+
+    def _append_system(self, buf: IrcBuffer, msg: str, color: str = "#334155"):
+        for ln in msg.splitlines():
+            self._append_line(buf, "•••", "#2B5B84", ln, body_fg=color)
+
+    def _on_chat_click_url(self, tv, ev):
+        if ev.button != 1:
+            return False
+        bx, by = tv.window_to_buffer_coords(Gtk.TextWindowType.WIDGET, int(ev.x), int(ev.y))
+        ok, it = tv.get_iter_at_location(bx, by)
+        if ok:
+            for tag in it.get_tags():
+                u = getattr(tag, "url_target", None)
+                if u:
+                    webbrowser.open(u)
+                    return True
+        return False
+
+    # ---------------- Left-Hand User List & Right-Click Op Context Menu ----------------
+    def _rebuild_user_list(self):
+        self.user_store.clear()
+        buf = self.buffers.get(self.active_buf_key)
+        if not buf or buf.kind != "channel":
+            self.lbl_users_hdr.set_text("  Users (—)")
+            return
+
+        entries = []
+        for lnick, dnick in buf.display_nicks.items():
+            pref = buf.highest_prefix(lnick)
+            entries.append((RANK_ORDER.get(pref, 5), dnick.lower(), pref, dnick))
+        entries.sort(key=lambda t: (t[0], t[1]))
+
+        self.lbl_users_hdr.set_text(f"  Users ({len(entries)})")
+        for _rk, _low, pref, dnick in entries:
+            if pref in ("~", "&", "@"):
+                col = "#166534"  # Emerald Op badge
+                wt = int(Pango.Weight.BOLD)
+            elif pref == "%":
+                col = "#0369A1"
+                wt = int(Pango.Weight.BOLD)
+            elif pref == "+":
+                col = "#8A5A00"
+                wt = int(Pango.Weight.NORMAL)
+            else:
+                col = "#101218"
+                wt = int(Pango.Weight.NORMAL)
+            self.user_store.append([pref, dnick, col, wt, dnick])
+
+    def _on_user_row_activated(self, _view, path, _col):
+        nick = self.user_store[path][4]
+        self._ensure_buffer(nick, "query", switch=True)
+
+    def _on_user_list_button_press(self, view, ev):
+        if ev.button == 3:
+            pth = view.get_path_at_pos(int(ev.x), int(ev.y))
+            if pth:
+                view.set_cursor(pth[0], None, False)
+                nick = self.user_store[pth[0]][4]
+                self._popup_user_op_menu(nick, ev)
+                return True
+        return False
+
+    def _popup_user_op_menu(self, nick: str, ev):
+        buf = self.buffers.get(self.active_buf_key)
+        chan = buf.name if (buf and buf.kind == "channel") else ""
+        uhost = self.user_hosts.get(nick.lower(), "")
+        ban_mask = f"*!*@{uhost.split('@', 1)[1]}" if "@" in uhost else f"{nick}!*@*"
+
+        menu = Gtk.Menu()
+
+        hdr = Gtk.MenuItem(label=f"User: {nick}" + (f" ({uhost})" if uhost else ""))
+        hdr.set_sensitive(False)
+        menu.append(hdr)
+        menu.append(Gtk.SeparatorMenuItem())
+
+        for lbl, cb in [
+            ("💬 Open Private Message (Query)", lambda *_: self._ensure_buffer(nick, "query", switch=True)),
+            ("🔍 WHOIS Info",                   lambda *_: self.send_raw(f"WHOIS {nick} {nick}")),
+            ("📡 CTCP VERSION",                 lambda *_: self.exec_command(f"/ctcp {nick} VERSION")),
+            ("⏱ CTCP PING",                    lambda *_: self.exec_command(f"/ping {nick}")),
+        ]:
+            mi = Gtk.MenuItem(label=lbl); mi.connect("activate", cb); menu.append(mi)
+
+        if chan:
+            menu.append(Gtk.SeparatorMenuItem())
+            op_hdr = Gtk.MenuItem(label=f"Channel Op Actions ({chan})")
+            op_hdr.set_sensitive(False)
+            menu.append(op_hdr)
+
+            for lbl, cb in [
+                ("★ Give Op (+o)",              lambda *_: self.send_raw(f"MODE {chan} +o {nick}")),
+                ("☆ Take Op (-o)",              lambda *_: self.send_raw(f"MODE {chan} -o {nick}")),
+                ("🔊 Give Voice (+v)",          lambda *_: self.send_raw(f"MODE {chan} +v {nick}")),
+                ("🔇 Take Voice (-v)",          lambda *_: self.send_raw(f"MODE {chan} -v {nick}")),
+                ("⚡ Give Half-Op (+h)",        lambda *_: self.send_raw(f"MODE {chan} +h {nick}")),
+                ("▫ Take Half-Op (-h)",         lambda *_: self.send_raw(f"MODE {chan} -h {nick}")),
+                ("-", None),
+                ("🥾 Kick from Channel...",     lambda *_: self._prompt_kick(chan, nick, also_ban=False)),
+                (f"🚫 Ban ({ban_mask})",        lambda *_: self.send_raw(f"MODE {chan} +b {ban_mask}")),
+                ("💥 Kick + Ban!",              lambda *_: self._prompt_kick(chan, nick, also_ban=True, mask=ban_mask)),
+                (f"🤐 Quiet (+q {ban_mask})",   lambda *_: self.send_raw(f"MODE {chan} +q {ban_mask}")),
+                (f"🗣 Unquiet (-q {ban_mask})", lambda *_: self.send_raw(f"MODE {chan} -q {ban_mask}")),
+            ]:
+                if lbl == "-":
+                    menu.append(Gtk.SeparatorMenuItem())
+                else:
+                    mi = Gtk.MenuItem(label=lbl); mi.connect("activate", cb); menu.append(mi)
+
+        menu.append(Gtk.SeparatorMenuItem())
+        is_ign = nick.lower() in self.ignored_nicks
+        mi_ign = Gtk.MenuItem(label=("✔ Unignore User" if is_ign else "🚫 Ignore User"))
+        mi_ign.connect("activate", lambda *_: self.exec_command(f"/{'unignore' if is_ign else 'ignore'} {nick}"))
+        menu.append(mi_ign)
+
+        mi_slap = Gtk.MenuItem(label="📘 Slap with UNIX System V Manual")
+        mi_slap.connect("activate", lambda *_: self.exec_command(f"/me slaps {nick} around a bit with a hardcover CDE OSF/Motif Style Guide"))
+        menu.append(mi_slap)
+
+        menu.show_all()
+        menu.popup_at_pointer(ev)
+
+    def _prompt_kick(self, chan: str, nick: str, also_ban: bool = False, mask: str = ""):
+        dlg = Gtk.Dialog(title=f"Kick {nick} from {chan} — dtIRC", transient_for=self, flags=0)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Kick", Gtk.ResponseType.OK)
+        box = dlg.get_content_area()
+        box.set_spacing(8); box.set_margin_top(10); box.set_margin_bottom(10); box.set_margin_start(12); box.set_margin_end(12)
+        box.pack_start(Gtk.Label(label=f"Reason for kicking {nick}:", xalign=0), False, False, 0)
+        ent = Gtk.Entry(text="Requested", width_chars=38)
+        ent.connect("activate", lambda *_: dlg.response(Gtk.ResponseType.OK))
+        box.pack_start(ent, False, False, 0)
+        dlg.show_all()
+        if dlg.run() == Gtk.ResponseType.OK:
+            reason = ent.get_text().strip() or nick
+            dlg.destroy()
+            if also_ban and mask:
+                self.send_raw(f"MODE {chan} +b {mask}")
+            self.send_raw(f"KICK {chan} {nick} :{reason}")
+        else:
+            dlg.destroy()
+
+    # ---------------- Editable Channel Topic Handler ----------------
+    def on_set_topic_activate(self, *_args):
+        buf = self.buffers.get(self.active_buf_key)
+        if not buf or buf.kind != "channel":
+            return
+        new_t = self.ent_topic.get_text().strip()
+        self.send_raw(f"TOPIC {buf.name} :{new_t}")
+        self.ent_input.grab_focus()
+
+    # ---------------- IRC Socket, TLS, SASL PLAIN & NickServ Engine ----------------
+    def _on_connect_btn(self, *_args):
+        if self.connected:
+            self.disconnect_irc("Reconnecting / Disconnected")
+        else:
+            self.connect_irc()
+
+    def connect_irc(self, host: str | None = None, port: int | None = None, use_tls: bool | None = None):
+        if self.connected:
+            self.disconnect_irc("Switching server")
+
+        h = host or self.cfg.get("host", DEFAULT_HOST)
+        p = int(port or self.cfg.get("port", DEFAULT_PORT))
+        tls = self.cfg.get("tls", True) if use_tls is None else use_tls
+
+        self.current_nick = self.cfg["nick"]
+        self.lbl_my_nick.set_text(f"[{self.current_nick}]")
+        self._ident_sent_this_session = False
+        self._sasl_in_progress = False
+
+        srv_buf = self._ensure_buffer("*Libera.Chat*", "server")
+        self._append_system(srv_buf, f"Connecting to {h}:{p} ({'TLS' if tls else 'Plain'})...")
+        self.lbl_status.set_text(f"Connecting to {h}:{p}...")
+
+        threading.Thread(target=self._irc_reader_thread, args=(h, p, tls), daemon=True).start()
+
+    def disconnect_irc(self, quit_msg: str = "dtIRC — CDE Desktop"):
+        with self.sock_lock:
+            s = self.sock
+            self.sock = None
+            self.connected = False
+            self.registered = False
+        if s:
+            try:
+                s.sendall(f"QUIT :{quit_msg}\r\n".encode("utf-8"))
+            except Exception:
+                pass
+            try:
+                s.close()
+            except Exception:
+                pass
+        GLib.idle_add(self._on_disconnected_ui, quit_msg)
+
+    def send_raw(self, line: str):
+        clean = line.replace("\r", "").replace("\n", "")
+        with self.sock_lock:
+            s = self.sock
+            if not s:
+                srv = self.buffers.get("*libera.chat*")
+                if srv:
+                    GLib.idle_add(self._append_system, srv, "Not connected to server. Click [⚡ Connect Libera.Chat] or type /connect.", "#C5221F")
+                return
+            try:
+                s.sendall((clean + "\r\n").encode("utf-8"))
+            except Exception as exc:
+                GLib.idle_add(self._on_disconnected_ui, str(exc))
+
+    def _irc_reader_thread(self, host: str, port: int, use_tls: bool):
+        try:
+            raw_sock = socket.create_connection((host, port), timeout=15)
+            if use_tls:
+                ctx = ssl.create_default_context()
+                conn = ctx.wrap_socket(raw_sock, server_hostname=host)
+            else:
+                conn = raw_sock
+            conn.settimeout(300)
+
+            with self.sock_lock:
+                self.sock = conn
+                self.connected = True
+
+            GLib.idle_add(self._on_connected_ui, host, port, use_tls)
+
+            # Negotiate SASL PLAIN if auto_identify + password saved!
+            want_sasl = bool(self.cfg.get("auto_identify") and self.cfg.get("ns_password"))
+            if want_sasl:
+                self._sasl_in_progress = True
+                self.send_raw("CAP LS 302")
+
+            self.send_raw(f"NICK {self.current_nick}")
+            self.send_raw(f"USER {self.cfg['username']} 0 * :{self.cfg['realname']}")
+
+            recv_buf = b""
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                recv_buf += chunk
+                while b"\n" in recv_buf:
+                    raw_ln, recv_buf = recv_buf.split(b"\n", 1)
+                    ln = raw_ln.rstrip(b"\r").decode("utf-8", errors="replace")
+                    if ln.startswith("PING "):
+                        token = ln[5:]
+                        self.send_raw(f"PONG {token}")
+                    else:
+                        GLib.idle_add(self._handle_irc_line, ln)
+        except Exception as exc:
+            GLib.idle_add(self._on_disconnected_ui, f"Connection closed: {exc}")
+        finally:
+            with self.sock_lock:
+                if self.sock is not None:
+                    try:
+                        self.sock.close()
+                    except Exception:
+                        pass
+                    self.sock = None
+                self.connected = False
+                self.registered = False
+            GLib.idle_add(self._on_disconnected_ui, "Disconnected.")
+
+    def _on_connected_ui(self, host: str, port: int, use_tls: bool):
+        self.btn_connect.set_label("🔌 Disconnect")
+        self.lbl_status.set_text(f"Connected to {host}:{port} ({'TLS' if use_tls else 'Plain'}) as {self.current_nick}")
+        self.lbl_lag.set_text(f"{'🔒 TLS' if use_tls else 'Plain'} {port}")
+
+    def _on_disconnected_ui(self, reason: str):
+        if not self.connected:
+            self.btn_connect.set_label("⚡ Connect Libera.Chat")
+            self.lbl_status.set_text(reason)
+            srv = self.buffers.get("*libera.chat*")
+            if srv and reason:
+                self._append_system(srv, reason, "#7F1D1D")
+
+    def send_nickserv_identify(self, manual: bool = False):
+        pw = self.cfg.get("ns_password", "")
+        if not pw:
+            if manual:
+                self.on_identity_dialog()
+            return
+        acct = self.cfg.get("ns_account", "").strip() or self.current_nick
+        tmpl = self.cfg.get("ns_command", "/msg NickServ IDENTIFY {account} {password}").strip()
+        rendered = (
+            tmpl.replace("{account}", acct)
+            .replace("{nick}", self.current_nick)
+            .replace("{password}", pw)
+        )
+        if rendered.startswith("/"):
+            self.exec_command(rendered, quiet_secret=True)
+        else:
+            self.send_raw(rendered)
+        self._ident_sent_this_session = True
+        srv = self.buffers.get(self.active_buf_key) or self.buffers["*libera.chat*"]
+        self._append_system(srv, f"Sent saved NickServ IDENTIFY command for account '{acct}'.", "#166534")
+
+    # ---------------- Incoming IRC Protocol Dispatcher ----------------
+    def _handle_irc_line(self, raw_line: str):
+        prefix, cmd, params = parse_irc_line(raw_line)
+        nick, user, host = split_prefix(prefix)
+        if nick and user and host:
+            self.user_hosts[nick.lower()] = f"{user}@{host}"
+
+        srv_buf = self.buffers["*libera.chat*"]
+
+        # SASL PLAIN Handshake (IRCv3 CAP -> AUTHENTICATE -> 903 -> CAP END)
+        if cmd == "CAP" and len(params) >= 2:
+            subcmd = params[1].upper()
+            caps = params[-1] if len(params) >= 3 else ""
+            if subcmd == "LS" and self._sasl_in_progress:
+                if "sasl" in caps.split():
+                    self.send_raw("CAP REQ :sasl")
+                else:
+                    self._sasl_in_progress = False
+                    self.send_raw("CAP END")
+            elif subcmd == "ACK" and "sasl" in caps:
+                self.send_raw("AUTHENTICATE PLAIN")
+            elif subcmd == "NAK":
+                self._sasl_in_progress = False
+                self.send_raw("CAP END")
+            return
+
+        if cmd == "AUTHENTICATE" and params and params[0] == "+":
+            acct = self.cfg.get("ns_account", "").strip() or self.current_nick
+            pw = self.cfg.get("ns_password", "")
+            payload = f"{acct}\x00{acct}\x00{pw}".encode("utf-8")
+            b64 = base64.b64encode(payload).decode("ascii")
+            self.send_raw(f"AUTHENTICATE {b64}")
+            return
+
+        if cmd in ("903", "904", "905", "906", "907"):
+            msg = params[-1] if params else f"SASL ({cmd})"
+            self._append_system(srv_buf, f"[SASL] {msg}", "#166534" if cmd == "903" else "#C5221F")
+            if cmd == "903":
+                self._ident_sent_this_session = True
+            self._sasl_in_progress = False
+            self.send_raw("CAP END")
+            return
+
+        # 001 Welcome!
+        if cmd == "001":
+            self.registered = True
+            if params:
+                self.current_nick = params[0]
+                self.lbl_my_nick.set_text(f"[{self.current_nick}]")
+            self._append_system(srv_buf, params[-1] if params else "Welcome to Libera.Chat!", "#166534")
+
+            if self.cfg.get("auto_identify") and self.cfg.get("ns_password") and not self._ident_sent_this_session:
+                self.send_nickserv_identify(manual=False)
+
+            chans_raw = self.cfg.get("auto_channels", "")
+            for tok in re.split(r"[,\s]+", chans_raw):
+                ch = tok.strip()
+                if ch:
+                    if not ch.startswith(("#", "&")):
+                        ch = "#" + ch
+                    self.send_raw(f"JOIN {ch}")
+            return
+
+        # 433 Nickname in use
+        if cmd == "433":
+            alt = self.cfg.get("alt_nick") or (self.current_nick + "_")
+            if self.current_nick == alt:
+                alt = alt + "_"
+            self.current_nick = alt
+            self.lbl_my_nick.set_text(f"[{self.current_nick}]")
+            self._append_system(srv_buf, f"Nickname in use — trying '{alt}'...", "#B45309")
+            self.send_raw(f"NICK {alt}")
+            return
+
+        # JOIN
+        if cmd == "JOIN" and params:
+            chan = params[0]
+            cbuf = self._ensure_buffer(chan, "channel", switch=(nick.lower() == self.current_nick.lower()))
+            cbuf.display_nicks[nick.lower()] = nick
+            cbuf.users.setdefault(nick.lower(), set())
+            self._append_system(cbuf, f"→ {nick} ({user}@{host}) has joined {chan}", "#15803D")
+            if self._buf_key(chan) == self.active_buf_key:
+                self._rebuild_user_list()
+            return
+
+        # PART
+        if cmd == "PART" and params:
+            chan = params[0]
+            reason = params[1] if len(params) > 1 else ""
+            key = self._buf_key(chan)
+            if key in self.buffers:
+                cbuf = self.buffers[key]
+                cbuf.users.pop(nick.lower(), None)
+                cbuf.display_nicks.pop(nick.lower(), None)
+                self._append_system(cbuf, f"← {nick} has left {chan}" + (f" ({reason})" if reason else ""), "#64748B")
+                if key == self.active_buf_key:
+                    self._rebuild_user_list()
+            return
+
+        # QUIT
+        if cmd == "QUIT":
+            reason = params[0] if params else ""
+            for key, b in self.buffers.items():
+                if b.kind == "channel" and nick.lower() in b.display_nicks:
+                    b.users.pop(nick.lower(), None)
+                    b.display_nicks.pop(nick.lower(), None)
+                    self._append_system(b, f"⇐ {nick} has quit ({reason})", "#64748B")
+                    if key == self.active_buf_key:
+                        self._rebuild_user_list()
+            return
+
+        # KICK
+        if cmd == "KICK" and len(params) >= 2:
+            chan, kicked = params[0], params[1]
+            reason = params[2] if len(params) > 2 else ""
+            key = self._buf_key(chan)
+            if key in self.buffers:
+                cbuf = self.buffers[key]
+                cbuf.users.pop(kicked.lower(), None)
+                cbuf.display_nicks.pop(kicked.lower(), None)
+                self._append_system(cbuf, f"🥾 {kicked} was kicked from {chan} by {nick} ({reason})", "#C5221F")
+                if key == self.active_buf_key:
+                    self._rebuild_user_list()
+            return
+
+        # NICK
+        if cmd == "NICK" and params:
+            new_nick = params[0]
+            if nick.lower() == self.current_nick.lower():
+                self.current_nick = new_nick
+                self.lbl_my_nick.set_text(f"[{self.current_nick}]")
+            for key, b in self.buffers.items():
+                if b.kind == "channel" and nick.lower() in b.display_nicks:
+                    prefs = b.users.pop(nick.lower(), set())
+                    b.display_nicks.pop(nick.lower(), None)
+                    b.users[new_nick.lower()] = prefs
+                    b.display_nicks[new_nick.lower()] = new_nick
+                    self._append_system(b, f"• {nick} is now known as {new_nick}", "#475569")
+                    if key == self.active_buf_key:
+                        self._rebuild_user_list()
+            return
+
+        # TOPIC & 332 / 333
+        if cmd == "TOPIC" and len(params) >= 2:
+            chan, new_t = params[0], params[1]
+            cbuf = self._ensure_buffer(chan, "channel")
+            cbuf.topic = new_t
+            cbuf.topic_meta = f"Set by {nick}"
+            self._append_system(cbuf, f"★ {nick} changed the topic of {chan} to: {new_t}", "#1D4ED8")
+            if self._buf_key(chan) == self.active_buf_key:
+                self.ent_topic.set_text(strip_mirc_codes(new_t))
+                self.ent_topic.set_tooltip_text(cbuf.topic_meta)
+            return
+
+        if cmd == "332" and len(params) >= 3:
+            chan, new_t = params[1], params[2]
+            cbuf = self._ensure_buffer(chan, "channel")
+            cbuf.topic = new_t
+            self._append_system(cbuf, f"Topic for {chan}: {new_t}", "#1D4ED8")
+            if self._buf_key(chan) == self.active_buf_key:
+                self.ent_topic.set_text(strip_mirc_codes(new_t))
+            return
+
+        if cmd == "333" and len(params) >= 4:
+            chan, setter, ts_s = params[1], params[2], params[3]
+            key = self._buf_key(chan)
+            if key in self.buffers:
+                try:
+                    dt_str = datetime.datetime.fromtimestamp(int(ts_s)).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    dt_str = ts_s
+                self.buffers[key].topic_meta = f"Topic set by {setter} on {dt_str}"
+                if key == self.active_buf_key:
+                    self.ent_topic.set_tooltip_text(self.buffers[key].topic_meta)
+            return
+
+        # 353 NAMES list & 366 End of NAMES
+        if cmd == "353" and len(params) >= 4:
+            chan = params[2]
+            names_str = params[3]
+            cbuf = self._ensure_buffer(chan, "channel")
+            ckey = self._buf_key(chan)
+            if ckey not in self._names_accum:
+                self._names_accum.add(ckey)
+                cbuf.users.clear()
+                cbuf.display_nicks.clear()
+            for tok in names_str.split():
+                prefs = set()
+                while tok and tok[0] in "~&@%+":
+                    prefs.add(tok[0])
+                    tok = tok[1:]
+                if "!" in tok:
+                    n_part, uh_part = tok.split("!", 1)
+                    self.user_hosts[n_part.lower()] = uh_part
+                    tok = n_part
+                if tok:
+                    cbuf.display_nicks[tok.lower()] = tok
+                    cbuf.users[tok.lower()] = prefs
+            return
+
+        if cmd == "366" and len(params) >= 2:
+            chan = params[1]
+            ckey = self._buf_key(chan)
+            self._names_accum.discard(ckey)
+            if ckey == self.active_buf_key:
+                self._rebuild_user_list()
+            return
+
+        # 352 WHO reply (caches user@host!)
+        if cmd == "352" and len(params) >= 6:
+            u_ident, u_host, u_nick = params[2], params[3], params[5]
+            self.user_hosts[u_nick.lower()] = f"{u_ident}@{u_host}"
+
+        # MODE changes (updates @ / + badges in left-hand user list live!)
+        if cmd == "MODE" and len(params) >= 2:
+            target = params[0]
+            modes = params[1]
+            m_args = params[2:]
+            if target.startswith(("#", "&")):
+                cbuf = self._ensure_buffer(target, "channel")
+                self._append_system(cbuf, f"⚙ {nick or prefix} sets mode {modes} {' '.join(m_args)}".strip(), "#0F766E")
+                adding = True
+                arg_i = 0
+                for mc in modes:
+                    if mc == "+":
+                        adding = True
+                    elif mc == "-":
+                        adding = False
+                    elif mc in MODE_TO_PREFIX and arg_i < len(m_args):
+                        tnick = m_args[arg_i].lower()
+                        arg_i += 1
+                        pchar = MODE_TO_PREFIX[mc]
+                        if tnick in cbuf.users:
+                            if adding:
+                                cbuf.users[tnick].add(pchar)
+                            else:
+                                cbuf.users[tnick].discard(pchar)
+                    elif mc in "beIqaohvk" and arg_i < len(m_args):
+                        arg_i += 1
+                if self._buf_key(target) == self.active_buf_key:
+                    self._rebuild_user_list()
+            else:
+                self._append_system(srv_buf, f"Mode {target}: {modes} {' '.join(m_args)}")
+            return
+
+        # PRIVMSG & NOTICE (including CTCP ACTION /me, VERSION, PING, TIME & NickServ prompts!)
+        if cmd in ("PRIVMSG", "NOTICE") and len(params) >= 2:
+            if nick.lower() in self.ignored_nicks:
+                return
+            target, text = params[0], params[1]
+
+            # Handle CTCP
+            if text.startswith("\x01") and text.endswith("\x01") and len(text) > 1:
+                ctcp_body = text[1:-1]
+                ctcp_cmd, _, ctcp_arg = ctcp_body.partition(" ")
+                ctcp_u = ctcp_cmd.upper()
+                if ctcp_u == "ACTION":
+                    dest_buf = self._ensure_buffer(target, "channel") if target.startswith(("#", "&")) else self._ensure_buffer(nick or "*Libera.Chat*", "query")
+                    hl = self.current_nick.lower() in ctcp_arg.lower()
+                    self._append_line(dest_buf, f"* {nick}", "#6B21A8", ctcp_arg, body_fg="#6B21A8", is_highlight=hl)
+                    return
+                if cmd == "PRIVMSG":
+                    if ctcp_u == "VERSION":
+                        self.send_raw(f"NOTICE {nick} :\x01VERSION dtIRC 1.0 — Common Desktop Environment (CDE / Linux)\x01")
+                    elif ctcp_u == "TIME":
+                        now_s = datetime.datetime.now().strftime("%a %b %d %H:%M:%S %Y")
+                        self.send_raw(f"NOTICE {nick} :\x01TIME {now_s}\x01")
+                    elif ctcp_u == "PING":
+                        self.send_raw(f"NOTICE {nick} :\x01PING {ctcp_arg}\x01")
+                    self._append_system(srv_buf, f"[CTCP {ctcp_u}] from {nick} {ctcp_arg}".strip(), "#B45309")
+                else:
+                    active = self.buffers.get(self.active_buf_key, srv_buf)
+                    self._append_system(active, f"[CTCP {ctcp_u} reply from {nick}] {ctcp_arg}", "#0369A1")
+                return
+
+            # Auto-respond to NickServ "This nickname is registered" if password saved and not yet sent!
+            if cmd == "NOTICE" and nick.lower() == "nickserv" and "identify" in text.lower():
+                if self.cfg.get("auto_identify") and self.cfg.get("ns_password") and not self._ident_sent_this_session:
+                    self.send_nickserv_identify(manual=False)
+
+            if cmd == "NOTICE":
+                dest = self.buffers.get(self._buf_key(target)) if target.startswith(("#", "&")) else self.buffers.get(self.active_buf_key, srv_buf)
+                sender = nick or prefix or "Server"
+                self._append_line(dest or srv_buf, f"-{sender}-", "#B45309", text)
+                return
+
+            # Normal PRIVMSG
+            if target.startswith(("#", "&")):
+                dest_buf = self._ensure_buffer(target, "channel")
+            else:
+                dest_buf = self._ensure_buffer(nick, "query")
+            hl = (self.current_nick.lower() in text.lower()) or (dest_buf.kind == "query")
+            self._append_line(dest_buf, f"<{nick}>", nick_color(nick), text, is_highlight=hl)
+            return
+
+        # WHOIS / Server Numerics / Channel LIST
+        if cmd in ("311", "312", "317", "318", "319", "330", "671", "314", "369"):
+            dest = self.buffers.get(self.active_buf_key, srv_buf)
+            info = " ".join(params[1:])
+            self._append_system(dest, f"[WHOIS] {info}", "#1A365D")
+            return
+
+        if cmd == "322" and len(params) >= 4:
+            ch_n, ch_cnt, ch_top = params[1], params[2], params[3]
+            self._append_system(srv_buf, f"{ch_n:22s} ({ch_cnt:>4s} users)  {strip_mirc_codes(ch_top)}", "#1E293B")
+            return
+
+        # Default server numeric / message output
+        disp = " ".join(params[1:]) if (cmd.isdigit() and len(params) > 1) else " ".join(params)
+        if disp:
+            is_err = cmd.isdigit() and cmd.startswith(("4", "5"))
+            dest = self.buffers.get(self.active_buf_key, srv_buf) if is_err else srv_buf
+            self._append_system(dest, disp, "#C5221F" if is_err else "#334155")
+
+    # ---------------- Full '/' Command Interpreter & Input Handling ----------------
+    def on_input_submit(self, *_args):
+        raw = self.ent_input.get_text()
+        if not raw:
+            return
+        self.ent_input.set_text("")
+        if not self.cmd_history or self.cmd_history[-1] != raw:
+            self.cmd_history.append(raw)
+        self.hist_idx = len(self.cmd_history)
+
+        if raw.startswith("/") and not raw.startswith("//"):
+            self.exec_command(raw)
+        else:
+            msg = raw[1:] if raw.startswith("//") else raw
+            buf = self.buffers.get(self.active_buf_key)
+            if not buf or buf.kind == "server":
+                self._append_system(self.buffers["*libera.chat*"], "Join a #channel first (e.g. /join #libera) or use / commands!")
+                return
+            self.send_raw(f"PRIVMSG {buf.name} :{msg}")
+            self._append_line(buf, f"<{self.current_nick}>", "#2B5B84", msg)
+
+    def exec_command(self, line: str, quiet_secret: bool = False):
+        s = line[1:].strip()
+        if not s:
+            return
+        cmd, _, rest = s.partition(" ")
+        c = cmd.lower()
+        rest = rest.strip()
+        active_buf = self.buffers.get(self.active_buf_key, self.buffers["*libera.chat*"])
+        cur_chan = active_buf.name if active_buf.kind == "channel" else ""
+
+        if c in ("j", "join"):
+            if not rest:
+                self.on_join_dialog(); return
+            parts = rest.split(None, 1)
+            ch = parts[0] if parts[0].startswith(("#", "&")) else "#" + parts[0]
+            key_arg = f" {parts[1]}" if len(parts) > 1 else ""
+            self.send_raw(f"JOIN {ch}{key_arg}")
+        elif c in ("part", "leave"):
+            parts = rest.split(None, 1) if rest else []
+            ch = parts[0] if (parts and parts[0].startswith(("#", "&"))) else cur_chan
+            reason = parts[1] if len(parts) > 1 else (rest if (parts and not parts[0].startswith("#")) else "Leaving")
+            if ch:
+                self.send_raw(f"PART {ch} :{reason}")
+                self._remove_buffer(self._buf_key(ch))
+        elif c in ("msg", "privmsg", "m"):
+            target, _, body = rest.partition(" ")
+            if target and body:
+                self.send_raw(f"PRIVMSG {target} :{body}")
+                if not quiet_secret:
+                    dest = self._ensure_buffer(target, "channel" if target.startswith("#") else "query")
+                    self._append_line(dest, f"→ <{target}>", "#2B5B84", body)
+        elif c in ("query", "q"):
+            if rest:
+                target, _, body = rest.partition(" ")
+                qbuf = self._ensure_buffer(target, "query", switch=True)
+                if body:
+                    self.send_raw(f"PRIVMSG {target} :{body}")
+                    self._append_line(qbuf, f"<{self.current_nick}>", "#2B5B84", body)
+        elif c == "notice":
+            target, _, body = rest.partition(" ")
+            if target and body:
+                self.send_raw(f"NOTICE {target} :{body}")
+                self._append_line(active_buf, f"→ -{target}-", "#B45309", body)
+        elif c == "me":
+            if active_buf.kind != "server" and rest:
+                self.send_raw(f"PRIVMSG {active_buf.name} :\x01ACTION {rest}\x01")
+                self._append_line(active_buf, f"* {self.current_nick}", "#6B21A8", rest, body_fg="#6B21A8")
+        elif c == "nick":
+            if rest:
+                self.send_raw(f"NICK {rest.split()[0]}")
+        elif c in ("ns", "nickserv"):
+            if rest:
+                self.send_raw(f"PRIVMSG NickServ :{rest}")
+                self._append_system(active_buf, "Sent command to NickServ.")
+        elif c in ("cs", "chanserv"):
+            if rest:
+                self.send_raw(f"PRIVMSG ChanServ :{rest}")
+                self._append_system(active_buf, f"-> ChanServ: {rest}")
+        elif c in ("id", "identify"):
+            if rest:
+                self.send_raw(f"PRIVMSG NickServ :IDENTIFY {rest}")
+                self._append_system(active_buf, "Sent NickServ IDENTIFY.")
+            else:
+                self.send_nickserv_identify(manual=True)
+        elif c in ("wi", "whois"):
+            t = rest.split()[0] if rest else self.current_nick
+            self.send_raw(f"WHOIS {t} {t}")
+        elif c == "whowas":
+            if rest:
+                self.send_raw(f"WHOWAS {rest}")
+        elif c == "who":
+            self.send_raw(f"WHO {rest or cur_chan}")
+        elif c in ("t", "topic"):
+            if cur_chan:
+                if rest:
+                    self.send_raw(f"TOPIC {cur_chan} :{rest}")
+                else:
+                    self.send_raw(f"TOPIC {cur_chan}")
+        elif c == "mode":
+            if rest.startswith(("#", "&")) or not cur_chan:
+                self.send_raw(f"MODE {rest}")
+            else:
+                self.send_raw(f"MODE {cur_chan} {rest}")
+        elif c in ("op", "deop", "voice", "devoice", "halfop", "dehalfop"):
+            m_map = {"op": "+o", "deop": "-o", "voice": "+v", "devoice": "-v", "halfop": "+h", "dehalfop": "-h"}
+            if cur_chan and rest:
+                for n in rest.split():
+                    self.send_raw(f"MODE {cur_chan} {m_map[c]} {n}")
+        elif c in ("k", "kick"):
+            if cur_chan and rest:
+                knick, _, reason = rest.partition(" ")
+                self.send_raw(f"KICK {cur_chan} {knick} :{reason or knick}")
+        elif c in ("b", "ban", "unban", "quiet", "unquiet"):
+            m_map = {"b": "+b", "ban": "+b", "unban": "-b", "quiet": "+q", "unquiet": "-q"}
+            if cur_chan and rest:
+                mask = rest.split()[0]
+                if "!" not in mask and "@" not in mask:
+                    uh = self.user_hosts.get(mask.lower(), "")
+                    mask = f"*!*@{uh.split('@', 1)[1]}" if "@" in uh else f"{mask}!*@*"
+                self.send_raw(f"MODE {cur_chan} {m_map[c]} {mask}")
+        elif c in ("kb", "kickban"):
+            if cur_chan and rest:
+                knick, _, reason = rest.partition(" ")
+                uh = self.user_hosts.get(knick.lower(), "")
+                mask = f"*!*@{uh.split('@', 1)[1]}" if "@" in uh else f"{knick}!*@*"
+                self.send_raw(f"MODE {cur_chan} +b {mask}")
+                self.send_raw(f"KICK {cur_chan} {knick} :{reason or knick}")
+        elif c == "invite":
+            parts = rest.split()
+            if len(parts) == 1 and cur_chan:
+                self.send_raw(f"INVITE {parts[0]} {cur_chan}")
+            elif len(parts) >= 2:
+                self.send_raw(f"INVITE {parts[0]} {parts[1]}")
+        elif c == "names":
+            self.send_raw(f"NAMES {rest or cur_chan}")
+        elif c == "list":
+            self.send_raw(f"LIST {rest or '>20'}")
+        elif c == "away":
+            self.send_raw(f"AWAY :{rest}" if rest else "AWAY")
+        elif c == "back":
+            self.send_raw("AWAY")
+        elif c == "ctcp":
+            target, _, sub = rest.partition(" ")
+            if target and sub:
+                self.send_raw(f"PRIVMSG {target} :\x01{sub}\x01")
+                self._append_system(active_buf, f"Sent CTCP {sub} to {target}")
+        elif c == "ping":
+            target = rest.split()[0] if rest else ""
+            if target:
+                self.send_raw(f"PRIVMSG {target} :\x01PING {int(time.time())}\x01")
+        elif c == "version":
+            target = rest.split()[0] if rest else ""
+            if target:
+                self.send_raw(f"PRIVMSG {target} :\x01VERSION\x01")
+        elif c == "ignore":
+            if rest:
+                n = rest.split()[0].lower()
+                self.ignored_nicks.add(n); self._save_config()
+                self._append_system(active_buf, f"Ignoring messages from {n}.")
+        elif c == "unignore":
+            if rest:
+                n = rest.split()[0].lower()
+                self.ignored_nicks.discard(n); self._save_config()
+                self._append_system(active_buf, f"Removed {n} from ignore list.")
+        elif c == "clear":
+            self.clear_active_buffer()
+        elif c in ("server", "connect"):
+            parts = rest.split()
+            h = parts[0] if parts else self.cfg["host"]
+            p = DEFAULT_PORT
+            tls = True
+            if len(parts) > 1:
+                ps = parts[1]
+                if ps.startswith("+"):
+                    tls = True; p = int(ps[1:] or 6697)
+                else:
+                    p = int(ps); tls = (p in (6697, 7000, 7070))
+            self.connect_irc(h, p, tls)
+        elif c == "reconnect":
+            self.connect_irc()
+        elif c == "disconnect":
+            self.disconnect_irc(rest or "Disconnected")
+        elif c in ("quit", "exit"):
+            self.disconnect_irc(rest or "dtIRC — CDE Desktop")
+            self.on_quit()
+        elif c in ("raw", "quote"):
+            if rest:
+                self.send_raw(rest)
+        else:
+            # Pass any other IRC command directly to server!
+            self.send_raw(f"{cmd.upper()} {rest}".strip())
+
+    # ---------------- Input History, Nick Tab-Completion & Dialogs ----------------
+    def _on_input_key_press(self, ent, ev):
+        if ev.keyval == Gdk.KEY_Up:
+            if self.cmd_history and self.hist_idx > 0:
+                self.hist_idx -= 1
+                ent.set_text(self.cmd_history[self.hist_idx])
+                ent.set_position(-1)
+            return True
+        if ev.keyval == Gdk.KEY_Down:
+            if self.hist_idx < len(self.cmd_history) - 1:
+                self.hist_idx += 1
+                ent.set_text(self.cmd_history[self.hist_idx])
+                ent.set_position(-1)
+            else:
+                self.hist_idx = len(self.cmd_history)
+                ent.set_text("")
+            return True
+        if ev.keyval == Gdk.KEY_Tab:
+            self._tab_complete_input()
+            return True
+        return False
+
+    def _tab_complete_input(self):
+        txt = self.ent_input.get_text()
+        pos = self.ent_input.get_position()
+        left = txt[:pos]
+        right = txt[pos:]
+        m = re.search(r"(\S+)$", left)
+        if not m:
+            return
+        prefix = m.group(1)
+        start_idx = m.start(1)
+
+        if prefix.startswith("/") and start_idx == 0:
+            cmds = [
+                "/join", "/part", "/msg", "/query", "/me", "/nick", "/nickserv", "/chanserv",
+                "/identify", "/whois", "/whowas", "/topic", "/mode", "/op", "/deop", "/voice",
+                "/devoice", "/kick", "/ban", "/unban", "/kickban", "/quiet", "/unquiet",
+                "/invite", "/list", "/names", "/away", "/back", "/ctcp", "/ping", "/ignore",
+                "/clear", "/connect", "/disconnect", "/quit", "/raw",
+            ]
+            matches = [x for x in cmds if x.startswith(prefix.lower())]
+            if matches:
+                rep = matches[0] + " "
+                self.ent_input.set_text(left[:start_idx] + rep + right)
+                self.ent_input.set_position(start_idx + len(rep))
+            return
+
+        buf = self.buffers.get(self.active_buf_key)
+        if buf and buf.kind == "channel":
+            nicks = sorted(buf.display_nicks.values(), key=str.lower)
+            matches = [n for n in nicks if n.lower().startswith(prefix.lower())]
+            if matches:
+                suffix = ": " if start_idx == 0 else " "
+                rep = matches[0] + suffix
+                self.ent_input.set_text(left[:start_idx] + rep + right)
+                self.ent_input.set_position(start_idx + len(rep))
+
+    def _refresh_active_names(self):
+        buf = self.buffers.get(self.active_buf_key)
+        if buf and buf.kind == "channel":
+            self.send_raw(f"NAMES {buf.name}")
+            self.send_raw(f"WHO {buf.name}")
+
+    def on_identity_dialog(self, *_args):
+        dlg = IdentityDialog(self, self.cfg)
+        if dlg.run() == Gtk.ResponseType.OK:
+            old_nick = self.cfg.get("nick")
+            self.cfg = dlg.get_updated_config(self.cfg)
+            self._save_config()
+            dlg.destroy()
+            if self.connected and self.cfg["nick"] != old_nick:
+                self.send_raw(f"NICK {self.cfg['nick']}")
+            self.lbl_status.set_text("Saved Libera.Chat & NickServ credentials (0600 permissions).")
+        else:
+            dlg.destroy()
+
+    def on_join_dialog(self, *_args):
+        dlg = Gtk.Dialog(title="Join Channel — dtIRC", transient_for=self, flags=0)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Join", Gtk.ResponseType.OK)
+        box = dlg.get_content_area()
+        box.set_spacing(8); box.set_margin_top(10); box.set_margin_bottom(10); box.set_margin_start(12); box.set_margin_end(12)
+        box.pack_start(Gtk.Label(label="Channel Name (e.g. #libera, #linux, ##retro):", xalign=0), False, False, 0)
+        ent = Gtk.Entry(text="#", width_chars=32)
+        ent.connect("activate", lambda *_: dlg.response(Gtk.ResponseType.OK))
+        box.pack_start(ent, False, False, 0)
+        dlg.show_all()
+        ent.set_position(-1)
+        if dlg.run() == Gtk.ResponseType.OK:
+            ch = ent.get_text().strip()
+            dlg.destroy()
+            if ch and ch != "#":
+                self.exec_command(f"/join {ch}")
+        else:
+            dlg.destroy()
+
+    def on_save_log(self, *_args):
+        buf = self.buffers.get(self.active_buf_key)
+        if not buf:
+            return
+        dlg = Gtk.FileChooserDialog(title="Save Chat Log — dtIRC", parent=self, action=Gtk.FileChooserAction.SAVE)
+        dlg.set_do_overwrite_confirmation(True)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save", Gtk.ResponseType.OK)
+        dlg.set_current_folder(str(LOG_DIR))
+        safe = re.sub(r"[^A-Za-z0-9_#-]+", "_", buf.name)
+        dlg.set_current_name(f"{safe}_{datetime.date.today().isoformat()}.log")
+        if dlg.run() == Gtk.ResponseType.OK:
+            out_p = Path(dlg.get_filename())
+            dlg.destroy()
+            start, end = buf.textbuf.get_bounds()
+            out_p.write_text(buf.textbuf.get_text(start, end, True), encoding="utf-8")
+            self.lbl_status.set_text(f"Saved chat transcript to {out_p}")
+        else:
+            dlg.destroy()
+
+    def on_commands_help(self, *_args):
+        md = Gtk.MessageDialog(
+            transient_for=self, flags=0, message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK, text="dtIRC — Supported / Commands Reference",
+        )
+        md.format_secondary_text(
+            "• Channels:  /join #chan [key], /part [reason], /topic [new topic], /names, /list, /invite nick\n"
+            "• Messaging: /msg target text, /query nick [text], /notice target text, /me action\n"
+            "• NickServ:  /identify [pw], /ns <cmd>, /cs <cmd>, or click [🔑 NickServ Setup] / [✔ Identify]\n"
+            "• Op Tools:  /op, /deop, /voice, /devoice, /halfop, /kick nick [reason], /ban, /unban, /kb, /quiet, /mode\n"
+            "• Info/Misc: /whois nick, /whowas nick, /who, /ctcp, /ping, /away, /back, /ignore, /clear, /server, /raw"
+        )
+        md.run(); md.destroy()
+
+    def on_about(self, *_args):
+        md = Gtk.MessageDialog(
+            transient_for=self, flags=0, message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK, text="dtIRC — CDE Libera.Chat IRC Client",
+        )
+        md.format_secondary_text(
+            "Full-featured Common Desktop Environment IRC client.\n\n"
+            "• Pre-wired to irc.libera.chat:6697 (TLS) with saved SASL PLAIN & NickServ auto-identify\n"
+            "• Left-hand ranked User List with Right-Click Op Menu & top editable Channel Topic bar\n"
+            "• Full mIRC color codes refactored for CDE cream wells + instant [A−]/[A＋] text scaling!"
+        )
+        md.run(); md.destroy()
+
+    def _on_window_key_press(self, _w, ev):
+        ctrl = bool(ev.state & Gdk.ModifierType.CONTROL_MASK)
+        kv = ev.keyval
+        if ctrl and kv in (Gdk.KEY_plus, Gdk.KEY_equal, Gdk.KEY_KP_Add):
+            self.step_font_size(1); return True
+        if ctrl and kv in (Gdk.KEY_minus, Gdk.KEY_underscore, Gdk.KEY_KP_Subtract):
+            self.step_font_size(-1); return True
+        if ctrl and kv in (Gdk.KEY_0, Gdk.KEY_KP_0):
+            self.set_font_size(11); return True
+        if ctrl and kv in (Gdk.KEY_j, Gdk.KEY_J):
+            self.on_join_dialog(); return True
+        if ctrl and kv in (Gdk.KEY_w, Gdk.KEY_W):
+            self.close_active_buffer(); return True
+        if ctrl and kv in (Gdk.KEY_t, Gdk.KEY_T):
+            self.ent_topic.grab_focus(); return True
+        if ctrl and kv in (Gdk.KEY_l, Gdk.KEY_L):
+            self.clear_active_buffer(); return True
+        if ctrl and kv in (Gdk.KEY_q, Gdk.KEY_Q):
+            self.on_quit(); return True
+        return False
+
+    def on_quit(self):
+        if self.connected:
+            self.disconnect_irc("dtIRC — Common Desktop Environment")
+        self._save_config()
+        self.destroy()
+        Gtk.main_quit()
+        return False
+
+
+def main():
+    win = DtIrcWindow()
+    win.connect("destroy", Gtk.main_quit)
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

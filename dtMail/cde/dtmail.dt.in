@@ -1,0 +1,12 @@
+set DtDbVersion=1.0
+
+ACTION dtMail
+{
+     LABEL         dtMail
+     ARG_COUNT     0
+     ICON          outlook_express
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/cde-mail
+     DESCRIPTION   dtMail — Native OSF/Motif Email Client.
+}

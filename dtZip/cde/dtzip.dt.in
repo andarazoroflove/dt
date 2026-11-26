@@ -1,0 +1,22 @@
+set DtDbVersion=1.0
+
+ACTION dtZip
+{
+     LABEL         dtZip
+     ICON          dtzip
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtzip "%(File)Arg_1%"
+     DESCRIPTION   dtZip — CDE Drag-and-Drop Archive Manager (.zip, .tar.*, .7z, .rar).
+}
+
+ACTION dtZip
+{
+     LABEL         dtZip
+     ARG_COUNT     0
+     ICON          dtzip
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtzip
+     DESCRIPTION   dtZip — CDE Drag-and-Drop Archive Manager (.zip, .tar.*, .7z, .rar).
+}

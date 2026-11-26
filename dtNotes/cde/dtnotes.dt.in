@@ -1,0 +1,22 @@
+set DtDbVersion=1.0
+
+ACTION dtNotes
+{
+     LABEL         dtNotes
+     ICON          dtnotes
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtnotes "%(File)Arg_1%"
+     DESCRIPTION   dtNotes — CDE Multi-Tab Rich Text (.rtf), Markdown (.md) & Code Editor.
+}
+
+ACTION dtNotes
+{
+     LABEL         dtNotes
+     ARG_COUNT     0
+     ICON          dtnotes
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtnotes
+     DESCRIPTION   dtNotes — CDE Multi-Tab Rich Text (.rtf), Markdown (.md) & Code Editor.
+}

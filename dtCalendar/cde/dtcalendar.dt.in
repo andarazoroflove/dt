@@ -1,0 +1,22 @@
+set DtDbVersion=1.0
+
+ACTION Dtcm
+{
+     LABEL         Calendar
+     ARG_COUNT     0
+     ICON          DtCM
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtcm
+     DESCRIPTION   dtCalendar (dtcm) — Native OSF/Motif Calendar & M365 Sync.
+}
+
+ACTION dtCalendarImport
+{
+     LABEL         Open in Calendar (dtcm)
+     ICON          DtCM
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtcm --import-ics "%(File)Arg_1%"
+     DESCRIPTION   Import .ics invitation into CDE Calendar.
+}

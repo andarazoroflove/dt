@@ -1,0 +1,22 @@
+set DtDbVersion=1.0
+
+ACTION dtPics
+{
+     LABEL         dtPics
+     ICON          dtpics
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtpics "%(File)Arg_1%"
+     DESCRIPTION   dtPics — CDE Universal Image Viewer & Photo/Markup Studio.
+}
+
+ACTION dtPics
+{
+     LABEL         dtPics
+     ARG_COUNT     0
+     ICON          dtpics
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtpics
+     DESCRIPTION   dtPics — CDE Universal Image Viewer & Photo/Markup Studio.
+}

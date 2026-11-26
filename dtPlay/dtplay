@@ -1,0 +1,1501 @@
+#!/usr/bin/env python3
+"""
+dtPlay — Common Desktop Environment (CDE) Media Player & 60s Clip Trimmer
+A clean, fast CDE OSF/Motif clone of VLC for Music & Movies.
+
+Supported Formats:
+  Audio: .wav, .mp3, .m4a, .flac, .ogg, .oga, .opus, .aac, .wma, .au, .snd, .aiff, .aif
+  Video: .mp4, .m4v, .mov, .avi, .mpeg, .mpg, .mkv, .webm, .ogv, .wmv, .3gp, .flv, .ts, .m2ts
+
+Features:
+  - Opens to ~/Music in dtMail's classic vintage greenbar alternating-row file browser
+  - Includes '..' parent folder row at the top for browsing anywhere on disk
+  - Double-clicking any song or movie plays it; '◀ Back to List' returns to the browser
+  - Native GStreamer gtksink video stage + retro CDE audio spectrum / cover art visualizer
+  - True borderless fullscreen toggle (F11 / F / Full Screen button / double-click video)
+  - '✂ Make a Clip' button: captures up to 60 seconds starting from current playback position
+    and opens it in a second dtPlay Clip Studio window to trim further or Save As!
+"""
+
+import argparse
+import datetime
+import math
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+from pathlib import Path
+
+import cairo
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
+gi.require_version("Gst", "1.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gst, Gtk, Pango, PangoCairo
+
+Gst.init(None)
+
+HOME = Path.home()
+DT_ICONS = HOME / ".dt" / "icons"
+MUSIC_DIR = HOME / "Music"
+
+AUDIO_EXTS = {
+    ".wav", ".mp3", ".m4a", ".flac", ".ogg", ".oga", ".opus",
+    ".aac", ".wma", ".au", ".snd", ".aiff", ".aif", ".mp2",
+}
+
+VIDEO_EXTS = {
+    ".mp4", ".m4v", ".mov", ".qt", ".avi", ".mpeg", ".mpg",
+    ".mkv", ".webm", ".ogv", ".wmv", ".3gp", ".flv", ".ts", ".m2ts",
+}
+
+MEDIA_EXTS = AUDIO_EXTS | VIDEO_EXTS
+
+
+# ---------------------------------------------------------------------------
+# CDE Active Motif Palette & GTK3 CSS (with dtMail Greenbar Shading)
+# ---------------------------------------------------------------------------
+def _shade_hex(hex_col: str, factor: float) -> str:
+    h = hex_col.lstrip("#")
+    if len(h) != 6:
+        return hex_col
+    r = max(0, min(255, int(int(h[0:2], 16) * factor)))
+    g = max(0, min(255, int(int(h[2:4], 16) * factor)))
+    b = max(0, min(255, int(int(h[4:6], 16) * factor)))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _compute_greenbar_hex(well_hex: str) -> str:
+    """Exact dtMail greenbar formula from cde_mail.c."""
+    h = well_hex.lstrip("#")
+    if len(h) != 6:
+        return "#eef4db"
+    r = max(0, int(h[0:2], 16) - 17)
+    g = max(0, int(h[2:4], 16) - 3)
+    b = max(0, int(h[4:6], 16) - 14)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def load_cde_palette() -> tuple[str, str, str, str]:
+    chrome, sel, well = "#aeb2c3", "#2c567e", "#fff7e9"
+    try:
+        out = subprocess.check_output(["xrdb", "-query"], text=True, stderr=subprocess.DEVNULL)
+        pal_name = "Crimson.dp"
+        for ln in out.splitlines():
+            if "ColorPalette:" in ln:
+                pal_name = ln.split(":", 1)[1].strip()
+                break
+        for pdir in (HOME / ".dt/palettes", Path("/usr/dt/palettes")):
+            pf = pdir / pal_name
+            if pf.is_file():
+                hexes = [l.strip() for l in pf.read_text().splitlines() if l.strip().startswith("#")]
+                if len(hexes) >= 4:
+                    def norm16(h):
+                        h = h.lstrip("#")
+                        return f"#{h[0:2]}{h[4:6]}{h[8:10]}" if len(h) == 12 else "#" + h[:6]
+                    chrome, sel, well = norm16(hexes[1]), norm16(hexes[2]), norm16(hexes[3])
+                break
+    except Exception:
+        pass
+    return chrome, sel, well, _compute_greenbar_hex(well)
+
+
+def build_cde_css(chrome: str, sel: str, well: str) -> bytes:
+    chrome_hi = _shade_hex(chrome, 1.06)
+    chrome_lo = _shade_hex(chrome, 0.90)
+    css = f"""
+    window, dialog, .background {{
+        background-color: {chrome};
+        color: #101014;
+        font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+        font-size: 9.5pt;
+    }}
+    menubar {{
+        background-color: {chrome};
+        border-bottom: 2px solid #585c6c;
+    }}
+    menuitem:hover {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    .cde-toolbar {{
+        background-color: {chrome};
+        padding: 4px 7px;
+        border-top: 2px solid #e6e9f2;
+        border-left: 2px solid #e6e9f2;
+        border-right: 2px solid #585c6c;
+        border-bottom: 2px solid #585c6c;
+    }}
+    .cde-clipbar {{
+        background-color: {well};
+        color: #101014;
+        padding: 5px 9px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+    }}
+    .cde-status {{
+        background-color: {chrome};
+        padding: 3px 8px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+    }}
+    frame {{
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+        border-radius: 0px;
+    }}
+    button {{
+        background-image: none;
+        background-color: {chrome};
+        color: #101014;
+        border-top: 2px solid #e6e9f2;
+        border-left: 2px solid #e6e9f2;
+        border-right: 2px solid #565a69;
+        border-bottom: 2px solid #565a69;
+        border-radius: 0px;
+        padding: 3px 8px;
+        box-shadow: none;
+    }}
+    button:hover {{
+        background-color: {chrome_hi};
+    }}
+    button:active, button:checked {{
+        background-color: {chrome_lo};
+        border-top: 2px solid #565a69;
+        border-left: 2px solid #565a69;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+        font-weight: bold;
+    }}
+    button.cde-play {{
+        background-color: #2b5b84;
+        color: #ffffff;
+        border-top: 2px solid #6899c4;
+        border-left: 2px solid #6899c4;
+        border-right: 2px solid #142c40;
+        border-bottom: 2px solid #142c40;
+        font-weight: bold;
+    }}
+    button.cde-play label {{ color: #ffffff; }}
+    button.cde-clip {{
+        background-color: #8b3a2b;
+        color: #ffffff;
+        border-top: 2px solid #c96c5b;
+        border-left: 2px solid #c96c5b;
+        border-right: 2px solid #421810;
+        border-bottom: 2px solid #421810;
+        font-weight: bold;
+    }}
+    button.cde-clip label {{ color: #ffffff; }}
+    button.cde-save {{
+        background-color: #266048;
+        color: #ffffff;
+        border-top: 2px solid #52997b;
+        border-left: 2px solid #52997b;
+        border-right: 2px solid #113023;
+        border-bottom: 2px solid #113023;
+        font-weight: bold;
+    }}
+    button.cde-save label {{ color: #ffffff; }}
+    entry, spinbutton, treeview {{
+        background-color: {well};
+        color: #101014;
+        border-radius: 0px;
+    }}
+    treeview:selected {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    treeview header button {{
+        background-color: {chrome};
+        font-weight: bold;
+    }}
+    """
+    return css.encode("utf-8")
+
+
+def format_time(sec: float) -> str:
+    if sec < 0 or math.isnan(sec):
+        sec = 0.0
+    tot = int(round(sec))
+    h, rem = divmod(tot, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
+
+
+def human_size(num: int) -> str:
+    if num < 1024:
+        return f"{num} B"
+    f = float(num)
+    for u in ("KB", "MB", "GB"):
+        f /= 1024.0
+        if f < 1024.0 or u == "GB":
+            return f"{f:.1f} {u}"
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Fast Non-Realtime GStreamer Segment Clip Extractor (Audio & Video)
+# ---------------------------------------------------------------------------
+def extract_media_clip_gst(src_path: Path, out_path: Path, start_sec: float, duration_sec: float,
+                           expect_video: bool) -> None:
+    """
+    Extract [start_sec, start_sec + duration_sec] from src_path into out_path
+    using GStreamer uridecodebin + encoders at maximum non-realtime speed.
+    """
+    ext = out_path.suffix.lower()
+    uri = src_path.resolve().as_uri()
+    start_ns = max(0, int(round(start_sec * Gst.SECOND)))
+    stop_ns = start_ns + max(int(0.25 * Gst.SECOND), int(round(duration_sec * Gst.SECOND)))
+
+    pipe = Gst.Pipeline.new("clip_pipeline")
+    dec = Gst.ElementFactory.make("uridecodebin", "dec")
+    dec.set_property("uri", uri)
+    pipe.add(dec)
+
+    sink = Gst.ElementFactory.make("filesink", "sink")
+    sink.set_property("location", str(out_path))
+    sink.set_property("sync", False)
+    pipe.add(sink)
+
+    mux = None
+    v_Entry = None
+    a_Entry = None
+
+    if expect_video or ext in (".mp4", ".m4v", ".mov"):
+        mux = Gst.ElementFactory.make("mp4mux", "mux")
+        pipe.add(mux)
+        mux.link(sink)
+
+        # Video branch
+        vq = Gst.ElementFactory.make("queue", "vq")
+        vconv = Gst.ElementFactory.make("videoconvert", "vconv")
+        x264 = Gst.ElementFactory.make("x264enc", "venc")
+        if x264:
+            x264.set_property("speed-preset", 1)  # ultrafast
+            x264.set_property("quantizer", 21)
+        else:
+            x264 = Gst.ElementFactory.make("openh264enc", "venc")
+        vparse = Gst.ElementFactory.make("h264parse", "vparse")
+        for el in (vq, vconv, x264, vparse):
+            pipe.add(el)
+        vq.link(vconv)
+        vconv.link(x264)
+        x264.link(vparse)
+        vparse.link(mux)
+        v_Entry = vq
+
+        # Audio branch (optional if video is silent!)
+        aq = Gst.ElementFactory.make("queue", "aq")
+        aconv = Gst.ElementFactory.make("audioconvert", "aconv")
+        ares = Gst.ElementFactory.make("audioresample", "ares")
+        aenc = Gst.ElementFactory.make("avenc_aac", "aenc") or Gst.ElementFactory.make("voaacenc", "aenc")
+        for el in (aq, aconv, ares, aenc):
+            pipe.add(el)
+        aq.link(aconv)
+        aconv.link(ares)
+        ares.link(aenc)
+        a_Entry = (aq, aenc)
+    else:
+        # Pure audio output (.mp3, .wav, .flac, .m4a, .ogg)
+        aq = Gst.ElementFactory.make("queue", "aq")
+        aconv = Gst.ElementFactory.make("audioconvert", "aconv")
+        ares = Gst.ElementFactory.make("audioresample", "ares")
+        for el in (aq, aconv, ares):
+            pipe.add(el)
+        aq.link(aconv)
+        aconv.link(ares)
+
+        if ext == ".wav":
+            enc = Gst.ElementFactory.make("wavenc", "aenc")
+            pipe.add(enc); ares.link(enc); enc.link(sink)
+        elif ext == ".flac":
+            enc = Gst.ElementFactory.make("flacenc", "aenc")
+            pipe.add(enc); ares.link(enc); enc.link(sink)
+        elif ext in (".m4a", ".aac"):
+            enc = Gst.ElementFactory.make("avenc_aac", "aenc")
+            mux = Gst.ElementFactory.make("mp4mux", "mux")
+            pipe.add(enc); pipe.add(mux)
+            ares.link(enc); enc.link(mux); mux.link(sink)
+        elif ext in (".ogg", ".opus"):
+            enc = Gst.ElementFactory.make("vorbisenc", "aenc")
+            mux = Gst.ElementFactory.make("oggmux", "mux")
+            pipe.add(enc); pipe.add(mux)
+            ares.link(enc); enc.link(mux); mux.link(sink)
+        else:
+            enc = Gst.ElementFactory.make("lamemp3enc", "aenc")
+            pipe.add(enc); ares.link(enc); enc.link(sink)
+        a_Entry = (aq, None)
+
+    linked_v = [False]
+    linked_a = [False]
+
+    def _on_pad_added(_element, pad):
+        caps = pad.get_current_caps() or pad.query_caps(None)
+        if not caps or caps.get_size() == 0:
+            return
+        name = caps.get_structure(0).get_name()
+        if name.startswith("video/") and v_Entry is not None and not linked_v[0]:
+            sp = v_Entry.get_static_pad("sink")
+            if sp and not sp.is_linked():
+                if pad.link(sp) == Gst.PadLinkReturn.OK:
+                    linked_v[0] = True
+        elif name.startswith("audio/") and a_Entry is not None and not linked_a[0]:
+            aq_el, aenc_el = a_Entry
+            sp = aq_el.get_static_pad("sink")
+            if sp and not sp.is_linked():
+                if pad.link(sp) == Gst.PadLinkReturn.OK:
+                    linked_a[0] = True
+                    if aenc_el is not None and mux is not None:
+                        aenc_el.link(mux)
+
+    dec.connect("pad-added", _on_pad_added)
+
+    # Preroll in PAUSED so pads link cleanly, then perform segment seek on uridecodebin!
+    pipe.set_state(Gst.State.PAUSED)
+    st_ret, _st, _pend = pipe.get_state(8 * Gst.SECOND)
+    if st_ret == Gst.StateChangeReturn.FAILURE:
+        pipe.set_state(Gst.State.NULL)
+        raise RuntimeError("Could not decode source media file for clipping.")
+
+    # Seek uridecodebin to [start_ns, stop_ns] so downstream encoders see running_time starting at 0
+    dec.seek(
+        1.0,
+        Gst.Format.TIME,
+        Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE,
+        Gst.SeekType.SET,
+        start_ns,
+        Gst.SeekType.SET,
+        stop_ns,
+    )
+    pipe.get_state(5 * Gst.SECOND)
+    pipe.set_state(Gst.State.PLAYING)
+
+    bus = pipe.get_bus()
+    err_msg = None
+    deadline = time.monotonic() + 90.0
+    while time.monotonic() < deadline:
+        msg = bus.timed_pop_filtered(
+            int(0.25 * Gst.SECOND),
+            Gst.MessageType.EOS | Gst.MessageType.ERROR,
+        )
+        if msg is None:
+            continue
+        if msg.type == Gst.MessageType.EOS:
+            break
+        if msg.type == Gst.MessageType.ERROR:
+            err, _dbg = msg.parse_error()
+            err_msg = err.message
+            break
+
+    pipe.set_state(Gst.State.NULL)
+    if err_msg:
+        raise RuntimeError(err_msg)
+    if not out_path.is_file() or out_path.stat().st_size < 64:
+        raise RuntimeError("Extracted clip was empty (check playback position).")
+
+
+# ---------------------------------------------------------------------------
+# Main dtPlay Window
+# ---------------------------------------------------------------------------
+class DtPlayWindow(Gtk.Window):
+    def __init__(self, initial_media: Path | None = None, clip_mode: bool = False, orig_stem: str = ""):
+        title = "dtPlay Clip Studio — Trim & Save Snippet" if clip_mode else "dtPlay — CDE Media Player"
+        super().__init__(title=title)
+        self.set_wmclass("dtplay", "DtPlay")
+        self.set_default_size(980, 640)
+        self.set_position(Gtk.WindowPosition.CENTER)
+
+        ic = DT_ICONS / "dtplay.l.pm"
+        if ic.is_file():
+            try:
+                self.set_icon_from_file(str(ic))
+            except Exception:
+                pass
+
+        MUSIC_DIR.mkdir(parents=True, exist_ok=True)
+        self.chrome_hex, self.sel_hex, self.well_hex, self.well_alt_hex = load_cde_palette()
+
+        # Clip Studio state (for the second dtPlay window spawned by Make a Clip)
+        self.clip_mode = clip_mode
+        self.orig_stem = orig_stem or "Clip"
+        self.master_clip_backup: Path | None = initial_media if clip_mode else None
+
+        # Browser & Playlist state
+        self.current_dir: Path = (initial_media.parent if initial_media and initial_media.is_file() else MUSIC_DIR).resolve()
+        self.folder_media: list[Path] = []
+        self.current_media: Path | None = None
+        self.is_video_media: bool = False
+        self.is_playing: bool = False
+        self.is_fullscreen: bool = False
+        self.playback_rate: float = 1.0
+        self._seeking_slider: bool = False
+        self._clipping_busy: bool = False
+
+        # Audio metadata & visualizer state
+        self.tag_title: str = ""
+        self.tag_artist: str = ""
+        self.tag_album: str = ""
+        self.cover_pixbuf: GdkPixbuf.Pixbuf | None = None
+        self._viz_bars: list[float] = [0.15] * 20
+        self._fs_hide_timer: int = 0
+
+        # Build GStreamer Playbin + Native gtksink
+        self.player = Gst.ElementFactory.make("playbin", "dtplay_playbin")
+        self.gtksink = Gst.ElementFactory.make("gtksink", "dtplay_gtksink")
+        self.video_widget: Gtk.Widget | None = None
+        if self.player and self.gtksink:
+            self.gtksink.set_property("force-aspect-ratio", True)
+            self.player.set_property("video-sink", self.gtksink)
+            self.video_widget = self.gtksink.props.widget
+
+        if self.player:
+            bus = self.player.get_bus()
+            bus.add_signal_watch()
+            bus.connect("message::eos", self._on_gst_eos)
+            bus.connect("message::error", self._on_gst_error)
+            bus.connect("message::tag", self._on_gst_tag)
+
+        self._build_ui()
+        self.populate_browser(self.current_dir)
+
+        GLib.timeout_add(250, self._tick_timeline)
+        GLib.timeout_add(90, self._tick_visualizer)
+
+        if initial_media and initial_media.is_file():
+            GLib.idle_add(self.play_file, initial_media.resolve())
+
+    # ---------------- UI Construction ----------------
+    def _build_ui(self):
+        self.root_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(self.root_vbox)
+
+        # 1. Top Menu Bar
+        self.menubar = Gtk.MenuBar()
+
+        m_media = Gtk.Menu()
+        mi_media = Gtk.MenuItem(label="Media"); mi_media.set_submenu(m_media)
+        for lbl, cb in [
+            ("Open File...  (Ctrl+O)",       self.on_open_file_dialog),
+            ("Browse Folder...  (Ctrl+D)",   self.on_open_folder_dialog),
+            ("-", None),
+            ("Make a 60s Clip  (Ctrl+K)",    self.on_make_clip),
+            ("-", None),
+            ("Quit  (Ctrl+Q)",               lambda *_: self.on_quit()),
+        ]:
+            if lbl == "-":
+                m_media.append(Gtk.SeparatorMenuItem())
+            else:
+                it = Gtk.MenuItem(label=lbl); it.connect("activate", cb); m_media.append(it)
+        self.menubar.append(mi_media)
+
+        m_play = Gtk.Menu()
+        mi_play = Gtk.MenuItem(label="Playback"); mi_play.set_submenu(m_play)
+        for lbl, cb in [
+            ("Play / Pause  (Space)",        self.on_play_pause),
+            ("Stop  (S)",                    self.on_stop),
+            ("-", None),
+            ("Previous in Folder  (P)",      lambda *_: self.step_folder(-1)),
+            ("Next in Folder  (N)",          lambda *_: self.step_folder(1)),
+            ("-", None),
+            ("Jump Back 10s  (Left)",        lambda *_: self.seek_relative(-10.0)),
+            ("Jump Forward 10s  (Right)",    lambda *_: self.seek_relative(10.0)),
+            ("-", None),
+            ("Speed 0.75×",                  lambda *_: self.set_rate(0.75)),
+            ("Speed 1.0× (Normal)",          lambda *_: self.set_rate(1.0)),
+            ("Speed 1.25×",                  lambda *_: self.set_rate(1.25)),
+            ("Speed 1.5×",                   lambda *_: self.set_rate(1.5)),
+            ("Speed 2.0×",                   lambda *_: self.set_rate(2.0)),
+        ]:
+            if lbl == "-":
+                m_play.append(Gtk.SeparatorMenuItem())
+            else:
+                it = Gtk.MenuItem(label=lbl); it.connect("activate", cb); m_play.append(it)
+        self.menubar.append(mi_play)
+
+        m_audio = Gtk.Menu()
+        mi_audio = Gtk.MenuItem(label="Audio"); mi_audio.set_submenu(m_audio)
+        for lbl, cb in [
+            ("Toggle Mute  (M)",     self.on_toggle_mute),
+            ("Volume Up  (Up)",      lambda *_: self.adjust_volume(0.08)),
+            ("Volume Down  (Down)",  lambda *_: self.adjust_volume(-0.08)),
+        ]:
+            it = Gtk.MenuItem(label=lbl); it.connect("activate", cb); m_audio.append(it)
+        self.menubar.append(mi_audio)
+
+        m_video = Gtk.Menu()
+        mi_video = Gtk.MenuItem(label="Video"); mi_video.set_submenu(m_video)
+        for lbl, cb in [
+            ("Borderless Full Screen  (F11 / F)", lambda *_: self.toggle_fullscreen()),
+            ("Back to Folder List  (Backspace)",  lambda *_: self.show_browser_view()),
+        ]:
+            it = Gtk.MenuItem(label=lbl); it.connect("activate", cb); m_video.append(it)
+        self.menubar.append(mi_video)
+
+        m_help = Gtk.Menu()
+        mi_help = Gtk.MenuItem(label="Help"); mi_help.set_submenu(m_help)
+        it_ab = Gtk.MenuItem(label="About dtPlay...")
+        it_ab.connect("activate", self.on_about)
+        m_help.append(it_ab)
+        self.menubar.append(mi_help)
+        self.root_vbox.pack_start(self.menubar, False, False, 0)
+
+        # 2. Central Stack: Page "browser" (Greenbar ~/Music Browser) vs Page "player" (Video / Audio Stage)
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.NONE)
+        self.root_vbox.pack_start(self.stack, True, True, 0)
+
+        # --- Page 1: Greenbar Folder Browser (dtMail Style) ---
+        br_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        nav_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        nav_bar.get_style_context().add_class("cde-toolbar")
+        b_up = Gtk.Button(label="⬆ Up (..)")
+        b_up.connect("clicked", lambda *_: self.populate_browser(self.current_dir.parent))
+        nav_bar.pack_start(b_up, False, False, 0)
+
+        for qlbl, qpath in [
+            ("🎵 Music", MUSIC_DIR),
+            ("🎬 Videos", HOME / "Videos"),
+            ("⬇ Downloads", HOME / "Downloads"),
+            ("🏠 Home", HOME),
+        ]:
+            qb = Gtk.Button(label=qlbl)
+            qb.connect("clicked", lambda _b, p=qpath: (p.mkdir(parents=True, exist_ok=True), self.populate_browser(p)))
+            nav_bar.pack_start(qb, False, False, 0)
+
+        nav_bar.pack_start(Gtk.Label(label="Folder:"), False, False, 4)
+        self.ent_path = Gtk.Entry()
+        self.ent_path.connect("activate", self._on_path_entry_activate)
+        nav_bar.pack_start(self.ent_path, True, True, 0)
+
+        self.btn_return_stage = Gtk.Button(label="▶ Now Playing Stage")
+        self.btn_return_stage.get_style_context().add_class("cde-play")
+        self.btn_return_stage.set_no_show_all(True)
+        self.btn_return_stage.connect("clicked", lambda *_: self.stack.set_visible_child_name("player"))
+        nav_bar.pack_end(self.btn_return_stage, False, False, 0)
+
+        br_vbox.pack_start(nav_bar, False, False, 0)
+
+        # Greenbar TreeView:
+        # 0: icon, 1: name, 2: kind_label, 3: size_str, 4: mtime_str, 5: full_path, 6: is_dir, 7: row_bg, 8: weight
+        self.br_store = Gtk.ListStore(str, str, str, str, str, str, bool, str, int)
+        self.br_view = Gtk.TreeView(model=self.br_store)
+        self.br_view.set_enable_search(True)
+        self.br_view.set_search_column(1)
+
+        cols = [
+            ("",         0, 36,  False, 0.5),
+            ("Name",     1, 380, True,  0.0),
+            ("Type",     2, 110, False, 0.0),
+            ("Size",     3, 95,  False, 1.0),
+            ("Modified", 4, 145, False, 0.0),
+        ]
+        for title, cidx, mw, exp, xal in cols:
+            r = Gtk.CellRendererText()
+            r.set_property("xalign", xal)
+            if exp:
+                r.set_property("ellipsize", Pango.EllipsizeMode.END)
+            c = Gtk.TreeViewColumn(title, r, text=cidx, cell_background=7, weight=8)
+            c.set_min_width(mw)
+            c.set_resizable(True)
+            c.set_expand(exp)
+            self.br_view.append_column(c)
+
+        self.br_view.connect("row-activated", self._on_browser_row_activated)
+        sw_br = Gtk.ScrolledWindow()
+        sw_br.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw_br.add(self.br_view)
+        fr_br = Gtk.Frame(margin=4)
+        fr_br.add(sw_br)
+        br_vbox.pack_start(fr_br, True, True, 0)
+        self.stack.add_named(br_vbox, "browser")
+
+        # --- Page 2: Media Playback Stage (Video gtksink + Audio Visualizer) ---
+        self.stage_stack = Gtk.Stack()
+        self.stage_stack.set_transition_type(Gtk.StackTransitionType.NONE)
+
+        # Video Stage
+        ev_vid = Gtk.EventBox()
+        ev_vid.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.POINTER_MOTION_MASK)
+        ev_vid.connect("button-press-event", self._on_stage_click)
+        ev_vid.connect("motion-notify-event", self._on_stage_motion)
+        if self.video_widget is not None:
+            ev_vid.add(self.video_widget)
+        else:
+            ev_vid.add(Gtk.Label(label="Video output ready"))
+        self.stage_stack.add_named(ev_vid, "video")
+
+        # Audio Visualizer Stage
+        self.audio_canvas = Gtk.DrawingArea(hexpand=True, vexpand=True)
+        self.audio_canvas.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.POINTER_MOTION_MASK)
+        self.audio_canvas.connect("draw", self._on_draw_audio_stage)
+        self.audio_canvas.connect("button-press-event", self._on_stage_click)
+        self.audio_canvas.connect("motion-notify-event", self._on_stage_motion)
+        self.stage_stack.add_named(self.audio_canvas, "audio")
+
+        self.stack.add_named(self.stage_stack, "player")
+
+        # 3. Clip Studio Trim & Save Bar (Visible in Clip Window Mode!)
+        self.clip_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.clip_bar.get_style_context().add_class("cde-clipbar")
+        self.clip_bar.set_no_show_all(True)
+
+        lbl_cb = Gtk.Label()
+        lbl_cb.set_markup("<b>✂ Clip Studio:</b>")
+        self.clip_bar.pack_start(lbl_cb, False, False, 2)
+
+        self.clip_bar.pack_start(Gtk.Label(label="Start (s):"), False, False, 0)
+        self.sp_trim_in = Gtk.SpinButton.new_with_range(0.0, 60.0, 0.1)
+        self.sp_trim_in.set_digits(1)
+        self.sp_trim_in.set_value(0.0)
+        self.clip_bar.pack_start(self.sp_trim_in, False, False, 0)
+
+        b_set_in = Gtk.Button(label="[ Set In")
+        b_set_in.set_tooltip_text("Set Trim Start to current playhead position")
+        b_set_in.connect("clicked", self._on_set_trim_in)
+        self.clip_bar.pack_start(b_set_in, False, False, 0)
+
+        self.clip_bar.pack_start(Gtk.Label(label="End (s):"), False, False, 2)
+        self.sp_trim_out = Gtk.SpinButton.new_with_range(0.2, 60.0, 0.1)
+        self.sp_trim_out.set_digits(1)
+        self.sp_trim_out.set_value(60.0)
+        self.clip_bar.pack_start(self.sp_trim_out, False, False, 0)
+
+        b_set_out = Gtk.Button(label="Set Out ]")
+        b_set_out.set_tooltip_text("Set Trim End to current playhead position")
+        b_set_out.connect("clicked", self._on_set_trim_out)
+        self.clip_bar.pack_start(b_set_out, False, False, 0)
+
+        b_apply_trim = Gtk.Button(label="✂ Trim Further")
+        b_apply_trim.get_style_context().add_class("cde-clip")
+        b_apply_trim.connect("clicked", self.on_trim_further)
+        self.clip_bar.pack_start(b_apply_trim, False, False, 4)
+
+        b_rst_clip = Gtk.Button(label="↺ Reset 60s")
+        b_rst_clip.set_tooltip_text("Restore full initial 60-second clip")
+        b_rst_clip.connect("clicked", self.on_reset_clip)
+        self.clip_bar.pack_start(b_rst_clip, False, False, 0)
+
+        b_save_clip = Gtk.Button(label="💾 Save Clip As...")
+        b_save_clip.get_style_context().add_class("cde-save")
+        b_save_clip.connect("clicked", self.on_save_clip_as)
+        self.clip_bar.pack_end(b_save_clip, False, False, 2)
+
+        self.root_vbox.pack_start(self.clip_bar, False, False, 0)
+
+        # 4. Bottom VLC-Style CDE Playback Toolbar
+        self.bottom_bar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.bottom_bar.get_style_context().add_class("cde-toolbar")
+
+        # Timeline Row
+        t_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.lbl_pos = Gtk.Label(label="00:00", xalign=1.0)
+        self.sl_seek = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 1000.0, 1.0)
+        self.sl_seek.set_draw_value(False)
+        self.sl_seek.set_hexpand(True)
+        self.sl_seek.connect("button-press-event", self._on_seek_press)
+        self.sl_seek.connect("button-release-event", self._on_seek_release)
+        self.lbl_dur = Gtk.Label(label="00:00", xalign=0.0)
+
+        t_row.pack_start(self.lbl_pos, False, False, 4)
+        t_row.pack_start(self.sl_seek, True, True, 0)
+        t_row.pack_start(self.lbl_dur, False, False, 4)
+        self.bottom_bar.pack_start(t_row, False, False, 0)
+
+        # Controls Row
+        c_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+
+        self.btn_back_list = Gtk.Button(label="◀ Back to List")
+        self.btn_back_list.set_tooltip_text("Return to greenbar folder browser (Backspace)")
+        self.btn_back_list.connect("clicked", lambda *_: self.show_browser_view())
+        c_row.pack_start(self.btn_back_list, False, False, 0)
+
+        c_row.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 3)
+
+        b_prev = Gtk.Button(label="⏮"); b_prev.set_tooltip_text("Previous in Folder"); b_prev.connect("clicked", lambda *_: self.step_folder(-1))
+        self.btn_play = Gtk.Button(label="▶ Play")
+        self.btn_play.get_style_context().add_class("cde-play")
+        self.btn_play.connect("clicked", self.on_play_pause)
+        b_stop = Gtk.Button(label="⏹"); b_stop.set_tooltip_text("Stop"); b_stop.connect("clicked", self.on_stop)
+        b_next = Gtk.Button(label="⏭"); b_next.set_tooltip_text("Next in Folder"); b_next.connect("clicked", lambda *_: self.step_folder(1))
+
+        c_row.pack_start(b_prev, False, False, 0)
+        c_row.pack_start(self.btn_play, False, False, 0)
+        c_row.pack_start(b_stop, False, False, 0)
+        c_row.pack_start(b_next, False, False, 0)
+
+        c_row.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 3)
+
+        self.btn_make_clip = Gtk.Button(label="✂ Make a Clip")
+        self.btn_make_clip.get_style_context().add_class("cde-clip")
+        self.btn_make_clip.set_tooltip_text("Capture up to a 60-second clip starting right now and open in a Clip Studio window!")
+        self.btn_make_clip.connect("clicked", self.on_make_clip)
+        c_row.pack_start(self.btn_make_clip, False, False, 0)
+
+        self.lbl_status = Gtk.Label(label="Browse ~/Music or double-click any song or movie to play.", xalign=0.0)
+        self.lbl_status.set_ellipsize(Pango.EllipsizeMode.END)
+        c_row.pack_start(self.lbl_status, True, True, 8)
+
+        # Right side: Mute + Volume + Borderless Full Screen
+        self.btn_mute = Gtk.Button(label="🔊")
+        self.btn_mute.set_tooltip_text("Mute / Unmute (M)")
+        self.btn_mute.connect("clicked", self.on_toggle_mute)
+        c_row.pack_end(self.btn_mute, False, False, 0)
+
+        self.btn_fs = Gtk.Button(label="⛶ Full Screen")
+        self.btn_fs.set_tooltip_text("Borderless Full Screen (F11 / F / Esc to exit)")
+        self.btn_fs.connect("clicked", lambda *_: self.toggle_fullscreen())
+        c_row.pack_end(self.btn_fs, False, False, 0)
+
+        self.sl_vol = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 1.25, 0.02)
+        self.sl_vol.set_draw_value(False)
+        self.sl_vol.set_size_request(95, -1)
+        self.sl_vol.set_value(0.90)
+        if self.player:
+            self.player.set_property("volume", 0.90)
+        self.sl_vol.connect("value-changed", self._on_vol_changed)
+        c_row.pack_end(self.sl_vol, False, False, 2)
+
+        self.bottom_bar.pack_start(c_row, False, False, 0)
+        self.root_vbox.pack_start(self.bottom_bar, False, False, 0)
+
+        self.connect("key-press-event", self._on_key_press)
+        self.connect("delete-event", lambda *_: self.on_quit())
+        self.show_all()
+
+        if self.clip_mode:
+            for ch in self.clip_bar.get_children():
+                ch.show_all()
+            self.clip_bar.show()
+
+    # ---------------- Greenbar Folder Browser ----------------
+    def populate_browser(self, folder: Path):
+        try:
+            target = folder.expanduser().resolve()
+            if not target.is_dir():
+                target = HOME
+        except Exception:
+            target = HOME
+
+        self.current_dir = target
+        self.ent_path.set_text(str(target))
+        self.br_store.clear()
+        self.folder_media.clear()
+
+        row_idx = 0
+        # Always place '..' at the top so user can browse up to any folder!
+        if target.parent != target:
+            bg = self.well_hex
+            self.br_store.append([
+                "📁", "..", "Parent Folder", "", "", str(target.parent), True, bg, int(Pango.Weight.BOLD)
+            ])
+            row_idx += 1
+
+        try:
+            entries = list(target.iterdir())
+        except PermissionError:
+            self.lbl_status.set_text(f"Permission denied: {target}")
+            return
+
+        dirs = sorted([p for p in entries if p.is_dir() and not p.name.startswith(".")], key=lambda x: x.name.lower())
+        files = sorted(
+            [p for p in entries if p.is_file() and p.suffix.lower() in MEDIA_EXTS],
+            key=lambda x: x.name.lower(),
+        )
+        self.folder_media = files
+
+        for d in dirs:
+            bg = self.well_alt_hex if (row_idx % 2 == 1) else self.well_hex
+            try:
+                mt = datetime.datetime.fromtimestamp(d.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            except OSError:
+                mt = ""
+            self.br_store.append([
+                "📁", d.name, "Folder", "—", mt, str(d), True, bg, int(Pango.Weight.BOLD)
+            ])
+            row_idx += 1
+
+        for f in files:
+            bg = self.well_alt_hex if (row_idx % 2 == 1) else self.well_hex
+            ext = f.suffix.lower()
+            is_vid = ext in VIDEO_EXTS
+            icon = "🎬" if is_vid else "🎵"
+            kind = f"{ext.lstrip('.').upper()} {'Video' if is_vid else 'Audio'}"
+            try:
+                st = f.stat()
+                sz = human_size(st.st_size)
+                mt = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+            except OSError:
+                sz, mt = "", ""
+            self.br_store.append([
+                icon, f.name, kind, sz, mt, str(f), False, bg, int(Pango.Weight.NORMAL)
+            ])
+            row_idx += 1
+
+        self.lbl_status.set_text(f"{target} — {len(dirs)} folder(s), {len(files)} playable media file(s).")
+
+    def _on_path_entry_activate(self, ent):
+        p = Path(ent.get_text().strip()).expanduser()
+        if p.is_dir():
+            self.populate_browser(p)
+        elif p.is_file() and p.suffix.lower() in MEDIA_EXTS:
+            self.populate_browser(p.parent)
+            self.play_file(p)
+
+    def _on_browser_row_activated(self, _view, path, _col):
+        row = self.br_store[path]
+        full_p = Path(row[5])
+        is_dir = row[6]
+        if is_dir:
+            self.populate_browser(full_p)
+        else:
+            self.play_file(full_p)
+
+    def show_browser_view(self):
+        if self.is_fullscreen:
+            self.toggle_fullscreen()
+        self.stack.set_visible_child_name("browser")
+        if self.current_media is not None:
+            self.btn_return_stage.show()
+
+    # ---------------- Media Playback Engine ----------------
+    def play_file(self, path: Path):
+        if not self.player or not path.is_file():
+            return
+        rp = path.resolve()
+        if rp.parent != self.current_dir:
+            self.populate_browser(rp.parent)
+
+        self.player.set_state(Gst.State.NULL)
+        self.current_media = rp
+        self.tag_title = rp.stem
+        self.tag_artist = ""
+        self.tag_album = ""
+        self.cover_pixbuf = None
+
+        self.is_video_media = rp.suffix.lower() in VIDEO_EXTS
+        self.stage_stack.set_visible_child_name("video" if self.is_video_media else "audio")
+        self.stack.set_visible_child_name("player")
+        self.btn_return_stage.show()
+
+        self.player.set_property("uri", rp.as_uri())
+        self.player.set_state(Gst.State.PLAYING)
+        self.is_playing = True
+        self.btn_play.set_label("⏸ Pause")
+
+        prefix = "Clip Studio: " if self.clip_mode else ""
+        self.set_title(f"{prefix}{rp.name} — dtPlay")
+        self.lbl_status.set_text(f"Playing: {rp.name}")
+
+        # Inspect actual decoded video streams once playing starts (in case .mp4 is audio-only or .ogg has video)
+        GLib.timeout_add(450, self._check_stream_tracks)
+
+    def _check_stream_tracks(self) -> bool:
+        if not self.player or not self.current_media:
+            return False
+        n_vid = self.player.get_property("n-video") or 0
+        if n_vid > 0 and not self.is_video_media:
+            self.is_video_media = True
+            self.stage_stack.set_visible_child_name("video")
+        elif n_vid == 0 and self.is_video_media and self.current_media.suffix.lower() in (".ogg", ".mp4", ".webm"):
+            self.is_video_media = False
+            self.stage_stack.set_visible_child_name("audio")
+
+        if self.clip_mode:
+            ok_d, dur_ns = self.player.query_duration(Gst.Format.TIME)
+            if ok_d and dur_ns > 0:
+                dur_s = round(dur_ns / float(Gst.SECOND), 1)
+                self.sp_trim_in.set_range(0.0, max(0.1, dur_s - 0.2))
+                self.sp_trim_out.set_range(0.2, max(0.2, dur_s))
+                self.sp_trim_out.set_value(dur_s)
+        return False
+
+    def on_play_pause(self, *_args):
+        if not self.player:
+            return
+        if self.current_media is None:
+            model, it = self.br_view.get_selection().get_selected()
+            if it is not None and not model[it][6]:
+                self.play_file(Path(model[it][5]))
+                return
+            if self.folder_media:
+                self.play_file(self.folder_media[0])
+            return
+
+        if self.is_playing:
+            self.player.set_state(Gst.State.PAUSED)
+            self.is_playing = False
+            self.btn_play.set_label("▶ Play")
+        else:
+            self.player.set_state(Gst.State.PLAYING)
+            self.is_playing = True
+            self.btn_play.set_label("⏸ Pause")
+
+    def on_stop(self, *_args):
+        if self.player:
+            self.player.set_state(Gst.State.NULL)
+        self.is_playing = False
+        self.btn_play.set_label("▶ Play")
+        self.sl_seek.set_value(0.0)
+        self.lbl_pos.set_text("00:00")
+
+    def step_folder(self, delta: int):
+        if not self.folder_media:
+            return
+        if self.current_media in self.folder_media:
+            idx = (self.folder_media.index(self.current_media) + delta) % len(self.folder_media)
+        else:
+            idx = 0
+        self.play_file(self.folder_media[idx])
+
+    def seek_relative(self, delta_s: float):
+        if not self.player or not self.current_media:
+            return
+        ok_p, pos_ns = self.player.query_position(Gst.Format.TIME)
+        ok_d, dur_ns = self.player.query_duration(Gst.Format.TIME)
+        if not ok_p:
+            return
+        target = max(0, pos_ns + int(delta_s * Gst.SECOND))
+        if ok_d and dur_ns > 0:
+            target = min(dur_ns, target)
+        self._seek_ns(target)
+
+    def _seek_ns(self, target_ns: int):
+        if not self.player:
+            return
+        flags = Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT
+        if abs(self.playback_rate - 1.0) < 0.01:
+            self.player.seek_simple(Gst.Format.TIME, flags, target_ns)
+        else:
+            self.player.seek(
+                self.playback_rate, Gst.Format.TIME, flags,
+                Gst.SeekType.SET, target_ns, Gst.SeekType.NONE, 0
+            )
+
+    def set_rate(self, rate: float):
+        self.playback_rate = rate
+        if self.player and self.current_media:
+            ok_p, pos_ns = self.player.query_position(Gst.Format.TIME)
+            if ok_p:
+                self._seek_ns(pos_ns)
+        self.lbl_status.set_text(f"Playback speed: {rate}×")
+
+    def on_toggle_mute(self, *_args):
+        if not self.player:
+            return
+        m = not self.player.get_property("mute")
+        self.player.set_property("mute", m)
+        self.btn_mute.set_label("🔇" if m else "🔊")
+
+    def adjust_volume(self, delta: float):
+        v = max(0.0, min(1.25, self.sl_vol.get_value() + delta))
+        self.sl_vol.set_value(v)
+
+    def _on_vol_changed(self, sl):
+        if self.player:
+            self.player.set_property("volume", sl.get_value())
+
+    def _on_seek_press(self, *_args):
+        self._seeking_slider = True
+        return False
+
+    def _on_seek_release(self, sl, _ev):
+        self._seeking_slider = False
+        if self.player and self.current_media:
+            ok_d, dur_ns = self.player.query_duration(Gst.Format.TIME)
+            if ok_d and dur_ns > 0:
+                frac = sl.get_value() / 1000.0
+                self._seek_ns(int(dur_ns * frac))
+        return False
+
+    def _tick_timeline(self) -> bool:
+        if self.player and self.current_media and not self._seeking_slider:
+            ok_p, pos_ns = self.player.query_position(Gst.Format.TIME)
+            ok_d, dur_ns = self.player.query_duration(Gst.Format.TIME)
+            if ok_p and pos_ns >= 0:
+                ps = pos_ns / float(Gst.SECOND)
+                self.lbl_pos.set_text(format_time(ps))
+                if ok_d and dur_ns > 0:
+                    ds = dur_ns / float(Gst.SECOND)
+                    self.lbl_dur.set_text(format_time(ds))
+                    self.sl_seek.set_value(min(1000.0, (ps / ds) * 1000.0))
+        return True
+
+    # ---------------- Retro CDE Audio Stage & Visualizer ----------------
+    def _tick_visualizer(self) -> bool:
+        if self.stack.get_visible_child_name() == "player" and not self.is_video_media:
+            if self.is_playing:
+                t = time.monotonic()
+                for i in range(len(self._viz_bars)):
+                    wave = 0.42 + 0.32 * math.sin(t * 5.2 + i * 0.55) + 0.22 * math.cos(t * 8.7 - i * 0.9)
+                    jitter = random.uniform(-0.08, 0.12)
+                    self._viz_bars[i] = max(0.08, min(0.98, 0.55 * self._viz_bars[i] + 0.45 * (wave + jitter)))
+                self.audio_canvas.queue_draw()
+            elif any(b > 0.10 for b in self._viz_bars):
+                self._viz_bars = [max(0.08, b * 0.80) for b in self._viz_bars]
+                self.audio_canvas.queue_draw()
+        return True
+
+    def _on_draw_audio_stage(self, widget, cr: cairo.Context):
+        alloc = widget.get_allocation()
+        w, h = alloc.width, alloc.height
+
+        # Deep CDE midnight studio backdrop
+        pat = cairo.LinearGradient(0, 0, 0, h)
+        pat.add_color_stop_rgb(0.0, 0.08, 0.10, 0.15)
+        pat.add_color_stop_rgb(1.0, 0.04, 0.05, 0.08)
+        cr.set_source(pat)
+        cr.paint()
+
+        cx = w * 0.5
+        top_y = max(24.0, h * 0.12)
+
+        # Album Art or Retro Traffic-Cone / Note Badge
+        art_sz = min(180, max(96, int(h * 0.34)))
+        ax = cx - art_sz * 0.5
+        cr.set_source_rgba(0, 0, 0, 0.55)
+        cr.rectangle(ax + 4, top_y + 4, art_sz, art_sz); cr.fill()
+
+        if self.cover_pixbuf is not None:
+            scaled = self.cover_pixbuf.scale_simple(art_sz, art_sz, GdkPixbuf.InterpType.BILINEAR)
+            Gdk.cairo_set_source_pixbuf(cr, scaled, ax, top_y)
+            cr.paint()
+        else:
+            cr.set_source_rgb(0.16, 0.20, 0.28)
+            cr.rectangle(ax, top_y, art_sz, art_sz); cr.fill()
+            # Iconic VLC-inspired retro CDE cone/play emblem
+            cr.set_source_rgb(0.92, 0.48, 0.14)
+            cr.move_to(cx, top_y + art_sz * 0.18)
+            cr.line_to(ax + art_sz * 0.76, top_y + art_sz * 0.80)
+            cr.line_to(ax + art_sz * 0.24, top_y + art_sz * 0.80)
+            cr.close_path(); cr.fill()
+            cr.set_source_rgba(1, 1, 1, 0.90)
+            cr.move_to(cx - art_sz * 0.10, top_y + art_sz * 0.44)
+            cr.line_to(cx + art_sz * 0.10, top_y + art_sz * 0.44)
+            cr.line_to(cx + art_sz * 0.15, top_y + art_sz * 0.56)
+            cr.line_to(cx - art_sz * 0.15, top_y + art_sz * 0.56)
+            cr.close_path(); cr.fill()
+
+        cr.set_source_rgba(1, 1, 1, 0.35)
+        cr.set_line_width(1.5)
+        cr.rectangle(ax, top_y, art_sz, art_sz); cr.stroke()
+
+        # Track Title & Artist
+        layout = PangoCairo.create_layout(cr)
+        layout.set_width(max(200, w - 80) * Pango.SCALE)
+        layout.set_alignment(Pango.Alignment.CENTER)
+        t_esc = GLib.markup_escape_text(self.tag_title or (self.current_media.name if self.current_media else "dtPlay"))
+        sub_parts = [p for p in (self.tag_artist, self.tag_album) if p]
+        s_esc = GLib.markup_escape_text("  •  ".join(sub_parts)) if sub_parts else ""
+        mk = f"<span size='14000' weight='bold' foreground='#FFF7E9'>{t_esc}</span>"
+        if s_esc:
+            mk += f"\n<span size='10500' foreground='#9CB3C9'>{s_esc}</span>"
+        layout.set_markup(mk, -1)
+        cr.move_to(40, top_y + art_sz + 16)
+        PangoCairo.show_layout(cr, layout)
+
+        # 20-Band Segmented CDE Spectrum Analyzer
+        n_bars = len(self._viz_bars)
+        tot_w = min(460.0, w * 0.68)
+        bar_w = (tot_w / n_bars) * 0.72
+        gap = (tot_w / n_bars) * 0.28
+        bx0 = cx - tot_w * 0.5
+        by_base = h - 28.0
+        max_bh = max(36.0, min(110.0, h * 0.22))
+
+        for i, val in enumerate(self._viz_bars):
+            bx = bx0 + i * (bar_w + gap)
+            bh = val * max_bh
+            segs = max(1, int(bh / 6.0))
+            for s in range(segs):
+                sy = by_base - (s + 1) * 6.0
+                frac = s / max(1.0, max_bh / 6.0)
+                if frac > 0.80:
+                    cr.set_source_rgb(0.94, 0.36, 0.34)
+                elif frac > 0.55:
+                    cr.set_source_rgb(0.95, 0.78, 0.28)
+                else:
+                    cr.set_source_rgb(0.28, 0.78, 0.58)
+                cr.rectangle(bx, sy, bar_w, 4.2)
+                cr.fill()
+        return False
+
+    # ---------------- Borderless Full Screen ----------------
+    def toggle_fullscreen(self):
+        if self.is_fullscreen:
+            self.is_fullscreen = False
+            if self._fs_hide_timer:
+                GLib.source_remove(self._fs_hide_timer)
+                self._fs_hide_timer = 0
+            self.unfullscreen()
+            self.set_decorated(True)
+            self.menubar.show()
+            self.bottom_bar.show()
+            if self.clip_mode:
+                self.clip_bar.show()
+            self.btn_fs.set_label("⛶ Full Screen")
+        else:
+            self.stack.set_visible_child_name("player")
+            self.is_fullscreen = True
+            self.menubar.hide()
+            self.clip_bar.hide()
+            self.bottom_bar.hide()
+            self.set_decorated(False)
+            self.fullscreen()
+            self.btn_fs.set_label("⛶ Exit Full Screen")
+
+    def _on_stage_click(self, _w, ev):
+        if ev.type == Gdk.EventType._2BUTTON_PRESS and ev.button == 1:
+            self.toggle_fullscreen()
+            return True
+        return False
+
+    def _on_stage_motion(self, _w, ev):
+        if not self.is_fullscreen:
+            return False
+        alloc = self.get_allocation()
+        # Reveal bottom playback bar temporarily when cursor moves near bottom or moves in fullscreen
+        if ev.y >= alloc.height - 110:
+            self.bottom_bar.show()
+            if self._fs_hide_timer:
+                GLib.source_remove(self._fs_hide_timer)
+            self._fs_hide_timer = GLib.timeout_add(2600, self._auto_hide_fs_bar)
+        return False
+
+    def _auto_hide_fs_bar(self) -> bool:
+        self._fs_hide_timer = 0
+        if self.is_fullscreen:
+            self.bottom_bar.hide()
+        return False
+
+    # ---------------- 60-Second "Make a Clip" & Clip Studio ----------------
+    def on_make_clip(self, *_args):
+        if self._clipping_busy:
+            self.lbl_status.set_text("Clip extraction already running...")
+            return
+        if self.current_media is None or not self.current_media.is_file():
+            self.lbl_status.set_text("Play or select a song or movie first, then click Make a Clip!")
+            return
+
+        ok_p, pos_ns = self.player.query_position(Gst.Format.TIME) if self.player else (False, 0)
+        ok_d, dur_ns = self.player.query_duration(Gst.Format.TIME) if self.player else (False, 0)
+        start_s = (pos_ns / float(Gst.SECOND)) if (ok_p and pos_ns > 0) else 0.0
+
+        if ok_d and dur_ns > 0:
+            rem_s = max(0.5, (dur_ns / float(Gst.SECOND)) - start_s)
+            clip_dur = min(60.0, rem_s)
+        else:
+            clip_dur = 60.0
+
+        src_p = self.current_media
+        is_vid = self.is_video_media
+        out_ext = ".mp4" if is_vid else (src_p.suffix.lower() if src_p.suffix.lower() in (".wav", ".flac", ".m4a", ".ogg") else ".mp3")
+        ts = int(time.time() * 1000)
+        tmp_clip = Path(tempfile.gettempdir()) / f"dtplay_clip_{src_p.stem}_{ts}{out_ext}"
+
+        self._clipping_busy = True
+        self.btn_make_clip.set_sensitive(False)
+        self.lbl_status.set_text(f"Making {clip_dur:.1f}s clip from {format_time(start_s)} — please wait...")
+
+        def _worker():
+            try:
+                extract_media_clip_gst(src_p, tmp_clip, start_s, clip_dur, is_vid)
+                GLib.idle_add(self._on_clip_ready, tmp_clip, src_p.stem, None)
+            except Exception as exc:
+                GLib.idle_add(self._on_clip_ready, tmp_clip, src_p.stem, str(exc))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_clip_ready(self, tmp_clip: Path, stem: str, err: str | None):
+        self._clipping_busy = False
+        self.btn_make_clip.set_sensitive(True)
+        if err:
+            self.lbl_status.set_text(f"Clip failed: {err}")
+            return
+
+        # Pause main player so audio doesn't overlap with the new Clip Studio window!
+        if self.is_playing and self.player:
+            self.player.set_state(Gst.State.PAUSED)
+            self.is_playing = False
+            self.btn_play.set_label("▶ Play")
+
+        self.lbl_status.set_text(f"Created 60s clip ({tmp_clip.name}) — opened in Clip Studio window!")
+        subprocess.Popen([
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--clip-window",
+            "--orig-stem", stem,
+            str(tmp_clip),
+        ])
+
+    def _on_set_trim_in(self, *_args):
+        if self.player:
+            ok, pos_ns = self.player.query_position(Gst.Format.TIME)
+            if ok:
+                self.sp_trim_in.set_value(round(pos_ns / float(Gst.SECOND), 1))
+
+    def _on_set_trim_out(self, *_args):
+        if self.player:
+            ok, pos_ns = self.player.query_position(Gst.Format.TIME)
+            if ok:
+                self.sp_trim_out.set_value(max(self.sp_trim_in.get_value() + 0.2, round(pos_ns / float(Gst.SECOND), 1)))
+
+    def on_trim_further(self, *_args):
+        if self._clipping_busy or not self.current_media:
+            return
+        t_in = float(self.sp_trim_in.get_value())
+        t_out = float(self.sp_trim_out.get_value())
+        if t_out <= t_in + 0.15:
+            self.lbl_status.set_text("Trim End must be greater than Trim Start.")
+            return
+
+        src_p = self.current_media
+        dur = min(60.0, t_out - t_in)
+        out_p = Path(tempfile.gettempdir()) / f"dtplay_trimmed_{int(time.time() * 1000)}{src_p.suffix}"
+        is_vid = self.is_video_media
+
+        self.on_stop()
+        self._clipping_busy = True
+        self.lbl_status.set_text(f"Trimming snippet to {t_in:.1f}s – {t_out:.1f}s ({dur:.1f}s)...")
+
+        def _worker():
+            try:
+                extract_media_clip_gst(src_p, out_p, t_in, dur, is_vid)
+                GLib.idle_add(self._on_subtrim_done, out_p, None)
+            except Exception as exc:
+                GLib.idle_add(self._on_subtrim_done, out_p, str(exc))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_subtrim_done(self, out_p: Path, err: str | None):
+        self._clipping_busy = False
+        if err:
+            self.lbl_status.set_text(f"Trim error: {err}")
+            return
+        self.sp_trim_in.set_value(0.0)
+        self.play_file(out_p)
+        self.lbl_status.set_text(f"Trimmed snippet ready ({out_p.name}) — click Save Clip As to keep!")
+
+    def on_reset_clip(self, *_args):
+        if self.master_clip_backup and self.master_clip_backup.is_file():
+            self.sp_trim_in.set_value(0.0)
+            self.play_file(self.master_clip_backup)
+            self.lbl_status.set_text("Restored initial 60-second snippet.")
+
+    def on_save_clip_as(self, *_args):
+        if not self.current_media or not self.current_media.is_file():
+            return
+        dlg = Gtk.FileChooserDialog(title="Save Media Clip As — dtPlay", parent=self, action=Gtk.FileChooserAction.SAVE)
+        dlg.set_do_overwrite_confirmation(True)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save Clip", Gtk.ResponseType.OK)
+        default_dir = (HOME / "Videos") if (self.is_video_media and (HOME / "Videos").is_dir()) else MUSIC_DIR
+        dlg.set_current_folder(str(default_dir))
+        ext = self.current_media.suffix or (".mp4" if self.is_video_media else ".mp3")
+        dlg.set_current_name(f"{self.orig_stem}_clip{ext}")
+
+        if dlg.run() == Gtk.ResponseType.OK:
+            dest = Path(dlg.get_filename())
+            dlg.destroy()
+            if not dest.suffix:
+                dest = dest.with_suffix(ext)
+            try:
+                shutil.copy2(self.current_media, dest)
+                self.lbl_status.set_text(f"Saved clip to {dest}")
+            except Exception as exc:
+                self.lbl_status.set_text(f"Could not save clip: {exc}")
+        else:
+            dlg.destroy()
+
+    # ---------------- GStreamer Bus, Dialogs & Shortcuts ----------------
+    def _on_gst_eos(self, _bus, _msg):
+        if self.clip_mode:
+            # Loop or reset to beginning cleanly in Clip Studio
+            self._seek_ns(0)
+            self.player.set_state(Gst.State.PAUSED)
+            self.is_playing = False
+            self.btn_play.set_label("▶ Play")
+            return
+        self.on_stop()
+        self.lbl_status.set_text("Playback finished.")
+
+    def _on_gst_error(self, _bus, msg):
+        err, _dbg = msg.parse_error()
+        self.on_stop()
+        self.lbl_status.set_text(f"Playback error: {err.message}")
+
+    def _on_gst_tag(self, _bus, msg):
+        taglist = msg.parse_tag()
+        ok_t, val_t = taglist.get_string(Gst.TAG_TITLE)
+        if ok_t and val_t:
+            self.tag_title = val_t
+        ok_a, val_a = taglist.get_string(Gst.TAG_ARTIST)
+        if ok_a and val_a:
+            self.tag_artist = val_a
+        ok_al, val_al = taglist.get_string(Gst.TAG_ALBUM)
+        if ok_al and val_al:
+            self.tag_album = val_al
+
+        for img_tag in (Gst.TAG_IMAGE, Gst.TAG_PREVIEW_IMAGE):
+            ok_s, sample = taglist.get_sample(img_tag)
+            if ok_s and sample:
+                buf = sample.get_buffer()
+                if buf:
+                    ok_m, mapinfo = buf.map(Gst.MapFlags.READ)
+                    if ok_m:
+                        try:
+                            loader = GdkPixbuf.PixbufLoader()
+                            loader.write(mapinfo.data)
+                            loader.close()
+                            pb = loader.get_pixbuf()
+                            if pb:
+                                self.cover_pixbuf = pb
+                        except Exception:
+                            pass
+                        finally:
+                            buf.unmap(mapinfo)
+                        break
+
+    def on_open_file_dialog(self, *_args):
+        dlg = Gtk.FileChooserDialog(title="Open Media File — dtPlay", parent=self, action=Gtk.FileChooserAction.OPEN)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Play", Gtk.ResponseType.OK)
+        dlg.set_current_folder(str(self.current_dir))
+        flt = Gtk.FileFilter()
+        flt.set_name("Supported Music & Video Files")
+        for ext in sorted(MEDIA_EXTS):
+            flt.add_pattern(f"*{ext}")
+            flt.add_pattern(f"*{ext.upper()}")
+        dlg.add_filter(flt)
+        fa = Gtk.FileFilter(); fa.set_name("All Files"); fa.add_pattern("*"); dlg.add_filter(fa)
+
+        if dlg.run() == Gtk.ResponseType.OK:
+            fn = dlg.get_filename()
+            dlg.destroy()
+            if fn:
+                self.play_file(Path(fn))
+        else:
+            dlg.destroy()
+
+    def on_open_folder_dialog(self, *_args):
+        dlg = Gtk.FileChooserDialog(title="Browse Media Folder — dtPlay", parent=self, action=Gtk.FileChooserAction.SELECT_FOLDER)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Open Folder", Gtk.ResponseType.OK)
+        dlg.set_current_folder(str(self.current_dir))
+        if dlg.run() == Gtk.ResponseType.OK:
+            fn = dlg.get_filename()
+            dlg.destroy()
+            if fn:
+                self.populate_browser(Path(fn))
+                self.show_browser_view()
+        else:
+            dlg.destroy()
+
+    def _on_key_press(self, _w, ev):
+        foc = self.get_focus()
+        if isinstance(foc, Gtk.Entry) or isinstance(foc, Gtk.SpinButton):
+            if ev.keyval == Gdk.KEY_Escape and self.is_fullscreen:
+                self.toggle_fullscreen()
+                return True
+            return False
+
+        ctrl = bool(ev.state & Gdk.ModifierType.CONTROL_MASK)
+        kv = ev.keyval
+
+        if kv == Gdk.KEY_Escape and self.is_fullscreen:
+            self.toggle_fullscreen(); return True
+        if kv in (Gdk.KEY_F11, Gdk.KEY_f, Gdk.KEY_F) and not ctrl:
+            self.toggle_fullscreen(); return True
+        if kv == Gdk.KEY_BackSpace:
+            self.show_browser_view(); return True
+        if kv == Gdk.KEY_space:
+            self.on_play_pause(); return True
+        if ctrl and kv in (Gdk.KEY_o, Gdk.KEY_O):
+            self.on_open_file_dialog(); return True
+        if ctrl and kv in (Gdk.KEY_d, Gdk.KEY_D):
+            self.on_open_folder_dialog(); return True
+        if ctrl and kv in (Gdk.KEY_k, Gdk.KEY_K):
+            self.on_make_clip(); return True
+        if ctrl and kv in (Gdk.KEY_q, Gdk.KEY_Q):
+            self.on_quit(); return True
+        if kv in (Gdk.KEY_m, Gdk.KEY_M):
+            self.on_toggle_mute(); return True
+        if kv == Gdk.KEY_Left and self.stack.get_visible_child_name() == "player":
+            self.seek_relative(-10.0); return True
+        if kv == Gdk.KEY_Right and self.stack.get_visible_child_name() == "player":
+            self.seek_relative(10.0); return True
+        if kv == Gdk.KEY_Up and self.stack.get_visible_child_name() == "player":
+            self.adjust_volume(0.06); return True
+        if kv == Gdk.KEY_Down and self.stack.get_visible_child_name() == "player":
+            self.adjust_volume(-0.06); return True
+        return False
+
+    def on_about(self, *_args):
+        md = Gtk.MessageDialog(
+            transient_for=self, flags=0, message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK, text="dtPlay — CDE Media Player & 60s Clip Studio",
+        )
+        md.format_secondary_text(
+            "Simple, fast Common Desktop Environment audio & movie player.\n\n"
+            "• Formats: WAV, MP3, M4A, FLAC, OGG, OPUS, MP4, M4V, MOV, AVI, MPEG, MKV, WebM\n"
+            "• Greenbar ~/Music folder browser with '..' navigation & instant playback\n"
+            "• Borderless Full Screen mode (F11 / F) & 1-click 60-second 'Make a Clip' trimmer!"
+        )
+        md.run(); md.destroy()
+
+    def on_quit(self):
+        if self.player:
+            self.player.set_state(Gst.State.NULL)
+        self.destroy()
+        Gtk.main_quit()
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--clip-window", action="store_true")
+    parser.add_argument("--orig-stem", default="Clip")
+    parser.add_argument("files", nargs="*")
+    args, _unknown = parser.parse_known_args()
+
+    chrome, sel, well, _well_alt = load_cde_palette()
+    prov = Gtk.CssProvider()
+    prov.load_from_data(build_cde_css(chrome, sel, well))
+    scr = Gdk.Screen.get_default()
+    if scr is not None:
+        Gtk.StyleContext.add_provider_for_screen(scr, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    init_media = None
+    for f in args.files:
+        s = f.strip()
+        if not s:
+            continue
+        if s.startswith("file://"):
+            p = Path(urllib.parse.unquote(urllib.parse.urlparse(s).path))
+        else:
+            p = Path(s).expanduser()
+        if p.is_file():
+            init_media = p.resolve()
+            break
+
+    win = DtPlayWindow(init_media, clip_mode=args.clip_window, orig_stem=args.orig_stem)
+    win.connect("destroy", Gtk.main_quit)
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

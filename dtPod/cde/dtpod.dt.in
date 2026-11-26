@@ -1,0 +1,12 @@
+set DtDbVersion=1.0
+
+ACTION dtPod
+{
+     LABEL         dtPod
+     ARG_COUNT     0
+     ICON          dtpod
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtpod
+     DESCRIPTION   dtPod — CDE Apple Podcast Browser, Subscriber & Player.
+}

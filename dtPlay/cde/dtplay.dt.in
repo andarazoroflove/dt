@@ -1,0 +1,22 @@
+set DtDbVersion=1.0
+
+ACTION dtPlay
+{
+     LABEL         dtPlay
+     ICON          dtplay
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtplay "%(File)Arg_1%"
+     DESCRIPTION   dtPlay — CDE Music & Movie Player with 60s Clip Studio.
+}
+
+ACTION dtPlay
+{
+     LABEL         dtPlay
+     ARG_COUNT     0
+     ICON          dtplay
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtplay
+     DESCRIPTION   dtPlay — CDE Music & Movie Player with 60s Clip Studio.
+}

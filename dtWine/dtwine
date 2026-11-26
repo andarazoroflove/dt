@@ -1,0 +1,2238 @@
+#!/usr/bin/env python3
+"""
+dtWine — Common Desktop Environment (CDE) Wine Software & Old Game Manager
+Tailored for Linux + Common Desktop Environment (dtwm) with OpenGL WineD3D.
+
+Features:
+- Installs GOG offline installers (setup_*.exe + goggame-*.info / .ico) and
+  classic Windows games & applications (.exe, .msi, .bat, portable folders)
+- Asks whether software is a Game or Application:
+    * Game        -> extracts main game .exe icon & adds to CDE "Games" stack
+                     (SUBPANEL PersPrintersSubpanel)
+    * Application -> extracts main app .exe icon & adds to CDE "Personal Applications"
+                     stack (SUBPANEL PersAppsSubpanel)
+- Ignores junk installer shortcuts (Uninstall, Readme, Manual, Website, Setup, etc.)
+- Pure-Python PE32 / PE32+ / 16-bit NE / ICO icon extractor with Win95/98 DIB
+  1-bit AND-mask transparency -> CDE XPM (.l.pm, .pm, .m.pm, .s.pm, .t.pm)
+- Broad GPU compatibility via OpenGL WineD3D (renderer=gl)
+- Per-game Virtual Desktop mode, Windows version (win95..win10), Winetricks presets,
+  patch/DLC runner, winecfg, regedit, wineserver -k, and live CDE Front Panel reload.
+"""
+
+import ctypes
+import glob
+import io
+import json
+import os
+import re
+import shlex
+import shutil
+import struct
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Pango", "1.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango
+from PIL import Image, ImageDraw
+
+# ---------------------------------------------------------------------------
+# Paths & Constants
+# ---------------------------------------------------------------------------
+HOME = Path.home()
+GAMES_ROOT = HOME / "Games"
+CONFIG_DIR = HOME / ".config" / "dtwine"
+LEGACY_CONFIG_DIR = HOME / ".config" / "dwine"
+ENTRIES_JSON = CONFIG_DIR / "entries.json"
+LOCAL_BIN = HOME / ".local" / "bin"
+DT_ICONS = HOME / ".dt" / "icons"
+DT_TYPES = HOME / ".dt" / "types"
+DT_FP_DYN = DT_TYPES / "fp_dynamic"
+TEMPLATES_DIR = HOME / "Templates"
+WINETRICKS_BIN = LOCAL_BIN / "winetricks"
+
+SUBPANEL_GAMES = "PersPrintersSubpanel"   # Renamed to "Games"
+SUBPANEL_APPS = "PersAppsSubpanel"        # "Personal Applications"
+
+WIN_VERSIONS = [
+    ("win10", "Windows 10 (Modern & GOG default)"),
+    ("win7",  "Windows 7 (2008–2015 games/apps)"),
+    ("winxp", "Windows XP (2001–2008 classics)"),
+    ("win2k", "Windows 2000"),
+    ("win98", "Windows 98 (Late-90s DirectX/Win32)"),
+    ("win95", "Windows 95 (Mid-90s classics)"),
+]
+
+VDESKTOP_MODES = [
+    ("",         "Off (Native / Fullscreen)"),
+    ("640x480",  "640x480 (90s SVGA Windowed)"),
+    ("800x600",  "800x600 (Classic 4:3 Windowed)"),
+    ("1024x768", "1024x768 (XGA 4:3 Windowed)"),
+    ("1280x720", "1280x720 (HD 16:9 Windowed)"),
+]
+
+WINETRICKS_PRESETS = [
+    ("corefonts",  "Core Fonts",   "Microsoft Arial/Times/Courier fonts"),
+    ("d3dx9",      "DirectX 9",    "D3DX9 DLLs for 2000s 3D games"),
+    ("directplay", "DirectPlay",   "90s/2000s DirectPlay games (AoE, Diablo, etc.)"),
+    ("vcrun2005",  "VC++ 2005",    "Visual C++ 2005 runtime"),
+    ("vcrun2008",  "VC++ 2008",    "Visual C++ 2008 runtime"),
+    ("vcrun2010",  "VC++ 2010",    "Visual C++ 2010 runtime"),
+    ("vcrun2022",  "VC++ 2015-22", "Visual C++ 2015–2022 runtime"),
+    ("mfc42",      "MFC42 / VB6",  "Windows 98/XP MFC42 C++ runtime"),
+    ("vb6run",     "VB6 Runtime",  "Visual Basic 6 classic apps"),
+    ("quartz",     "Quartz Video", "DirectShow AVI/MPEG cutscenes for old games"),
+]
+
+JUNK_EXE_PATTERNS = re.compile(
+    r"(^unins\d*\.exe$|^uninstall.*|^setup\.exe$|^setup_.*|^install\.exe$|"
+    r"^dxsetup\.exe$|^vcredist.*|^vc_redist.*|^dotnet.*|^oalinst\.exe$|"
+    r"^physx.*|^ue4prereq.*|^crash.*|^unitycrashhandler.*|^cefprocess.*|"
+    r"^blizzarderror.*|^battlenet_helper.*|^regsvr32\.exe$|^rundll32\.exe$|"
+    r"^galaxycommunication.*|^goggalaxy.*|^redists?/.*)",
+    re.IGNORECASE,
+)
+
+JUNK_LNK_PATTERNS = re.compile(
+    r"(uninstall|unins0|readme|read me|manual|help|website|web site|support|"
+    r"faq|changelog|whatsnew|what's new|license|eula|register|registration|"
+    r"visit |online|patch notes|troubleshooting|configure|configuration|"
+    r"graphic mode setup|sound setup)",
+    re.IGNORECASE,
+)
+
+# Authentic CDE / OSF Motif GTK3 CSS styling
+CDE_MOTIF_CSS = b"""
+window, dialog, .background {
+    background-color: #aeb2c3;
+    color: #141418;
+    font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+    font-size: 10pt;
+}
+.cde-banner {
+    background-color: #2c567e;
+    color: #ffffff;
+    padding: 8px 12px;
+    border-top: 2px solid #6894be;
+    border-left: 2px solid #6894be;
+    border-right: 2px solid #162c42;
+    border-bottom: 2px solid #162c42;
+}
+.cde-banner label {
+    color: #ffffff;
+}
+frame, .cde-bevel-in {
+    border-top: 2px solid #5c6070;
+    border-left: 2px solid #5c6070;
+    border-right: 2px solid #e4e7f0;
+    border-bottom: 2px solid #e4e7f0;
+    border-radius: 0px;
+}
+button {
+    background-image: none;
+    background-color: #b8bccd;
+    color: #111116;
+    border-top: 2px solid #e6e9f2;
+    border-left: 2px solid #e6e9f2;
+    border-right: 2px solid #565a69;
+    border-bottom: 2px solid #565a69;
+    border-radius: 0px;
+    padding: 5px 10px;
+    box-shadow: none;
+}
+button:hover {
+    background-color: #c5c9d9;
+}
+button:active, button:checked {
+    background-color: #9ba0b2;
+    border-top: 2px solid #565a69;
+    border-left: 2px solid #565a69;
+    border-right: 2px solid #e6e9f2;
+    border-bottom: 2px solid #e6e9f2;
+}
+button.cde-primary {
+    background-color: #7d2440;
+    color: #ffffff;
+    border-top: 2px solid #b84b6d;
+    border-left: 2px solid #b84b6d;
+    border-right: 2px solid #3d0e1d;
+    border-bottom: 2px solid #3d0e1d;
+    font-weight: bold;
+}
+button.cde-primary:hover {
+    background-color: #912b4b;
+}
+button.cde-primary label {
+    color: #ffffff;
+}
+button.cde-launch {
+    background-color: #266048;
+    color: #ffffff;
+    border-top: 2px solid #52997b;
+    border-left: 2px solid #52997b;
+    border-right: 2px solid #113023;
+    border-bottom: 2px solid #113023;
+    font-weight: bold;
+}
+button.cde-launch:hover {
+    background-color: #2f7357;
+}
+button.cde-launch label {
+    color: #ffffff;
+}
+entry, textview, treeview, list {
+    background-color: #dedfe8;
+    color: #101014;
+    border-radius: 0px;
+}
+row:selected, treeview:selected {
+    background-color: #2c567e;
+    color: #ffffff;
+}
+row:selected label {
+    color: #ffffff;
+}
+notebook header {
+    background-color: #9fa3b5;
+}
+notebook tab {
+    background-color: #aeb2c3;
+    border-top: 2px solid #e4e7f0;
+    border-left: 2px solid #e4e7f0;
+    border-right: 2px solid #565a69;
+    border-radius: 0px;
+    padding: 4px 10px;
+}
+notebook tab:checked {
+    background-color: #c4c8d8;
+    font-weight: bold;
+}
+.cde-log {
+    background-color: #191d24;
+    color: #d7e4f0;
+    font-family: "DejaVu Sans Mono", "Liberation Mono", monospace;
+    font-size: 9pt;
+}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Helpers: Slugs, PE Architecture, Windows Paths
+# ---------------------------------------------------------------------------
+def make_slug(text: str, max_len: int = 18) -> str:
+    s = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+    if not s or not s[0].isalpha():
+        s = "app_" + s
+    return s[:max_len].rstrip("_")
+
+
+def clean_installer_title(filename: str) -> str:
+    stem = Path(filename).stem
+    # GOG pattern: setup_game_name_1.2.3_(64bit)_(12345)
+    s = re.sub(r"^setup[_\-\s]+", "", stem, flags=re.IGNORECASE)
+    s = re.sub(r"_\(\d+\)$", "", s)
+    s = re.sub(r"_\((?:32|64)bit\)", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"[_\-]+v?\d+(?:\.\d+)+[a-z0-9_\-]*$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"[_\-]+(setup|install|installer|gog|win32|win64)$", "", s, flags=re.IGNORECASE)
+    s = s.replace("_", " ").replace("-", " ").strip()
+    if not s:
+        s = stem.replace("_", " ").strip()
+    # Title-case words unless already mixed case
+    if s == s.lower():
+        s = " ".join(w.capitalize() if w not in ("of", "and", "the", "in", "to", "ii", "iii", "iv")
+                     else (w.upper() if w in ("ii", "iii", "iv") else w)
+                     for w in s.split())
+        if s:
+            s = s[0].upper() + s[1:]
+    return s or "Windows Program"
+
+
+def detect_pe_arch(path: str) -> str:
+    """Inspect MZ/PE/NE header to return 'win64', 'win32', 'win16', or 'unknown'."""
+    try:
+        with open(path, "rb") as f:
+            mz = f.read(64)
+            if len(mz) < 64 or mz[:2] != b"MZ":
+                return "unknown"
+            lfanew = struct.unpack_from("<I", mz, 0x3C)[0]
+            f.seek(lfanew)
+            sig = f.read(6)
+            if sig[:4] == b"PE\x00\x00" and len(sig) >= 6:
+                machine = struct.unpack_from("<H", sig, 4)[0]
+                if machine == 0x8664:
+                    return "win64"
+                if machine == 0x014C:
+                    return "win32"
+            elif sig[:2] == b"NE":
+                return "win16"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def resolve_win_path_in_prefix(prefix: Path, win_path: str) -> Path | None:
+    """Resolve a Windows path like C:\\GOG Games\\Foo\\bar.exe case-insensitively inside drive_c."""
+    if not win_path:
+        return None
+    p = win_path.strip().strip('"')
+    p = p.replace("\\", "/")
+    if re.match(r"^[a-zA-Z]:/", p):
+        drive = p[0].lower()
+        rel = p[3:].lstrip("/")
+        base = prefix / "drive_c" if drive == "c" else prefix / "dosdevices" / f"{drive}:"
+    else:
+        base = prefix / "drive_c"
+        rel = p.lstrip("/")
+
+    cur = base
+    for part in [seg for seg in rel.split("/") if seg and seg != "."]:
+        exact = cur / part
+        if exact.exists():
+            cur = exact
+            continue
+        found = None
+        if cur.is_dir():
+            low = part.lower()
+            try:
+                for child in cur.iterdir():
+                    if child.name.lower() == low:
+                        found = child
+                        break
+            except OSError:
+                pass
+        if found is None:
+            return exact
+        cur = found
+    return cur
+
+
+# ---------------------------------------------------------------------------
+# Pure-Python PE32 / PE32+ / 16-bit NE / ICO Icon Extractor -> CDE XPM (.pm)
+# ---------------------------------------------------------------------------
+def decode_dib_icon(data: bytes) -> Image.Image | None:
+    """Decode a raw RT_ICON payload (PNG or BITMAPINFOHEADER DIB + 1-bit AND mask)."""
+    if len(data) < 16:
+        return None
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        try:
+            return Image.open(io.BytesIO(data)).convert("RGBA")
+        except Exception:
+            return None
+
+    try:
+        hdr_size = struct.unpack_from("<I", data, 0)[0]
+        if hdr_size < 40 or len(data) < hdr_size:
+            return None
+        width, height2, planes, bpp, compression, img_size = struct.unpack_from("<iiHHII", data, 4)
+        clr_used = struct.unpack_from("<I", data, 32)[0]
+        width = abs(width)
+        height = abs(height2) // 2
+        if width <= 0 or height <= 0 or width > 512 or height > 512:
+            return None
+        if compression not in (0, 3):  # BI_RGB or BI_BITFIELDS
+            # Try wrapping in ICO container for Pillow fallback
+            return None
+
+        offset = hdr_size
+        if compression == 3 and bpp in (16, 32):
+            offset += 12
+
+        palette = []
+        if bpp <= 8:
+            num_colors = clr_used if clr_used > 0 else (1 << bpp)
+            for i in range(num_colors):
+                if offset + 4 > len(data):
+                    break
+                b, g, r, _ = struct.unpack_from("<BBBB", data, offset)
+                palette.append((r, g, b))
+                offset += 4
+
+        xor_stride = ((width * bpp + 31) // 32) * 4
+        and_stride = ((width + 31) // 32) * 4
+        xor_bytes = xor_stride * height
+        if offset + xor_bytes > len(data):
+            return None
+        xor_data = data[offset : offset + xor_bytes]
+        and_offset = offset + xor_bytes
+        and_data = data[and_offset : and_offset + and_stride * height]
+
+        im = Image.new("RGBA", (width, height))
+        px = im.load()
+        has_alpha_channel = False
+
+        for row in range(height):
+            y = height - 1 - row  # Bottom-up DIB
+            row_off = row * xor_stride
+            and_row_off = row * and_stride
+            for x in range(width):
+                mask_transparent = False
+                if len(and_data) >= and_row_off + (x // 8) + 1:
+                    mask_byte = and_data[and_row_off + (x // 8)]
+                    mask_transparent = bool((mask_byte >> (7 - (x % 8))) & 1)
+
+                if bpp == 32:
+                    b, g, r, a = struct.unpack_from("<BBBB", xor_data, row_off + x * 4)
+                    if a > 0:
+                        has_alpha_channel = True
+                    px[x, y] = (r, g, b, a)
+                elif bpp == 24:
+                    b, g, r = struct.unpack_from("<BBB", xor_data, row_off + x * 3)
+                    px[x, y] = (r, g, b, 0 if mask_transparent else 255)
+                elif bpp == 16:
+                    val = struct.unpack_from("<H", xor_data, row_off + x * 2)[0]
+                    r = ((val >> 10) & 0x1F) * 255 // 31
+                    g = ((val >> 5) & 0x1F) * 255 // 31
+                    b = (val & 0x1F) * 255 // 31
+                    px[x, y] = (r, g, b, 0 if mask_transparent else 255)
+                elif bpp == 8:
+                    idx = xor_data[row_off + x]
+                    r, g, b = palette[idx] if idx < len(palette) else (0, 0, 0)
+                    px[x, y] = (r, g, b, 0 if mask_transparent else 255)
+                elif bpp == 4:
+                    byte = xor_data[row_off + (x // 2)]
+                    idx = (byte >> 4) & 0x0F if (x % 2 == 0) else (byte & 0x0F)
+                    r, g, b = palette[idx] if idx < len(palette) else (0, 0, 0)
+                    px[x, y] = (r, g, b, 0 if mask_transparent else 255)
+                elif bpp == 1:
+                    byte = xor_data[row_off + (x // 8)]
+                    idx = (byte >> (7 - (x % 8))) & 1
+                    r, g, b = palette[idx] if idx < len(palette) else ((255, 255, 255) if idx else (0, 0, 0))
+                    px[x, y] = (r, g, b, 0 if mask_transparent else 255)
+
+        # Some older 32bpp icons leave alpha=0 everywhere and rely on the 1-bit AND mask
+        if bpp == 32 and not has_alpha_channel:
+            for row in range(height):
+                y = height - 1 - row
+                and_row_off = row * and_stride
+                for x in range(width):
+                    r, g, b, _ = px[x, y]
+                    mask_transparent = False
+                    if len(and_data) >= and_row_off + (x // 8) + 1:
+                        mask_byte = and_data[and_row_off + (x // 8)]
+                        mask_transparent = bool((mask_byte >> (7 - (x % 8))) & 1)
+                    px[x, y] = (r, g, b, 0 if mask_transparent else 255)
+
+        return im
+    except Exception:
+        return None
+
+
+def score_icon_candidate(width: int, height: int, bpp: int) -> tuple:
+    # Prefer >= 48px (ideal for CDE .l.pm), up to 256px, and higher bit depth
+    size_tier = 3 if (48 <= width <= 256) else (2 if width == 32 else (1 if width > 256 else 0))
+    pref_dist = -abs(width - 64) if width >= 48 else width
+    return (size_tier, bpp, pref_dist)
+
+
+def extract_icon_from_ico_bytes(data: bytes) -> Image.Image | None:
+    if len(data) < 6:
+        return None
+    try:
+        reserved, ico_type, count = struct.unpack_from("<HHH", data, 0)
+        if reserved == 0 and ico_type == 1 and 0 < count <= 64:
+            best_img = None
+            best_score = (-1, -1, -9999)
+            for i in range(count):
+                ent_off = 6 + i * 16
+                if ent_off + 16 > len(data):
+                    break
+                w, h, color_cnt, _, planes, bpp, size, offset = struct.unpack_from("<BBBBHHII", data, ent_off)
+                w = 256 if w == 0 else w
+                h = 256 if h == 0 else h
+                if offset + size > len(data) or size == 0:
+                    continue
+                blob = data[offset : offset + size]
+                im = decode_dib_icon(blob)
+                if im is not None:
+                    eff_bpp = bpp or (32 if blob[:8] == b"\x89PNG\r\n\x1a\n" else 8)
+                    sc = score_icon_candidate(im.width, im.height, eff_bpp)
+                    if sc > best_score:
+                        best_score = sc
+                        best_img = im
+            if best_img is not None:
+                return best_img
+    except Exception:
+        pass
+    try:
+        im = Image.open(io.BytesIO(data))
+        return im.convert("RGBA")
+    except Exception:
+        return None
+
+
+def extract_pe_icon(data: bytes, pe_off: int) -> Image.Image | None:
+    if pe_off + 24 > len(data) or data[pe_off : pe_off + 4] != b"PE\x00\x00":
+        return None
+    _, num_sections, _, _, _, opt_hdr_size, _ = struct.unpack_from("<HHIIIHH", data, pe_off + 4)
+    opt_off = pe_off + 24
+    if opt_off + opt_hdr_size > len(data) or opt_hdr_size < 96:
+        return None
+    magic = struct.unpack_from("<H", data, opt_off)[0]
+    dd_off = opt_off + (112 if magic == 0x20B else 96)
+    if dd_off + 24 > opt_off + opt_hdr_size:
+        return None
+    rsrc_rva, rsrc_size = struct.unpack_from("<II", data, dd_off + 16)  # Index 2 = Resource Table
+    if rsrc_rva == 0 or rsrc_size == 0:
+        return None
+
+    sec_table_off = opt_off + opt_hdr_size
+    sections = []
+    for i in range(num_sections):
+        soff = sec_table_off + i * 40
+        if soff + 40 > len(data):
+            break
+        vsize, vrva, raw_size, raw_ptr = struct.unpack_from("<IIII", data, soff + 8)
+        sections.append((vrva, max(vsize, raw_size), raw_ptr, raw_size))
+
+    def rva_to_off(rva: int) -> int | None:
+        for vrva, span, raw_ptr, raw_size in sections:
+            if vrva <= rva < vrva + span:
+                off = raw_ptr + (rva - vrva)
+                return off if off < len(data) else None
+        return None
+
+    rsrc_base = rva_to_off(rsrc_rva)
+    if rsrc_base is None:
+        return None
+
+    def iter_dir(dir_off: int):
+        if dir_off + 16 > len(data):
+            return
+        named_cnt, id_cnt = struct.unpack_from("<HH", data, dir_off + 12)
+        pos = dir_off + 16
+        for _ in range(named_cnt + id_cnt):
+            if pos + 8 > len(data):
+                break
+            name_or_id, offset_to_data = struct.unpack_from("<II", data, pos)
+            pos += 8
+            is_dir = bool(offset_to_data & 0x80000000)
+            sub_off = rsrc_base + (offset_to_data & 0x7FFFFFFF)
+            ident = None if (name_or_id & 0x80000000) else (name_or_id & 0xFFFF)
+            yield ident, is_dir, sub_off
+
+    def read_first_leaf(node_off: int) -> bytes | None:
+        for _, is_dir, sub_off in iter_dir(node_off):
+            if is_dir:
+                res = read_first_leaf(sub_off)
+                if res is not None:
+                    return res
+            else:
+                if sub_off + 16 <= len(data):
+                    data_rva, size = struct.unpack_from("<II", data, sub_off)
+                    foff = rva_to_off(data_rva)
+                    if foff is not None and foff + size <= len(data):
+                        return data[foff : foff + size]
+        return None
+
+    rt_icons = {}
+    group_blobs = []
+
+    for type_id, is_dir, type_sub in iter_dir(rsrc_base):
+        if not is_dir:
+            continue
+        if type_id == 3:  # RT_ICON
+            for icon_id, icon_is_dir, icon_sub in iter_dir(type_sub):
+                if icon_id is None:
+                    continue
+                blob = read_first_leaf(icon_sub) if icon_is_dir else None
+                if blob:
+                    rt_icons[icon_id] = blob
+        elif type_id == 14:  # RT_GROUP_ICON
+            for _, grp_is_dir, grp_sub in iter_dir(type_sub):
+                blob = read_first_leaf(grp_sub) if grp_is_dir else None
+                if blob:
+                    group_blobs.append(blob)
+
+    best_img = None
+    best_score = (-1, -1, -9999)
+
+    # Parse primary icon group first (Windows Explorer uses first RT_GROUP_ICON)
+    for gblob in group_blobs[:2]:
+        if len(gblob) < 6:
+            continue
+        reserved, gtype, gcount = struct.unpack_from("<HHH", gblob, 0)
+        if gtype != 1 or gcount == 0 or gcount > 64:
+            continue
+        pos = 6
+        for _ in range(gcount):
+            if pos + 14 > len(gblob):
+                break
+            w, h, _, _, planes, bpp, bytes_in_res, icon_id = struct.unpack_from("<BBBBHHIH", gblob, pos)
+            pos += 14
+            raw = rt_icons.get(icon_id)
+            if not raw:
+                continue
+            im = decode_dib_icon(raw)
+            if im is not None:
+                eff_bpp = bpp or (32 if raw[:8] == b"\x89PNG\r\n\x1a\n" else 8)
+                sc = score_icon_candidate(im.width, im.height, eff_bpp)
+                if sc > best_score:
+                    best_score = sc
+                    best_img = im
+        if best_img is not None:
+            return best_img
+
+    # Fallback: try all RT_ICON entries directly
+    for raw in rt_icons.values():
+        im = decode_dib_icon(raw)
+        if im is not None:
+            sc = score_icon_candidate(im.width, im.height, 32)
+            if sc > best_score:
+                best_score = sc
+                best_img = im
+    return best_img
+
+
+def extract_ne_icon(data: bytes, ne_off: int) -> Image.Image | None:
+    """Extract icon from 16-bit Windows 3.x / Win95 NE executables."""
+    try:
+        if ne_off + 0x28 > len(data) or data[ne_off : ne_off + 2] != b"NE":
+            return None
+        rsrc_rel = struct.unpack_from("<H", data, ne_off + 0x24)[0]
+        rsrc_off = ne_off + rsrc_rel
+        if rsrc_off + 4 > len(data):
+            return None
+        align_shift = struct.unpack_from("<H", data, rsrc_off)[0]
+        pos = rsrc_off + 2
+        rt_icons = {}
+        while pos + 8 <= len(data):
+            type_id = struct.unpack_from("<H", data, pos)[0]
+            if type_id == 0:
+                break
+            count = struct.unpack_from("<H", data, pos + 2)[0]
+            pos += 8
+            for _ in range(count):
+                if pos + 12 > len(data):
+                    break
+                rn_off, rn_len, _, rn_id = struct.unpack_from("<HHHH", data, pos)
+                pos += 12
+                file_off = rn_off << align_shift
+                byte_len = rn_len << align_shift
+                if type_id == 0x8003 and file_off + byte_len <= len(data):
+                    rt_icons[rn_id & 0x7FFF] = data[file_off : file_off + byte_len]
+        best = None
+        best_sc = (-1, -1, -9999)
+        for raw in rt_icons.values():
+            im = decode_dib_icon(raw)
+            if im is not None:
+                sc = score_icon_candidate(im.width, im.height, 8)
+                if sc > best_sc:
+                    best_sc = sc
+                    best = im
+        return best
+    except Exception:
+        return None
+
+
+def make_fallback_cde_icon(category: str = "game") -> Image.Image:
+    """Generate a crisp 48x48 CDE Motif fallback icon when an EXE has no embedded icon."""
+    im = Image.new("RGBA", (48, 48), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    # Beveled Motif tile
+    d.rectangle([4, 5, 43, 43], outline=(33, 33, 33, 255), fill=(173, 173, 173, 255))
+    d.line([(5, 6), (42, 6)], fill=(230, 230, 230, 255))
+    d.line([(5, 6), (5, 42)], fill=(230, 230, 230, 255))
+    d.line([(6, 42), (42, 42)], fill=(90, 90, 90, 255))
+    d.line([(42, 6), (42, 42)], fill=(90, 90, 90, 255))
+    if category == "game":
+        # Classic CD-ROM + joystick/gamepad motif
+        d.ellipse([10, 10, 37, 37], outline=(33, 33, 33, 255), fill=(108, 172, 208, 255))
+        d.ellipse([20, 20, 27, 27], outline=(33, 33, 33, 255), fill=(173, 173, 173, 255))
+        d.line([(14, 15), (20, 21)], fill=(255, 255, 255, 255), width=2)
+    else:
+        # Classic CDE Window application motif
+        d.rectangle([7, 8, 40, 14], fill=(44, 86, 126, 255))
+        d.rectangle([8, 16, 39, 39], outline=(90, 90, 90, 255), fill=(230, 232, 240, 255))
+    return im
+
+
+def extract_best_icon(exe_path: Path | None, hint_ico: Path | None = None, category: str = "game") -> Image.Image:
+    """Extract the best RGBA icon from hint .ico, GOG directory .ico, or target .exe."""
+    # 1. Explicit hint .ico (from GOG manifest or .lnk)
+    if hint_ico and hint_ico.is_file():
+        try:
+            im = extract_icon_from_ico_bytes(hint_ico.read_bytes())
+            if im is not None:
+                return im
+        except Exception:
+            pass
+
+    if exe_path and exe_path.is_file():
+        exe_dir = exe_path.parent
+        low_name = exe_path.name.lower()
+        # 2. If GOG wrapper (dosbox/scummvm), prefer goggame-*.ico in game folder or parent
+        if any(k in low_name for k in ("dosbox", "scummvm")):
+            for search_dir in (exe_dir, exe_dir.parent, exe_dir.parent.parent):
+                for ico_file in sorted(search_dir.glob("goggame-*.ico")):
+                    im = extract_icon_from_ico_bytes(ico_file.read_bytes())
+                    if im is not None:
+                        return im
+
+        # 3. Direct .ico file passed
+        if low_name.endswith(".ico"):
+            im = extract_icon_from_ico_bytes(exe_path.read_bytes())
+            if im is not None:
+                return im
+
+        # 4. Parse PE32 / PE32+ / 16-bit NE resources inside the .exe
+        try:
+            raw = exe_path.read_bytes()
+            if len(raw) >= 64 and raw[:2] == b"MZ":
+                lfanew = struct.unpack_from("<I", raw, 0x3C)[0]
+                if lfanew + 4 <= len(raw):
+                    if raw[lfanew : lfanew + 4] == b"PE\x00\x00":
+                        im = extract_pe_icon(raw, lfanew)
+                        if im is not None:
+                            return im
+                    elif raw[lfanew : lfanew + 2] == b"NE":
+                        im = extract_ne_icon(raw, lfanew)
+                        if im is not None:
+                            return im
+        except Exception:
+            pass
+
+        # 5. Any goggame-*.ico or *.ico alongside the executable
+        for ico_file in sorted(list(exe_dir.glob("goggame-*.ico")) + list(exe_dir.glob("*.ico"))):
+            try:
+                im = extract_icon_from_ico_bytes(ico_file.read_bytes())
+                if im is not None:
+                    return im
+            except Exception:
+                pass
+
+    return make_fallback_cde_icon(category)
+
+
+XPM_CHARS = " .+@#$%&*=-;>,')!~{]^/(_:<[}|1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def save_rgba_as_xpm(im: Image.Image, size: int, out_path: Path, var_name: str):
+    """Resize RGBA image cleanly and write CDE-compatible XPM3 with transparent 'None'."""
+    src = im.convert("RGBA")
+    # Keep pixel-art sharp when upscaling small Win95 16/32px icons, Lanczos when downscaling
+    resample = Image.Resampling.NEAREST if (src.width <= 32 and size > src.width and size % src.width == 0) else Image.Resampling.LANCZOS
+    scaled = src.resize((size, size), resample)
+    alpha = scaled.getchannel("A")
+    rgb_quant = scaled.convert("RGB").quantize(colors=220, method=Image.Quantize.MEDIANCUT).convert("RGB")
+
+    px_rgb = rgb_quant.load()
+    px_a = alpha.load()
+
+    colors = []
+    seen = {}
+    for y in range(size):
+        for x in range(size):
+            if px_a[x, y] < 96:
+                continue
+            c = px_rgb[x, y]
+            if c not in seen:
+                seen[c] = len(colors)
+                colors.append(c)
+
+    cpp = 1 if (len(colors) + 1) <= len(XPM_CHARS) else 2
+
+    def sym(idx: int) -> str:
+        if cpp == 1:
+            return XPM_CHARS[idx]
+        return XPM_CHARS[idx // len(XPM_CHARS)] + XPM_CHARS[idx % len(XPM_CHARS)]
+
+    lines = [
+        "/* XPM */",
+        f"static char * {var_name} [] = {{",
+        f'"{size} {size} {len(colors) + 1} {cpp}",',
+        f'"{sym(0)}\tc None",',
+    ]
+    for i, (r, g, b) in enumerate(colors, start=1):
+        lines.append(f'"{sym(i)}\tc #{r:02X}{g:02X}{b:02X}",')
+
+    for y in range(size):
+        row = []
+        for x in range(size):
+            if px_a[x, y] < 96:
+                row.append(sym(0))
+            else:
+                row.append(sym(seen[px_rgb[x, y]] + 1))
+        tail = "," if y < size - 1 else "};"
+        lines.append('"' + "".join(row) + '"' + tail)
+
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_cde_icon_set(im: Image.Image, icon_base: str):
+    DT_ICONS.mkdir(parents=True, exist_ok=True)
+    clean_var = re.sub(r"[^a-zA-Z0-9_]", "_", icon_base)
+    save_rgba_as_xpm(im, 48, DT_ICONS / f"{icon_base}.l.pm", f"{clean_var}_l")
+    save_rgba_as_xpm(im, 48, DT_ICONS / f"{icon_base}.pm",   f"{clean_var}")
+    save_rgba_as_xpm(im, 32, DT_ICONS / f"{icon_base}.m.pm", f"{clean_var}_m")
+    save_rgba_as_xpm(im, 24, DT_ICONS / f"{icon_base}.s.pm", f"{clean_var}_s")
+    save_rgba_as_xpm(im, 16, DT_ICONS / f"{icon_base}.t.pm", f"{clean_var}_t")
+
+
+def pil_to_pixbuf(im: Image.Image, size: int = 48) -> GdkPixbuf.Pixbuf:
+    buf = io.BytesIO()
+    im.convert("RGBA").resize((size, size), Image.Resampling.LANCZOS).save(buf, format="PNG")
+    loader = GdkPixbuf.PixbufLoader.new_with_type("png")
+    loader.write(buf.getvalue())
+    loader.close()
+    return loader.get_pixbuf()
+
+
+# ---------------------------------------------------------------------------
+# Windows .lnk Parser & GOG Manifest / Post-Install Target Detector
+# ---------------------------------------------------------------------------
+def parse_lnk_file(lnk_path: Path) -> dict | None:
+    """Parse MS-SHLLINK (.lnk) binary shortcut to extract target, args, workdir, icon."""
+    try:
+        b = lnk_path.read_bytes()
+        if len(b) < 0x4C or struct.unpack_from("<I", b, 0)[0] != 0x0000004C:
+            return None
+        flags = struct.unpack_from("<I", b, 0x14)[0]
+        is_unicode = bool(flags & 0x80)
+        pos = 0x4C
+
+        # HasLinkTargetIDList
+        if flags & 0x01:
+            if pos + 2 > len(b):
+                return None
+            idlist_size = struct.unpack_from("<H", b, pos)[0]
+            pos += 2 + idlist_size
+
+        target_win = ""
+        # HasLinkInfo
+        if flags & 0x02:
+            if pos + 28 > len(b):
+                return None
+            li_size, li_hdr_size, li_flags = struct.unpack_from("<III", b, pos)
+            local_base_off = struct.unpack_from("<I", b, pos + 16)[0]
+            common_suf_off = struct.unpack_from("<I", b, pos + 24)[0]
+            if (li_flags & 0x01) and local_base_off < li_size:
+                s_start = pos + local_base_off
+                s_end = b.find(b"\x00", s_start, pos + li_size)
+                if s_end != -1:
+                    base_str = b[s_start:s_end].decode("cp1252", errors="replace")
+                    suf_str = ""
+                    if common_suf_off < li_size:
+                        c_start = pos + common_suf_off
+                        c_end = b.find(b"\x00", c_start, pos + li_size)
+                        if c_end != -1:
+                            suf_str = b[c_start:c_end].decode("cp1252", errors="replace")
+                    target_win = base_str + suf_str
+            pos += li_size
+
+        def read_str() -> str:
+            nonlocal pos
+            if pos + 2 > len(b):
+                return ""
+            cnt = struct.unpack_from("<H", b, pos)[0]
+            pos += 2
+            if is_unicode:
+                raw = b[pos : pos + cnt * 2]
+                pos += cnt * 2
+                return raw.decode("utf-16le", errors="replace")
+            else:
+                raw = b[pos : pos + cnt]
+                pos += cnt
+                return raw.decode("cp1252", errors="replace")
+
+        name_str = read_str() if (flags & 0x04) else ""
+        rel_path = read_str() if (flags & 0x08) else ""
+        work_dir = read_str() if (flags & 0x10) else ""
+        args_str = read_str() if (flags & 0x20) else ""
+        icon_loc = read_str() if (flags & 0x40) else ""
+
+        if not target_win and rel_path and work_dir:
+            target_win = work_dir.rstrip("\\/") + "\\" + rel_path.lstrip(".\\/")
+
+        return {
+            "lnk_name": lnk_path.stem,
+            "target_win": target_win,
+            "work_dir_win": work_dir,
+            "args": args_str,
+            "icon_win": icon_loc,
+            "desc": name_str,
+        }
+    except Exception:
+        return None
+
+
+def snapshot_prefix_files(prefix: Path) -> set[str]:
+    drive_c = prefix / "drive_c"
+    snap = set()
+    if not drive_c.is_dir():
+        return snap
+    skip_roots = {"windows", "vrclient", "openxr"}
+    for root, dirs, files in os.walk(drive_c):
+        rel_root = Path(root).relative_to(drive_c)
+        if rel_root.parts and rel_root.parts[0].lower() in skip_roots:
+            dirs[:] = []
+            continue
+        for f in files:
+            low = f.lower()
+            if low.endswith((".exe", ".lnk", ".info", ".bat")):
+                snap.add(str(rel_root / f))
+    return snap
+
+
+def detect_installed_targets(prefix: Path, pre_snap: set[str], preferred_title: str = "") -> list[dict]:
+    """
+    Precision 3-tier post-install target discovery:
+    1) GOG goggame-*.info official playTasks manifest (handles native + DOSBox/ScummVM!)
+    2) Windows Start Menu / Desktop .lnk shortcuts (filtering out Uninstall/Readme/etc.)
+    3) Newly added .exe files in drive_c (filtering out unins000/vcredist/dxsetup/etc.)
+    Returns ordered list of candidate dicts:
+       {label, exe_path, args, work_dir, icon_path, source}
+    """
+    drive_c = prefix / "drive_c"
+    candidates = []
+    seen_keys = set()
+
+    def add_cand(label: str, exe_p: Path, args: str = "", work_p: Path | None = None,
+                 ico_p: Path | None = None, source: str = "", priority: int = 50):
+        if not exe_p or not exe_p.is_file():
+            return
+        key = (str(exe_p.resolve()), args.strip())
+        if key in seen_keys:
+            return
+        seen_keys.add(key)
+        candidates.append({
+            "label": label.strip() or exe_p.stem,
+            "exe_path": exe_p.resolve(),
+            "args": args.strip(),
+            "work_dir": (work_p.resolve() if (work_p and work_p.is_dir()) else exe_p.resolve().parent),
+            "icon_path": (ico_p.resolve() if (ico_p and ico_p.is_file()) else None),
+            "source": source,
+            "priority": priority,
+        })
+
+    # Tier 1: GOG goggame-*.info manifests
+    for info_file in sorted(drive_c.rglob("goggame-*.info")):
+        rel_str = str(info_file.relative_to(drive_c))
+        is_new = (not pre_snap) or (rel_str not in pre_snap)
+        try:
+            info = json.loads(info_file.read_text(encoding="utf-8", errors="replace"))
+            gog_name = info.get("name") or preferred_title
+            game_id = info.get("gameId", "")
+            base_dir = info_file.parent
+            ico_candidate = base_dir / f"goggame-{game_id}.ico"
+            if not ico_candidate.is_file():
+                icos = list(base_dir.glob("goggame-*.ico"))
+                ico_candidate = icos[0] if icos else None
+
+            for task in info.get("playTasks", []):
+                if task.get("type") != "FileTask":
+                    continue
+                cat = (task.get("category") or "").lower()
+                tname = task.get("name") or gog_name
+                if cat in ("document", "other") or JUNK_LNK_PATTERNS.search(tname or ""):
+                    continue
+                rel_exe = (task.get("path") or "").replace("\\", "/").lstrip("/")
+                if not rel_exe:
+                    continue
+                exe_p = resolve_win_path_in_prefix(prefix, str(base_dir / rel_exe)) if ":" in rel_exe else (base_dir / rel_exe)
+                if not exe_p.is_file():
+                    # Case-insensitive fallback relative to base_dir
+                    cur = base_dir
+                    for seg in rel_exe.split("/"):
+                        if not seg:
+                            continue
+                        matches = [c for c in cur.iterdir() if c.name.lower() == seg.lower()] if cur.is_dir() else []
+                        cur = matches[0] if matches else (cur / seg)
+                    exe_p = cur
+                wdir_rel = (task.get("workingDir") or "").replace("\\", "/").strip("/")
+                work_p = (base_dir / wdir_rel) if wdir_rel else exe_p.parent
+                args = task.get("arguments") or ""
+                is_primary = bool(task.get("isPrimary"))
+                prio = (100 if is_new else 85) + (10 if is_primary else 0)
+                add_cand(gog_name if is_primary else tname, exe_p, args, work_p, ico_candidate, "GOG Manifest", prio)
+        except Exception:
+            pass
+
+    # Tier 2: Start Menu & Desktop .lnk shortcuts inside drive_c
+    for lnk_file in sorted(drive_c.rglob("*.lnk")):
+        rel_str = str(lnk_file.relative_to(drive_c))
+        if JUNK_LNK_PATTERNS.search(lnk_file.stem):
+            continue
+        parsed = parse_lnk_file(lnk_file)
+        if not parsed or not parsed["target_win"]:
+            continue
+        exe_p = resolve_win_path_in_prefix(prefix, parsed["target_win"])
+        if not exe_p or not exe_p.is_file():
+            continue
+        if exe_p.suffix.lower() not in (".exe", ".bat", ".com"):
+            continue
+        if JUNK_EXE_PATTERNS.search(exe_p.name):
+            continue
+        work_p = resolve_win_path_in_prefix(prefix, parsed["work_dir_win"]) if parsed["work_dir_win"] else exe_p.parent
+        ico_p = resolve_win_path_in_prefix(prefix, parsed["icon_win"]) if parsed["icon_win"] else None
+        is_new = (not pre_snap) or (rel_str not in pre_snap)
+        lbl = parsed["lnk_name"]
+        lbl = re.sub(r"^Launch\s+", "", lbl, flags=re.IGNORECASE).strip()
+        add_cand(lbl, exe_p, parsed["args"], work_p, ico_p, "Shortcut (.lnk)", 90 if is_new else 70)
+
+    # Tier 3: Filesystem scan of .exe files in drive_c
+    skip_roots = {"windows", "users", "vrclient", "openxr", "programdata"}
+    title_words = {w.lower() for w in re.findall(r"[a-zA-Z0-9]{3,}", preferred_title)}
+    for root, dirs, files in os.walk(drive_c):
+        rel_root = Path(root).relative_to(drive_c)
+        if rel_root.parts and rel_root.parts[0].lower() in skip_roots:
+            dirs[:] = []
+            continue
+        # Skip Common Files / Internet Explorer / Windows NT / Windows Media Player boilerplate
+        if len(rel_root.parts) >= 2 and rel_root.parts[0].lower().startswith("program files"):
+            sub_low = rel_root.parts[1].lower()
+            if sub_low in ("common files", "internet explorer", "windows media player", "windows nt"):
+                dirs[:] = []
+                continue
+        for f in files:
+            if not f.lower().endswith(".exe"):
+                continue
+            if JUNK_EXE_PATTERNS.search(f):
+                continue
+            rel_str = str(rel_root / f)
+            if JUNK_EXE_PATTERNS.search(rel_str.replace("\\", "/")):
+                continue
+            exe_p = Path(root) / f
+            is_new = (not pre_snap) or (rel_str not in pre_snap)
+            if pre_snap and not is_new:
+                continue
+            try:
+                sz = exe_p.stat().st_size
+            except OSError:
+                sz = 0
+            stem_words = {w.lower() for w in re.findall(r"[a-zA-Z0-9]{3,}", exe_p.stem)}
+            name_bonus = 15 if (title_words and (title_words & stem_words)) else 0
+            gog_bonus = 10 if "gog games" in rel_str.lower() else 0
+            size_bonus = min(10, sz // (512 * 1024))
+            prio = (65 if is_new else 40) + name_bonus + gog_bonus + size_bonus
+            add_cand(preferred_title or exe_p.stem, exe_p, "", exe_p.parent, None, "Detected .exe", prio)
+
+    candidates.sort(key=lambda c: c["priority"], reverse=True)
+    return candidates
+
+
+# ---------------------------------------------------------------------------
+# CDE Front Panel Integration & Silent Live Reload
+# ---------------------------------------------------------------------------
+def reload_cde_panel():
+    """Reload CDE actions database and trigger silent dtwm Front Panel refresh."""
+    env = os.environ.copy()
+    env["PATH"] = f"/usr/dt/bin:{env.get('PATH', '')}"
+    if Path("/usr/dt/bin/dtaction").is_file():
+        subprocess.run(["/usr/dt/bin/dtaction", "ReloadActions"], env=env,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # Trigger _DtWmRestartNoConfirm via libDtSvc so new subpanel icons appear immediately
+    try:
+        x11 = ctypes.CDLL("libX11.so.6")
+        dtsvc = ctypes.CDLL("/usr/dt/lib/libDtSvc.so.2")
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        x11.XDefaultRootWindow.restype = ctypes.c_ulong
+        x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        dtsvc._DtWmRestartNoConfirm.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        dtsvc._DtWmRestartNoConfirm.restype = ctypes.c_int
+
+        dpy = x11.XOpenDisplay(None)
+        if dpy:
+            root = x11.XDefaultRootWindow(dpy)
+            dtsvc._DtWmRestartNoConfirm(dpy, root)
+            x11.XSync(dpy, 0)
+            x11.XCloseDisplay(dpy)
+    except Exception:
+        pass
+
+
+def register_cde_entry(entry: dict) -> dict:
+    """
+    Generate launcher script, extract .exe icon -> CDE .pm icons, write .dt action,
+    Template file, and fp_dynamic/*.fp targeting Games or Personal Applications.
+    """
+    slug = entry["slug"]
+    action_id = entry.get("action_id") or f"dw_{slug}"
+    icon_name = entry.get("icon_name") or f"dw_{slug}"
+    fp_file_name = entry.get("fp_file") or f"dw_{slug[:8]}1.fp"
+
+    prefix = Path(entry["prefix"])
+    exe_path = Path(entry["exe_path"])
+    work_dir = Path(entry.get("work_dir") or exe_path.parent)
+    args = entry.get("args", "").strip()
+    arch = entry.get("arch", "win64")
+    vdesktop = entry.get("vdesktop", "")
+    category = entry.get("category", "game")  # "game" or "app"
+    title = entry["title"].strip()
+
+    # 1. Extract icon from main .exe (or hint .ico) -> CDE XPM icon set
+    hint_ico = Path(entry["icon_source"]) if entry.get("icon_source") else None
+    icon_img = extract_best_icon(exe_path, hint_ico, category)
+    write_cde_icon_set(icon_img, icon_name)
+
+    # 2. Write dedicated Wine launcher script in ~/.local/bin/
+    LOCAL_BIN.mkdir(parents=True, exist_ok=True)
+    launcher_path = entry.get("launcher")
+    launcher = Path(launcher_path) if launcher_path else (LOCAL_BIN / f"dw-{slug}")
+
+    q_prefix = shlex.quote(str(prefix))
+    q_workdir = shlex.quote(str(work_dir))
+    q_exe = shlex.quote(str(exe_path))
+
+    if vdesktop:
+        desk_name = re.sub(r"[^a-zA-Z0-9]", "", slug)[:12] or "dtwine"
+        exec_line = f'exec wine explorer /desktop={desk_name},{vdesktop} {q_exe} {args} "$@"'
+    elif exe_path.suffix.lower() == ".msi":
+        exec_line = f'exec wine msiexec /i {q_exe} {args} "$@"'
+    elif exe_path.suffix.lower() == ".bat":
+        exec_line = f'exec wine cmd /c {q_exe} {args} "$@"'
+    else:
+        exec_line = f'exec wine {q_exe} {args} "$@"'
+
+    script_text = f"""#!/usr/bin/env bash
+# Auto-generated by dtWine for {title}
+export WINEPREFIX={q_prefix}
+export WINEARCH={arch}
+export WINE_D3D_CONFIG="renderer=gl"
+export WINEDLLOVERRIDES="locationapi=d;winemenubuilder.exe=d;mscoree,mshtml="
+
+# Keep Battle.net CEF hardware acceleration off if present in prefix
+CFG="$WINEPREFIX/drive_c/users/${{USER:-$(id -un)}}/AppData/Roaming/Battle.net/Battle.net.config"
+if [ -f "$CFG" ]; then
+    sed -i 's/"HardwareAcceleration"[[:space:]]*:[[:space:]]*"true"/"HardwareAcceleration": "false"/g' "$CFG"
+fi
+
+cd {q_workdir} || exit 1
+{exec_line}
+"""
+    launcher.write_text(script_text, encoding="utf-8")
+    launcher.chmod(0o755)
+
+    # 3. Write CDE Action file ~/.dt/types/<action_id>.dt
+    DT_TYPES.mkdir(parents=True, exist_ok=True)
+    dt_file = DT_TYPES / f"{action_id}.dt"
+    safe_label = title.replace("\n", " ").strip()
+    stack_human = "Games" if category == "game" else "Personal Applications"
+    dt_content = f"""######################################################################
+# CDE Action Definition generated by dtWine for {safe_label}
+######################################################################
+set DtDbVersion=1.0
+
+ACTION {action_id}
+{{
+     LABEL         {safe_label}
+     TYPE          COMMAND
+     EXEC_STRING   {launcher}
+     ICON          {icon_name}
+     WINDOW_TYPE   NO_STDIO
+     DESCRIPTION   {safe_label} (Wine — {stack_human}).
+}}
+"""
+    dt_file.write_text(dt_content, encoding="utf-8")
+
+    # 4. Write CDE Template file ~/Templates/<action_id>
+    TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+    tmpl = TEMPLATES_DIR / action_id
+    tmpl.write_text(
+        "# Common Desktop Environment (CDE) action generated by dtWine.\n"
+        f'exec "{launcher}" "$@"\n',
+        encoding="utf-8",
+    )
+    tmpl.chmod(0o755)
+
+    # 5. Write CDE Front Panel control in ~/.dt/types/fp_dynamic/
+    DT_FP_DYN.mkdir(parents=True, exist_ok=True)
+    target_subpanel = SUBPANEL_GAMES if category == "game" else SUBPANEL_APPS
+    fp_path = DT_FP_DYN / fp_file_name
+    fp_content = f"""CONTROL\t{action_id}
+{{
+   TYPE\ticon
+   CONTAINER_TYPE\tSUBPANEL
+   CONTAINER_NAME\t{target_subpanel}
+   POSITION_HINTS\tlast
+   LABEL\t{safe_label}
+   ICON\t{icon_name}
+   PUSH_ACTION\t{action_id}
+   HELP_STRING\t{safe_label} (Managed by dtWine).
+}}
+"""
+    fp_path.write_text(fp_content, encoding="utf-8")
+
+    entry["action_id"] = action_id
+    entry["icon_name"] = icon_name
+    entry["fp_file"] = fp_file_name
+    entry["launcher"] = str(launcher)
+    return entry
+
+
+def unregister_cde_entry(entry: dict):
+    action_id = entry.get("action_id", "")
+    icon_name = entry.get("icon_name", "")
+    fp_file = entry.get("fp_file", "")
+    launcher = entry.get("launcher", "")
+
+    if fp_file and (DT_FP_DYN / fp_file).exists():
+        (DT_FP_DYN / fp_file).unlink(missing_ok=True)
+    if action_id and action_id not in ("battlenet", "dtWine", "dtwine"):
+        (DT_TYPES / f"{action_id}.dt").unlink(missing_ok=True)
+        (TEMPLATES_DIR / action_id).unlink(missing_ok=True)
+    if icon_name and icon_name not in ("battlenet", "dtWine", "dtwine"):
+        for suf in (".l.pm", ".m.pm", ".s.pm", ".t.pm", ".pm"):
+            (DT_ICONS / f"{icon_name}{suf}").unlink(missing_ok=True)
+    if launcher and Path(launcher).name.startswith("dw-"):
+        Path(launcher).unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Wine Prefix Operations (OpenGL WineD3D)
+# ---------------------------------------------------------------------------
+def wine_env(prefix: Path, arch: str = "win64") -> dict:
+    env = os.environ.copy()
+    env["WINEPREFIX"] = str(prefix)
+    env["WINEARCH"] = arch
+    env["WINE_D3D_CONFIG"] = "renderer=gl"
+    env["WINEDLLOVERRIDES"] = "locationapi=d;winemenubuilder.exe=d;mscoree,mshtml="
+    env.setdefault("DISPLAY", ":0.0")
+    return env
+
+
+def apply_prefix_settings(prefix: Path, arch: str, winver: str, log_cb=None):
+    env = wine_env(prefix, arch)
+    prefix.mkdir(parents=True, exist_ok=True)
+
+    def run_logged(cmd, desc=""):
+        if log_cb and desc:
+            log_cb(f"==> {desc}\n")
+        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in proc.stdout:
+            if log_cb and "Vulkan support is incomplete" not in line:
+                log_cb(line)
+        proc.wait()
+        return proc.returncode
+
+    if not (prefix / "system.reg").is_file():
+        run_logged(["wineboot", "-u"], f"Initializing {arch} Wine prefix at {prefix}...")
+        subprocess.run(["wineserver", "-w"], env=env)
+
+    # Force OpenGL WineD3D OpenGL Direct3D/DirectDraw settings
+    run_logged(["wine", "reg", "add", r"HKCU\Software\Wine\Direct3D",
+                "/v", "renderer", "/t", "REG_SZ", "/d", "gl", "/f"],
+               "Configuring WineD3D OpenGL renderer (OpenGL WineD3D)...")
+    run_logged(["wine", "reg", "add", r"HKCU\Software\Wine\Direct3D",
+                "/v", "DirectDrawRenderer", "/t", "REG_SZ", "/d", "opengl", "/f"])
+    if winver:
+        run_logged(["wine", "winecfg", "-v", winver], f"Setting Windows compatibility version to {winver}...")
+    subprocess.run(["wineserver", "-w"], env=env)
+
+
+# ---------------------------------------------------------------------------
+# Catalog Persistence & Existing Battle.net Auto-Discovery
+# ---------------------------------------------------------------------------
+def load_entries() -> list[dict]:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    entries = []
+    if not ENTRIES_JSON.is_file() and (LEGACY_CONFIG_DIR / "entries.json").is_file():
+        shutil.copy2(LEGACY_CONFIG_DIR / "entries.json", ENTRIES_JSON)
+    if ENTRIES_JSON.is_file():
+        try:
+            entries = json.loads(ENTRIES_JSON.read_text(encoding="utf-8"))
+        except Exception:
+            entries = []
+
+    known_prefixes = {e.get("prefix") for e in entries}
+    bnet_pfx = GAMES_ROOT / "battlenet-wine"
+    bnet_exe = bnet_pfx / "drive_c" / "Program Files (x86)" / "Battle.net" / "Battle.net Launcher.exe"
+    if str(bnet_pfx) not in known_prefixes and bnet_exe.is_file():
+        entries.append({
+            "slug": "battlenet",
+            "title": "Battle.net",
+            "category": "app",
+            "prefix": str(bnet_pfx),
+            "arch": "win64",
+            "winver": "win10",
+            "exe_path": str(bnet_exe),
+            "work_dir": str(bnet_exe.parent),
+            "args": "",
+            "vdesktop": "",
+            "action_id": "battlenet",
+            "icon_name": "battlenet",
+            "fp_file": "battlenet1.fp",
+            "launcher": str(LOCAL_BIN / "battlenet-wine"),
+        })
+        save_entries(entries)
+    return entries
+
+
+def save_entries(entries: list[dict]):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    ENTRIES_JSON.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Guided Installer Wizard Dialog (GOG & Any Classic Windows Software)
+# ---------------------------------------------------------------------------
+class InstallWizardDialog(Gtk.Dialog):
+    def __init__(self, parent, initial_installer: str = ""):
+        super().__init__(title="dtWine — Install GOG Game or Windows Software", transient_for=parent, flags=0)
+        self.set_default_size(680, 560)
+        self.set_Modal = True
+        self.result_entry = None
+        self._worker_running = False
+
+        box = self.get_content_area()
+        box.set_spacing(8)
+        box.set_margin_start(10)
+        box.set_margin_end(10)
+        box.set_margin_top(8)
+        box.set_margin_bottom(8)
+
+        # Banner
+        banner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        banner.get_style_context().add_class("cde-banner")
+        lbl_h = Gtk.Label(xalign=0)
+        lbl_h.set_markup("<b>Install GOG Game or Classic Windows Software</b>")
+        lbl_s = Gtk.Label(
+            label="Runs setup (.exe / .msi / .bat) or imports portable software, extracts the main .exe icon, and places it in Games or Personal Applications.",
+            xalign=0,
+        )
+        lbl_s.set_line_wrap(True)
+        banner.pack_start(lbl_h, False, False, 0)
+        banner.pack_start(lbl_s, False, False, 0)
+        box.pack_start(banner, False, False, 0)
+
+        self.stack = Gtk.Stack()
+        box.pack_start(self.stack, True, True, 0)
+
+        self._build_step1(initial_installer)
+        self._build_step2()
+        self._build_step3()
+
+        # Bottom buttons
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.btn_cancel = Gtk.Button(label="Cancel")
+        self.btn_cancel.connect("clicked", self._on_cancel)
+        self.btn_next = Gtk.Button(label="Start Installation  ▶")
+        self.btn_next.get_style_context().add_class("cde-primary")
+        self.btn_next.connect("clicked", self._on_next_clicked)
+
+        btn_box.pack_end(self.btn_next, False, False, 0)
+        btn_box.pack_end(self.btn_cancel, False, False, 0)
+        box.pack_start(btn_box, False, False, 4)
+
+        self.show_all()
+
+    def _build_step1(self, initial_installer: str):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+
+        # 1. File Selection & Install Mode
+        fr_src = Gtk.Frame(label=" 1. Installer or Executable File ")
+        g_src = Gtk.Grid(column_spacing=8, row_spacing=6, margin=8)
+        fr_src.add(g_src)
+
+        g_src.attach(Gtk.Label(label="Setup / .exe File:", xalign=0), 0, 0, 1, 1)
+        self.ent_file = Gtk.Entry(hexpand=True)
+        if initial_installer:
+            self.ent_file.set_text(initial_installer)
+        btn_browse = Gtk.Button(label="Browse...")
+        btn_browse.connect("clicked", self._on_browse_installer)
+        g_src.attach(self.ent_file, 1, 0, 1, 1)
+        g_src.attach(btn_browse, 2, 0, 1, 1)
+
+        g_src.attach(Gtk.Label(label="Mode:", xalign=0), 0, 1, 1, 1)
+        mode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.rb_mode_inst = Gtk.RadioButton.new_with_label_from_widget(None, "Run Installer (GOG setup.exe / CD setup / .msi)")
+        self.rb_mode_port = Gtk.RadioButton.new_with_label_from_widget(self.rb_mode_inst, "Import Portable / Already-Unpacked .exe (Copy folder into prefix)")
+        mode_box.pack_start(self.rb_mode_inst, False, False, 0)
+        mode_box.pack_start(self.rb_mode_port, False, False, 0)
+        g_src.attach(mode_box, 1, 1, 2, 1)
+        page.pack_start(fr_src, False, False, 0)
+
+        # 2. Category (Game vs Application -> CDE Panel Stack)
+        fr_cat = Gtk.Frame(label=" 2. Software Type & CDE Front Panel Destination ")
+        cat_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=8)
+        fr_cat.add(cat_box)
+
+        self.rb_cat_game = Gtk.RadioButton.new_with_label_from_widget(
+            None,
+            "Game  —  Extract main game .exe icon (skipping extra shortcuts) & add to \"Games\" panel stack",
+        )
+        self.rb_cat_app = Gtk.RadioButton.new_with_label_from_widget(
+            self.rb_cat_game,
+            "Application  —  Extract application .exe icon & add to \"Personal Applications\" panel stack",
+        )
+        cat_box.pack_start(self.rb_cat_game, False, False, 0)
+        cat_box.pack_start(self.rb_cat_app, False, False, 0)
+
+        name_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        name_row.pack_start(Gtk.Label(label="Display Title:", xalign=0), False, False, 0)
+        self.ent_title = Gtk.Entry(hexpand=True)
+        if initial_installer:
+            self.ent_title.set_text(clean_installer_title(initial_installer))
+        name_row.pack_start(self.ent_title, True, True, 0)
+        cat_box.pack_start(name_row, False, False, 2)
+        page.pack_start(fr_cat, False, False, 0)
+
+        # 3. Wine Compatibility & Old-Game Options
+        fr_opt = Gtk.Frame(label=" 3. Wine Prefix & Compatibility Settings ")
+        g_opt = Gtk.Grid(column_spacing=10, row_spacing=6, margin=8)
+        fr_opt.add(g_opt)
+
+        g_opt.attach(Gtk.Label(label="Architecture:", xalign=0), 0, 0, 1, 1)
+        self.cmb_arch = Gtk.ComboBoxText()
+        self.cmb_arch.append("win64", "64-bit + 32-bit WoW64 (Recommended — GOG & most games/apps)")
+        self.cmb_arch.append("win32", "Pure 32-bit (Legacy Win95/98 32-bit-only software)")
+        self.cmb_arch.set_active_id("win64")
+        g_opt.attach(self.cmb_arch, 1, 0, 1, 1)
+
+        g_opt.attach(Gtk.Label(label="Windows Version:", xalign=0), 0, 1, 1, 1)
+        self.cmb_winver = Gtk.ComboBoxText()
+        for wid, wlbl in WIN_VERSIONS:
+            self.cmb_winver.append(wid, wlbl)
+        self.cmb_winver.set_active_id("win10")
+        g_opt.attach(self.cmb_winver, 1, 1, 1, 1)
+
+        g_opt.attach(Gtk.Label(label="Virtual Desktop:", xalign=0), 0, 2, 1, 1)
+        self.cmb_vdesk = Gtk.ComboBoxText()
+        for vid, vlbl in VDESKTOP_MODES:
+            self.cmb_vdesk.append(vid, vlbl)
+        self.cmb_vdesk.set_active_id("")
+        g_opt.attach(self.cmb_vdesk, 1, 2, 1, 1)
+
+        g_opt.attach(Gtk.Label(label="Pre-install Runtime:", xalign=0), 0, 3, 1, 1)
+        wt_box = Gtk.FlowBox(max_children_per_line=4, selection_mode=Gtk.SelectionMode.NONE)
+        self.chk_wt = {}
+        for verb, short, tip in [
+            ("corefonts", "corefonts", "Windows standard fonts"),
+            ("d3dx9", "d3dx9 (DX9)", "DirectX 9 DLLs for 2000s games"),
+            ("directplay", "directplay", "90s/2000s DirectPlay multiplayer"),
+            ("vcrun2022", "vcrun2022", "Visual C++ 2015-2022 runtime"),
+        ]:
+            cb = Gtk.CheckButton(label=short)
+            cb.set_tooltip_text(tip)
+            self.chk_wt[verb] = cb
+            wt_box.add(cb)
+        g_opt.attach(wt_box, 1, 3, 1, 1)
+
+        page.pack_start(fr_opt, False, False, 0)
+        self.stack.add_named(page, "step1")
+
+    def _build_step2(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.lbl_progress = Gtk.Label(label="Preparing Wine prefix...", xalign=0)
+        page.pack_start(self.lbl_progress, False, False, 0)
+
+        sc = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        self.txt_log = Gtk.TextView(editable=False, wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        self.txt_log.get_style_context().add_class("cde-log")
+        sc.add(self.txt_log)
+        page.pack_start(sc, True, True, 0)
+        self.stack.add_named(page, "step2")
+
+    def _build_step3(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        fr = Gtk.Frame(label=" Confirm Main Executable & CDE Panel Icon ")
+        g = Gtk.Grid(column_spacing=10, row_spacing=8, margin=10)
+        fr.add(g)
+
+        self.img_preview = Gtk.Image()
+        ic_frame = Gtk.Frame()
+        ic_frame.add(self.img_preview)
+        g.attach(ic_frame, 0, 0, 1, 3)
+
+        g.attach(Gtk.Label(label="Detected Main .exe:", xalign=0), 1, 0, 1, 1)
+        self.cmb_candidates = Gtk.ComboBoxText(hexpand=True)
+        self.cmb_candidates.connect("changed", self._on_candidate_changed)
+        g.attach(self.cmb_candidates, 2, 0, 2, 1)
+
+        g.attach(Gtk.Label(label="Executable Path:", xalign=0), 1, 1, 1, 1)
+        self.ent_final_exe = Gtk.Entry(hexpand=True)
+        self.ent_final_exe.connect("changed", self._refresh_icon_preview)
+        btn_pick_exe = Gtk.Button(label="Browse drive_c...")
+        btn_pick_exe.connect("clicked", self._on_browse_drive_c)
+        g.attach(self.ent_final_exe, 2, 1, 1, 1)
+        g.attach(btn_pick_exe, 3, 1, 1, 1)
+
+        g.attach(Gtk.Label(label="Launch Arguments:", xalign=0), 1, 2, 1, 1)
+        self.ent_final_args = Gtk.Entry(hexpand=True, placeholder_text="Optional (auto-filled for GOG DOSBox/ScummVM games)")
+        g.attach(self.ent_final_args, 2, 2, 2, 1)
+
+        g.attach(Gtk.Label(label="Panel Icon Label:", xalign=0), 1, 3, 1, 1)
+        self.ent_final_title = Gtk.Entry(hexpand=True)
+        g.attach(self.ent_final_title, 2, 3, 2, 1)
+
+        self.lbl_dest_info = Gtk.Label(xalign=0)
+        g.attach(self.lbl_dest_info, 1, 4, 3, 1)
+
+        page.pack_start(fr, False, False, 0)
+        self.stack.add_named(page, "step3")
+
+    def _on_browse_installer(self, _btn):
+        dlg = Gtk.FileChooserDialog(
+            title="Select Windows Installer or Executable",
+            parent=self,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Select", Gtk.ResponseType.OK)
+        dl = HOME / "Downloads"
+        if dl.is_dir():
+            dlg.set_current_folder(str(dl))
+        flt = Gtk.FileFilter()
+        flt.set_name("Windows Executables & Installers (*.exe, *.msi, *.bat)")
+        for pat in ("*.exe", "*.EXE", "*.msi", "*.MSI", "*.bat", "*.BAT", "*.com", "*.COM"):
+            flt.add_pattern(pat)
+        dlg.add_filter(flt)
+        flt_all = Gtk.FileFilter()
+        flt_all.set_name("All Files")
+        flt_all.add_pattern("*")
+        dlg.add_filter(flt_all)
+
+        if dlg.run() == Gtk.ResponseType.OK:
+            fpath = dlg.get_filename()
+            self.ent_file.set_text(fpath)
+            if not self.ent_title.get_text().strip():
+                self.ent_title.set_text(clean_installer_title(fpath))
+            elif Path(fpath).name.lower().startswith("setup_"):
+                self.ent_title.set_text(clean_installer_title(fpath))
+            if detect_pe_arch(fpath) == "win64":
+                self.cmb_arch.set_active_id("win64")
+        dlg.destroy()
+
+    def _append_log(self, text: str):
+        def _do():
+            buf = self.txt_log.get_buffer()
+            buf.insert(buf.get_end_iter(), text)
+            mark = buf.create_mark(None, buf.get_end_iter(), False)
+            self.txt_log.scroll_to_mark(mark, 0.0, True, 0.0, 1.0)
+        GLib.idle_add(_do)
+
+    def _on_cancel(self, _btn):
+        if self._worker_running and hasattr(self, "_cur_prefix"):
+            subprocess.run(["wineserver", "-k"], env=wine_env(self._cur_prefix),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.response(Gtk.ResponseType.CANCEL)
+
+    def _on_next_clicked(self, _btn):
+        cur_page = self.stack.get_visible_child_name()
+        if cur_page == "step1":
+            self._start_install_worker()
+        elif cur_page == "step3":
+            self._finalize_registration()
+
+    def _start_install_worker(self):
+        fpath_str = self.ent_file.get_text().strip()
+        if not fpath_str or not Path(fpath_str).is_file():
+            self._error("Please select a valid .exe, .msi, or .bat file first.")
+            return
+
+        installer_path = Path(fpath_str).resolve()
+        title = self.ent_title.get_text().strip() or clean_installer_title(installer_path.name)
+        category = "game" if self.rb_cat_game.get_active() else "app"
+        is_portable = self.rb_mode_port.get_active()
+        arch = self.cmb_arch.get_active_id() or "win64"
+        if detect_pe_arch(str(installer_path)) == "win64" and arch == "win32":
+            arch = "win64"
+        winver = self.cmb_winver.get_active_id() or "win10"
+        vdesktop = self.cmb_vdesk.get_active_id() or ""
+        verbs = [v for v, cb in self.chk_wt.items() if cb.get_active()]
+
+        slug = make_slug(title)
+        prefix = GAMES_ROOT / f"{slug}-wine"
+        idx = 2
+        while prefix.exists() and (prefix / "system.reg").exists():
+            slug_try = f"{slug[:15]}_{idx}"
+            prefix = GAMES_ROOT / f"{slug_try}-wine"
+            if not prefix.exists():
+                slug = slug_try
+                break
+            idx += 1
+
+        self._cur_slug = slug
+        self._cur_title = title
+        self._cur_category = category
+        self._cur_prefix = prefix
+        self._cur_arch = arch
+        self._cur_winver = winver
+        self._cur_vdesktop = vdesktop
+        self._candidates = []
+
+        self.stack.set_visible_child_name("step2")
+        self.btn_next.set_sensitive(False)
+        self._worker_running = True
+
+        def worker():
+            try:
+                apply_prefix_settings(prefix, arch, winver, self._append_log)
+                env = wine_env(prefix, arch)
+
+                if verbs and WINETRICKS_BIN.is_file():
+                    self._append_log(f"==> Installing Winetricks components: {' '.join(verbs)}\n")
+                    p = subprocess.Popen(
+                        [str(WINETRICKS_BIN), "-q"] + verbs,
+                        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                    )
+                    for ln in p.stdout:
+                        if "Vulkan support" not in ln:
+                            self._append_log(ln)
+                    p.wait()
+                    subprocess.run(["wineserver", "-w"], env=env)
+
+                if is_portable:
+                    dest_root = prefix / "drive_c" / ("Games" if category == "game" else "Program Files") / slug
+                    dest_root.parent.mkdir(parents=True, exist_ok=True)
+                    src_dir = installer_path.parent
+                    # If single loose exe in ~/Downloads, copy just the exe; otherwise copy app folder
+                    if src_dir in (HOME, HOME / "Downloads", HOME / "Desktop", Path("/tmp")):
+                        dest_root.mkdir(parents=True, exist_ok=True)
+                        target_exe = dest_root / installer_path.name
+                        self._append_log(f"==> Copying {installer_path.name} -> {target_exe}\n")
+                        shutil.copy2(installer_path, target_exe)
+                    else:
+                        self._append_log(f"==> Copying folder {src_dir} -> {dest_root}\n")
+                        shutil.copytree(src_dir, dest_root, dirs_exist_ok=True)
+                        target_exe = dest_root / installer_path.name
+                    candidates = [{
+                        "label": title,
+                        "exe_path": target_exe,
+                        "args": "",
+                        "work_dir": target_exe.parent,
+                        "icon_path": None,
+                        "source": "Portable Import",
+                        "priority": 100,
+                    }]
+                else:
+                    pre_snap = snapshot_prefix_files(prefix)
+                    GLib.idle_add(self.lbl_progress.set_text,
+                                  f"Running installer: {installer_path.name}  (Complete the Windows setup wizard on screen)")
+                    self._append_log(f"\n==> Launching installer: {installer_path}\n")
+                    ext = installer_path.suffix.lower()
+                    if ext == ".msi":
+                        cmd = ["wine", "msiexec", "/i", str(installer_path)]
+                    elif ext == ".bat":
+                        cmd = ["wine", "cmd", "/c", str(installer_path)]
+                    else:
+                        cmd = ["wine", str(installer_path)]
+                    proc = subprocess.Popen(
+                        cmd, cwd=str(installer_path.parent), env=env,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                    )
+                    for ln in proc.stdout:
+                        if "Vulkan support" not in ln and "ntlm_auth" not in ln:
+                            self._append_log(ln)
+                    proc.wait()
+                    self._append_log("==> Waiting for background setup tasks to finish (wineserver -w)...\n")
+                    subprocess.run(["wineserver", "-w"], env=env)
+                    self._append_log("==> Scanning prefix for installed main executable & icon...\n")
+                    candidates = detect_installed_targets(prefix, pre_snap, title)
+
+                self._candidates = candidates
+                GLib.idle_add(self._enter_step3)
+            except Exception as exc:
+                self._append_log(f"\n[ERROR] {exc}\n")
+                GLib.idle_add(self.btn_next.set_sensitive, True)
+            finally:
+                self._worker_running = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _enter_step3(self):
+        self.stack.set_visible_child_name("step3")
+        self.cmb_candidates.remove_all()
+        self.ent_final_title.set_text(self._cur_title)
+
+        stack_label = "Games" if self._cur_category == "game" else "Personal Applications"
+        self.lbl_dest_info.set_markup(
+            f"<b>CDE Panel Destination:</b>  Icon from main <tt>.exe</tt> only  →  <b>{stack_label}</b> stack"
+        )
+
+        if self._candidates:
+            for idx, c in enumerate(self._candidates):
+                rel = c["exe_path"]
+                try:
+                    rel = c["exe_path"].relative_to(self._cur_prefix / "drive_c")
+                except ValueError:
+                    pass
+                tag = f"[{c['source']}] {c['label']}  —  C:\\{str(rel).replace('/', chr(92))}"
+                self.cmb_candidates.append(str(idx), tag)
+            self.cmb_candidates.set_active(0)
+        else:
+            self.cmb_candidates.append("-1", "(No new .exe auto-detected — click Browse drive_c...)")
+            self.cmb_candidates.set_active(0)
+            self._refresh_icon_preview()
+
+        self.btn_next.set_label(f"Add to \"{stack_label}\" Stack & Finish  ✔")
+        self.btn_next.set_sensitive(True)
+
+    def _on_candidate_changed(self, cmb):
+        cid = cmb.get_active_id()
+        if cid is None or cid == "-1":
+            return
+        idx = int(cid)
+        if 0 <= idx < len(self._candidates):
+            c = self._candidates[idx]
+            self._selected_hint_ico = c.get("icon_path")
+            self._selected_workdir = c.get("work_dir")
+            self.ent_final_exe.set_text(str(c["exe_path"]))
+            self.ent_final_args.set_text(c.get("args", ""))
+            if c.get("source") == "GOG Manifest" and c.get("label"):
+                self.ent_final_title.set_text(c["label"])
+            self._refresh_icon_preview()
+
+    def _on_browse_drive_c(self, _btn):
+        dlg = Gtk.FileChooserDialog(
+            title="Select Main Executable inside Prefix drive_c",
+            parent=self,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Select", Gtk.ResponseType.OK)
+        dc = self._cur_prefix / "drive_c"
+        if dc.is_dir():
+            dlg.set_current_folder(str(dc))
+        flt = Gtk.FileFilter()
+        flt.set_name("Windows Executables (*.exe, *.bat, *.msi)")
+        for p in ("*.exe", "*.EXE", "*.bat", "*.BAT", "*.com", "*.COM"):
+            flt.add_pattern(p)
+        dlg.add_filter(flt)
+        if dlg.run() == Gtk.ResponseType.OK:
+            p = Path(dlg.get_filename())
+            self._selected_hint_ico = None
+            self._selected_workdir = p.parent
+            self.ent_final_exe.set_text(str(p))
+        dlg.destroy()
+
+    def _refresh_icon_preview(self, *_args):
+        exe_txt = self.ent_final_exe.get_text().strip()
+        exe_p = Path(exe_txt) if exe_txt else None
+        hint = getattr(self, "_selected_hint_ico", None)
+        im = extract_best_icon(exe_p, hint, getattr(self, "_cur_category", "game"))
+        self.img_preview.set_from_pixbuf(pil_to_pixbuf(im, 48))
+
+    def _finalize_registration(self):
+        exe_txt = self.ent_final_exe.get_text().strip()
+        if not exe_txt or not Path(exe_txt).is_file():
+            self._error("Please select the installed main .exe file inside drive_c.")
+            return
+        exe_p = Path(exe_txt).resolve()
+        title = self.ent_final_title.get_text().strip() or self._cur_title
+        hint_ico = getattr(self, "_selected_hint_ico", None)
+        wdir = getattr(self, "_selected_workdir", None) or exe_p.parent
+
+        entry = {
+            "slug": self._cur_slug,
+            "title": title,
+            "category": self._cur_category,
+            "prefix": str(self._cur_prefix),
+            "arch": self._cur_arch,
+            "winver": self._cur_winver,
+            "exe_path": str(exe_p),
+            "work_dir": str(wdir),
+            "args": self.ent_final_args.get_text().strip(),
+            "vdesktop": self._cur_vdesktop,
+            "icon_source": str(hint_ico) if hint_ico else "",
+        }
+        register_cde_entry(entry)
+        reload_cde_panel()
+        self.result_entry = entry
+        self.response(Gtk.ResponseType.OK)
+
+    def _error(self, msg: str):
+        md = Gtk.MessageDialog(transient_for=self, flags=0, message_type=Gtk.MessageType.ERROR,
+                               buttons=Gtk.ButtonsType.OK, text=msg)
+        md.run()
+        md.destroy()
+
+
+# ---------------------------------------------------------------------------
+# Main dtWine Window
+# ---------------------------------------------------------------------------
+class DtWineWindow(Gtk.Window):
+    def __init__(self, initial_installer: str = ""):
+        super().__init__(title="dtWine — CDE Wine Software & Game Manager")
+        self.set_wmclass("dtwine", "DtWine")
+        self.set_default_size(900, 600)
+        self.set_position(Gtk.WindowPosition.CENTER)
+
+        dtwine_icon_pm = DT_ICONS / "dtwine.l.pm"
+        if dtwine_icon_pm.is_file():
+            try:
+                self.set_icon_from_file(str(dtwine_icon_pm))
+            except Exception:
+                pass
+
+        self.entries = load_entries()
+        self.selected_idx = -1
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=8)
+        self.add(root)
+
+        # Top CDE Motif Banner + Primary Install Button
+        top_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        top_bar.get_style_context().add_class("cde-banner")
+        if dtwine_icon_pm.is_file():
+            try:
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_size(str(dtwine_icon_pm), 36, 36)
+                top_bar.pack_start(Gtk.Image.new_from_pixbuf(pb), False, False, 0)
+            except Exception:
+                pass
+
+        title_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        lbl_t = Gtk.Label(xalign=0)
+        lbl_t.set_markup("<b>dtWine — CDE Wine Software &amp; Classic Game Manager</b>")
+        lbl_sub = Gtk.Label(
+            label="OpenGL WineD3D Engine  •  GOG & Win95/98/XP/10 Support  •  Auto CDE Panel Icons",
+            xalign=0,
+        )
+        title_col.pack_start(lbl_t, False, False, 0)
+        title_col.pack_start(lbl_sub, False, False, 0)
+        top_bar.pack_start(title_col, True, True, 0)
+
+        btn_install = Gtk.Button(label="＋ Install Game / Software...")
+        btn_install.get_style_context().add_class("cde-primary")
+        btn_install.connect("clicked", lambda _b: self.open_install_wizard())
+        top_bar.pack_end(btn_install, False, False, 0)
+        root.pack_start(top_bar, False, False, 0)
+
+        # Split Pane: Left = Installed Software/Games, Right = Controls & Tweaks
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, wide_handle=True)
+        paned.set_position(280)
+        root.pack_start(paned, True, True, 0)
+
+        # Left Pane
+        left_frame = Gtk.Frame(label=" Installed Games & Applications ")
+        left_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin=6)
+        left_frame.add(left_box)
+
+        sc_list = Gtk.ScrolledWindow(vexpand=True)
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.listbox.connect("row-selected", self._on_row_selected)
+        sc_list.add(self.listbox)
+        left_box.pack_start(sc_list, True, True, 0)
+
+        btn_reload_fp = Gtk.Button(label="Refresh CDE Panel Icons")
+        btn_reload_fp.connect("clicked", self._on_reload_panel)
+        left_box.pack_start(btn_reload_fp, False, False, 0)
+        paned.pack1(left_frame, resize=False, shrink=False)
+
+        # Right Pane (Notebook: Overview/Config | Winetricks & Tools | Activity Log)
+        self.right_nb = Gtk.Notebook()
+        paned.pack2(self.right_nb, resize=True, shrink=False)
+
+        self._build_detail_tab()
+        self._build_tools_tab()
+        self._build_log_tab()
+
+        self._populate_list()
+        self.show_all()
+
+        if initial_installer and Path(initial_installer).is_file():
+            GLib.idle_add(self.open_install_wizard, initial_installer)
+
+    def _build_detail_tab(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=10)
+
+        # Header action row
+        hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.img_detail = Gtk.Image()
+        hdr.pack_start(self.img_detail, False, False, 0)
+
+        self.lbl_detail_title = Gtk.Label(xalign=0)
+        self.lbl_detail_title.set_markup("<b>Select or install a program</b>")
+        hdr.pack_start(self.lbl_detail_title, True, True, 0)
+
+        self.btn_launch = Gtk.Button(label="▶  Launch")
+        self.btn_launch.get_style_context().add_class("cde-launch")
+        self.btn_launch.connect("clicked", self._on_launch)
+        hdr.pack_end(self.btn_launch, False, False, 0)
+
+        self.btn_kill = Gtk.Button(label="■  Stop Wine")
+        self.btn_kill.connect("clicked", self._on_kill_wine)
+        hdr.pack_end(self.btn_kill, False, False, 0)
+        vbox.pack_start(hdr, False, False, 0)
+
+        # Editable configuration form
+        fr = Gtk.Frame(label=" Program & CDE Stack Settings ")
+        g = Gtk.Grid(column_spacing=8, row_spacing=6, margin=8)
+        fr.add(g)
+
+        g.attach(Gtk.Label(label="Title:", xalign=0), 0, 0, 1, 1)
+        self.ed_title = Gtk.Entry(hexpand=True)
+        g.attach(self.ed_title, 1, 0, 2, 1)
+
+        g.attach(Gtk.Label(label="CDE Panel Stack:", xalign=0), 0, 1, 1, 1)
+        self.ed_cat = Gtk.ComboBoxText()
+        self.ed_cat.append("game", "Games stack  (PersPrintersSubpanel)")
+        self.ed_cat.append("app",  "Personal Applications stack  (PersAppsSubpanel)")
+        g.attach(self.ed_cat, 1, 1, 2, 1)
+
+        g.attach(Gtk.Label(label="Main Executable:", xalign=0), 0, 2, 1, 1)
+        self.ed_exe = Gtk.Entry(hexpand=True)
+        btn_b_exe = Gtk.Button(label="Browse...")
+        btn_b_exe.connect("clicked", self._on_browse_edit_exe)
+        g.attach(self.ed_exe, 1, 2, 1, 1)
+        g.attach(btn_b_exe, 2, 2, 1, 1)
+
+        g.attach(Gtk.Label(label="Arguments:", xalign=0), 0, 3, 1, 1)
+        self.ed_args = Gtk.Entry(hexpand=True)
+        g.attach(self.ed_args, 1, 3, 2, 1)
+
+        g.attach(Gtk.Label(label="Windows Version:", xalign=0), 0, 4, 1, 1)
+        self.ed_winver = Gtk.ComboBoxText()
+        for wid, wlbl in WIN_VERSIONS:
+            self.ed_winver.append(wid, wlbl)
+        g.attach(self.ed_winver, 1, 4, 2, 1)
+
+        g.attach(Gtk.Label(label="Virtual Desktop:", xalign=0), 0, 5, 1, 1)
+        self.ed_vdesk = Gtk.ComboBoxText()
+        for vid, vlbl in VDESKTOP_MODES:
+            self.ed_vdesk.append(vid, vlbl)
+        g.attach(self.ed_vdesk, 1, 5, 2, 1)
+
+        g.attach(Gtk.Label(label="Wine Prefix:", xalign=0), 0, 6, 1, 1)
+        self.lbl_prefix = Gtk.Label(xalign=0, selectable=True)
+        self.lbl_prefix.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        g.attach(self.lbl_prefix, 1, 6, 2, 1)
+
+        vbox.pack_start(fr, False, False, 0)
+
+        act_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.btn_save = Gtk.Button(label="Save & Update CDE Panel Icon")
+        self.btn_save.get_style_context().add_class("cde-primary")
+        self.btn_save.connect("clicked", self._on_save_entry)
+        act_row.pack_start(self.btn_save, False, False, 0)
+
+        self.btn_patch = Gtk.Button(label="Run Patch / DLC / Setup in Prefix...")
+        self.btn_patch.connect("clicked", self._on_run_patch)
+        act_row.pack_start(self.btn_patch, False, False, 0)
+
+        self.btn_delete = Gtk.Button(label="Remove...")
+        self.btn_delete.connect("clicked", self._on_delete_entry)
+        act_row.pack_end(self.btn_delete, False, False, 0)
+
+        vbox.pack_start(act_row, False, False, 0)
+        self.right_nb.append_page(vbox, Gtk.Label(label="Program & Icon"))
+
+    def _build_tools_tab(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=10)
+
+        fr_u = Gtk.Frame(label=" Wine Prefix Utilities ")
+        hb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, margin=8)
+        fr_u.add(hb)
+        for lbl, cmd_fn in [
+            ("Wine Configuration (winecfg)", lambda e: ["wine", "winecfg"]),
+            ("Registry Editor (regedit)",    lambda e: ["wine", "regedit"]),
+            ("Open drive_c Folder",          None),
+        ]:
+            b = Gtk.Button(label=lbl)
+            if cmd_fn:
+                b.connect("clicked", lambda _b, fn=cmd_fn: self._run_prefix_tool(fn))
+            else:
+                b.connect("clicked", self._on_open_drive_c)
+            hb.pack_start(b, False, False, 0)
+        vbox.pack_start(fr_u, False, False, 0)
+
+        fr_wt = Gtk.Frame(label=" One-Click Old-Game & Runtime Libraries (Winetricks) ")
+        vb_wt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=8)
+        fr_wt.add(vb_wt)
+
+        fb = Gtk.FlowBox(max_children_per_line=3, selection_mode=Gtk.SelectionMode.NONE, row_spacing=4, column_spacing=6)
+        for verb, short, tip in WINETRICKS_PRESETS:
+            b = Gtk.Button(label=f"Install {short}")
+            b.set_tooltip_text(f"{verb} — {tip}")
+            b.connect("clicked", lambda _b, v=verb: self._run_winetricks([v]))
+            fb.add(b)
+        vb_wt.pack_start(fb, False, False, 0)
+
+        custom_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        custom_row.pack_start(Gtk.Label(label="Custom verb(s):", xalign=0), False, False, 0)
+        self.ent_wt_custom = Gtk.Entry(hexpand=True, placeholder_text="e.g. d3dx9_43 xact winxp")
+        btn_wt_go = Gtk.Button(label="Run Winetricks")
+        btn_wt_go.connect("clicked", self._on_custom_winetricks)
+        custom_row.pack_start(self.ent_wt_custom, True, True, 0)
+        custom_row.pack_start(btn_wt_go, False, False, 0)
+        vb_wt.pack_start(custom_row, False, False, 2)
+
+        vbox.pack_start(fr_wt, False, False, 0)
+        self.right_nb.append_page(vbox, Gtk.Label(label="Runtimes & Tools"))
+
+    def _build_log_tab(self):
+        sc = Gtk.ScrolledWindow(margin=6)
+        self.main_log = Gtk.TextView(editable=False, wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        self.main_log.get_style_context().add_class("cde-log")
+        sc.add(self.main_log)
+        self.right_nb.append_page(sc, Gtk.Label(label="Wine Log"))
+
+    def _log(self, text: str):
+        def _do():
+            buf = self.main_log.get_buffer()
+            buf.insert(buf.get_end_iter(), text)
+            mark = buf.create_mark(None, buf.get_end_iter(), False)
+            self.main_log.scroll_to_mark(mark, 0.0, True, 0.0, 1.0)
+        GLib.idle_add(_do)
+
+    def _populate_list(self, select_idx: int = 0):
+        for child in self.listbox.get_children():
+            self.listbox.remove(child)
+
+        for e in self.entries:
+            row = Gtk.ListBoxRow()
+            hb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, margin=4)
+            ic_pm = DT_ICONS / f"{e.get('icon_name', '')}.m.pm"
+            if ic_pm.is_file():
+                try:
+                    pb = GdkPixbuf.Pixbuf.new_from_file_at_size(str(ic_pm), 28, 28)
+                    hb.pack_start(Gtk.Image.new_from_pixbuf(pb), False, False, 0)
+                except Exception:
+                    pass
+            vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            lbl_n = Gtk.Label(xalign=0)
+            lbl_n.set_markup(f"<b>{GLib.markup_escape_text(e['title'])}</b>")
+            badge = "Games Stack" if e.get("category") == "game" else "Personal Apps Stack"
+            lbl_c = Gtk.Label(label=badge, xalign=0)
+            vb.pack_start(lbl_n, False, False, 0)
+            vb.pack_start(lbl_c, False, False, 0)
+            hb.pack_start(vb, True, True, 0)
+            row.add(hb)
+            self.listbox.add(row)
+
+        self.listbox.show_all()
+        if self.entries:
+            idx = max(0, min(select_idx, len(self.entries) - 1))
+            self.listbox.select_row(self.listbox.get_row_at_index(idx))
+        else:
+            self._set_detail_enabled(False)
+
+    def _set_detail_enabled(self, sensitive: bool):
+        for w in (self.btn_launch, self.btn_kill, self.btn_save, self.btn_patch, self.btn_delete):
+            w.set_sensitive(sensitive)
+
+    def _on_row_selected(self, _lb, row):
+        if row is None:
+            self.selected_idx = -1
+            self._set_detail_enabled(False)
+            return
+        idx = row.get_index()
+        self.selected_idx = idx
+        e = self.entries[idx]
+        self._set_detail_enabled(True)
+
+        ic_pm = DT_ICONS / f"{e.get('icon_name', '')}.l.pm"
+        if ic_pm.is_file():
+            try:
+                self.img_detail.set_from_pixbuf(GdkPixbuf.Pixbuf.new_from_file_at_size(str(ic_pm), 48, 48))
+            except Exception:
+                pass
+
+        stack_txt = "Games" if e.get("category") == "game" else "Personal Applications"
+        self.lbl_detail_title.set_markup(
+            f"<span size='large'><b>{GLib.markup_escape_text(e['title'])}</b></span>\n"
+            f"<small>CDE Stack: {stack_txt}  •  Arch: {e.get('arch', 'win64')}</small>"
+        )
+        self.ed_title.set_text(e.get("title", ""))
+        self.ed_cat.set_active_id(e.get("category", "game"))
+        self.ed_exe.set_text(e.get("exe_path", ""))
+        self.ed_args.set_text(e.get("args", ""))
+        self.ed_winver.set_active_id(e.get("winver", "win10"))
+        self.ed_vdesk.set_active_id(e.get("vdesktop", ""))
+        self.lbl_prefix.set_text(e.get("prefix", ""))
+
+    def open_install_wizard(self, initial_installer: str = ""):
+        wiz = InstallWizardDialog(self, initial_installer)
+        resp = wiz.run()
+        new_entry = wiz.result_entry
+        wiz.destroy()
+        if resp == Gtk.ResponseType.OK and new_entry:
+            self.entries.append(new_entry)
+            save_entries(self.entries)
+            self._populate_list(len(self.entries) - 1)
+            stack_name = "Games" if new_entry["category"] == "game" else "Personal Applications"
+            self._log(f"Installed '{new_entry['title']}' and added icon to CDE '{stack_name}' stack.\n")
+
+    def _current_entry(self) -> dict | None:
+        if 0 <= self.selected_idx < len(self.entries):
+            return self.entries[self.selected_idx]
+        return None
+
+    def _on_launch(self, _btn):
+        e = self._current_entry()
+        if not e:
+            return
+        launcher = Path(e.get("launcher", ""))
+        if not launcher.is_file():
+            register_cde_entry(e)
+            save_entries(self.entries)
+            launcher = Path(e["launcher"])
+        self._log(f"==> Launching {e['title']} ({launcher})...\n")
+        subprocess.Popen([str(launcher)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+    def _on_kill_wine(self, _btn):
+        e = self._current_entry()
+        if not e:
+            return
+        subprocess.run(["wineserver", "-k"], env=wine_env(Path(e["prefix"]), e.get("arch", "win64")))
+        self._log(f"==> Stopped all Wine processes in {e['prefix']}.\n")
+
+    def _on_browse_edit_exe(self, _btn):
+        e = self._current_entry()
+        if not e:
+            return
+        dlg = Gtk.FileChooserDialog(title="Select Main Executable", parent=self, action=Gtk.FileChooserAction.OPEN)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Select", Gtk.ResponseType.OK)
+        dc = Path(e["prefix"]) / "drive_c"
+        if dc.is_dir():
+            dlg.set_current_folder(str(dc))
+        if dlg.run() == Gtk.ResponseType.OK:
+            self.ed_exe.set_text(dlg.get_filename())
+        dlg.destroy()
+
+    def _on_save_entry(self, _btn):
+        e = self._current_entry()
+        if not e:
+            return
+        old_winver = e.get("winver", "win10")
+        e["title"] = self.ed_title.get_text().strip() or e["title"]
+        e["category"] = self.ed_cat.get_active_id() or "game"
+        e["exe_path"] = self.ed_exe.get_text().strip()
+        e["work_dir"] = str(Path(e["exe_path"]).parent) if e["exe_path"] else e.get("work_dir", "")
+        e["args"] = self.ed_args.get_text().strip()
+        e["winver"] = self.ed_winver.get_active_id() or "win10"
+        e["vdesktop"] = self.ed_vdesk.get_active_id() or ""
+
+        # For pre-existing battlenet, keep its custom launcher name intact unless moved
+        register_cde_entry(e)
+        save_entries(self.entries)
+        reload_cde_panel()
+        self._populate_list(self.selected_idx)
+
+        if e["winver"] != old_winver:
+            threading.Thread(
+                target=apply_prefix_settings,
+                args=(Path(e["prefix"]), e.get("arch", "win64"), e["winver"], self._log),
+                daemon=True,
+            ).start()
+        self._log(f"==> Saved '{e['title']}' and updated CDE Front Panel icon.\n")
+
+    def _on_run_patch(self, _btn):
+        e = self._current_entry()
+        if not e:
+            return
+        dlg = Gtk.FileChooserDialog(title="Select Patch / DLC / Setup .exe or .msi", parent=self, action=Gtk.FileChooserAction.OPEN)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Run in Prefix", Gtk.ResponseType.OK)
+        if (HOME / "Downloads").is_dir():
+            dlg.set_current_folder(str(HOME / "Downloads"))
+        if dlg.run() == Gtk.ResponseType.OK:
+            fpath = Path(dlg.get_filename())
+            dlg.destroy()
+            self.right_nb.set_current_page(2)
+            env = wine_env(Path(e["prefix"]), e.get("arch", "win64"))
+            cmd = ["wine", "msiexec", "/i", str(fpath)] if fpath.suffix.lower() == ".msi" else ["wine", str(fpath)]
+
+            def run_bg():
+                self._log(f"==> Running {fpath.name} in {e['prefix']}...\n")
+                p = subprocess.Popen(cmd, cwd=str(fpath.parent), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                for ln in p.stdout:
+                    if "Vulkan support" not in ln:
+                        self._log(ln)
+                p.wait()
+                self._log("==> Finished.\n")
+
+            threading.Thread(target=run_bg, daemon=True).start()
+        else:
+            dlg.destroy()
+
+    def _on_delete_entry(self, _btn):
+        e = self._current_entry()
+        if not e:
+            return
+        dlg = Gtk.MessageDialog(
+            transient_for=self, flags=0, message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.NONE,
+            text=f"Remove '{e['title']}' from dtWine and CDE Front Panel?",
+        )
+        dlg.format_secondary_text(f"Prefix path: {e['prefix']}")
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
+                        "Remove Icon Only", 1,
+                        "Delete Prefix & Icon", 2)
+        resp = dlg.run()
+        dlg.destroy()
+        if resp not in (1, 2):
+            return
+
+        unregister_cde_entry(e)
+        if resp == 2:
+            pfx = Path(e["prefix"])
+            subprocess.run(["wineserver", "-k"], env=wine_env(pfx, e.get("arch", "win64")),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if pfx.is_dir() and pfx.parent == GAMES_ROOT:
+                shutil.rmtree(pfx, ignore_errors=True)
+
+        self.entries.pop(self.selected_idx)
+        save_entries(self.entries)
+        reload_cde_panel()
+        self._populate_list(0)
+
+    def _run_prefix_tool(self, cmd_fn):
+        e = self._current_entry()
+        if not e:
+            return
+        subprocess.Popen(cmd_fn(e), env=wine_env(Path(e["prefix"]), e.get("arch", "win64")),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _on_open_drive_c(self, _btn):
+        e = self._current_entry()
+        if not e:
+            return
+        dc = Path(e["prefix"]) / "drive_c"
+        dc.mkdir(parents=True, exist_ok=True)
+        for fm in ("nautilus", "xdg-open", "/usr/dt/bin/dtfile"):
+            if shutil.which(fm):
+                subprocess.Popen([fm, str(dc)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                break
+
+    def _on_custom_winetricks(self, _btn):
+        verbs = self.ent_wt_custom.get_text().strip().split()
+        if verbs:
+            self._run_winetricks(verbs)
+
+    def _run_winetricks(self, verbs: list[str]):
+        e = self._current_entry()
+        if not e or not WINETRICKS_BIN.is_file():
+            return
+        self.right_nb.set_current_page(2)
+        env = wine_env(Path(e["prefix"]), e.get("arch", "win64"))
+
+        def worker():
+            self._log(f"==> Running winetricks {' '.join(verbs)} in {e['prefix']}...\n")
+            p = subprocess.Popen([str(WINETRICKS_BIN), "-q"] + verbs, env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            for ln in p.stdout:
+                if "Vulkan support" not in ln:
+                    self._log(ln)
+            p.wait()
+            self._log(f"==> winetricks {' '.join(verbs)} completed (exit {p.returncode}).\n")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_reload_panel(self, _btn):
+        reload_cde_panel()
+        self._log("==> Reloaded CDE actions and refreshed Front Panel.\n")
+
+
+def main():
+    provider = Gtk.CssProvider()
+    provider.load_from_data(CDE_MOTIF_CSS)
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+    )
+
+    initial_arg = sys.argv[1].strip() if len(sys.argv) > 1 else ""
+    win = DtWineWindow(initial_arg)
+    win.connect("destroy", Gtk.main_quit)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

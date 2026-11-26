@@ -1,0 +1,22 @@
+set DtDbVersion=1.0
+
+ACTION dtReader
+{
+     LABEL         dtReader
+     ICON          dtreader
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtreader "%(File)Arg_1%"
+     DESCRIPTION   dtReader — CDE PDF Viewer & Fillable AcroForm Editor.
+}
+
+ACTION dtReader
+{
+     LABEL         dtReader
+     ARG_COUNT     0
+     ICON          dtreader
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtreader
+     DESCRIPTION   dtReader — CDE PDF Viewer & Fillable AcroForm Editor.
+}

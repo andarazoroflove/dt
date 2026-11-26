@@ -1,0 +1,12 @@
+set DtDbVersion=1.0
+
+ACTION dtIRC
+{
+     LABEL         dtIRC
+     ARG_COUNT     0
+     ICON          dtirc
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtirc
+     DESCRIPTION   dtIRC — CDE Libera.Chat IRC Client with NickServ & Cream mIRC Colors.
+}

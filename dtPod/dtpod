@@ -1,0 +1,1963 @@
+#!/usr/bin/env python3
+"""
+dtPod — Common Desktop Environment (CDE) Apple Podcast Browser & Player
+
+Features:
+  - Public Apple Podcasts Search & Lookup API (no login required)
+  - Search by Show Title, Artist/Creator, or Keyword + Top Podcasts chart
+  - Subscribe / Unsubscribe to favorite shows (saved in ~/.config/dtpod/)
+  - High-res show & episode cover artwork with disk caching
+  - Episode browser in classic CDE greenbar alternating row style + Show Notes pane
+  - Right-click any episode -> "Save Episode As..." background downloader with progress
+  - Built-in GStreamer streaming & offline audio player (-15s/+30s skip, speed, scrub, volume)
+  - Styled natively to match CDE's active OSF/Motif palette
+"""
+
+import datetime
+import email.utils
+import hashlib
+import html
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+import cairo
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Pango", "1.0")
+gi.require_version("Gst", "1.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gst, Gtk, Pango
+from PIL import Image
+import requests
+
+Gst.init(None)
+
+HOME = Path.home()
+DT_ICONS = HOME / ".dt" / "icons"
+CONFIG_DIR = HOME / ".config" / "dtpod"
+CACHE_ART_DIR = HOME / ".cache" / "dtpod" / "art"
+SUBS_FILE = CONFIG_DIR / "subscriptions.json"
+
+USER_AGENT = "dtPod/1.0 (CDE Common Desktop Environment; Linux x86_64) ApplePodcastsClient"
+
+
+# ---------------------------------------------------------------------------
+# CDE Active Motif Palette & GTK3 CSS
+# ---------------------------------------------------------------------------
+def _shade_hex(hex_col: str, factor: float) -> str:
+    h = hex_col.lstrip("#")
+    if len(h) != 6:
+        return hex_col
+    r = max(0, min(255, int(int(h[0:2], 16) * factor)))
+    g = max(0, min(255, int(int(h[2:4], 16) * factor)))
+    b = max(0, min(255, int(int(h[4:6], 16) * factor)))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _compute_greenbar_hex(well_hex: str) -> str:
+    """Match dtMail's exact vintage greenbar alternating shade from bg_well."""
+    h = well_hex.lstrip("#")
+    if len(h) != 6:
+        return "#eef4db"
+    r = max(0, int(h[0:2], 16) - 17)
+    g = max(0, int(h[2:4], 16) - 3)
+    b = max(0, int(h[4:6], 16) - 14)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def load_cde_palette() -> tuple[str, str, str, str]:
+    chrome, sel, well = "#aeb2c3", "#2c567e", "#fff7e9"
+    try:
+        out = subprocess.check_output(["xrdb", "-query"], text=True, stderr=subprocess.DEVNULL)
+        pal_name = "Crimson.dp"
+        for ln in out.splitlines():
+            if "ColorPalette:" in ln:
+                pal_name = ln.split(":", 1)[1].strip()
+                break
+        for pdir in (HOME / ".dt/palettes", Path("/usr/dt/palettes")):
+            pf = pdir / pal_name
+            if pf.is_file():
+                hexes = [l.strip() for l in pf.read_text().splitlines() if l.strip().startswith("#")]
+                if len(hexes) >= 4:
+                    def norm16(h):
+                        h = h.lstrip("#")
+                        return f"#{h[0:2]}{h[4:6]}{h[8:10]}" if len(h) == 12 else "#" + h[:6]
+                    chrome, sel, well = norm16(hexes[1]), norm16(hexes[2]), norm16(hexes[3])
+                break
+    except Exception:
+        pass
+    well_alt = _compute_greenbar_hex(well)
+    return chrome, sel, well, well_alt
+
+
+def build_cde_css(chrome: str, sel: str, well: str, well_alt: str) -> bytes:
+    chrome_hi = _shade_hex(chrome, 1.06)
+    chrome_lo = _shade_hex(chrome, 0.90)
+    css = f"""
+    window, dialog, .background {{
+        background-color: {chrome};
+        color: #101014;
+        font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+        font-size: 9.5pt;
+    }}
+    menubar {{
+        background-color: {chrome};
+        border-bottom: 2px solid #585c6c;
+    }}
+    menuitem:hover {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    .cde-toolbar {{
+        background-color: {chrome};
+        padding: 4px 6px;
+        border-top: 2px solid #e6e9f2;
+        border-left: 2px solid #e6e9f2;
+        border-right: 2px solid #585c6c;
+        border-bottom: 2px solid #585c6c;
+    }}
+    .cde-header-card {{
+        background-color: {well};
+        color: #101014;
+        padding: 8px 10px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+    }}
+    .cde-player-deck {{
+        background-color: {chrome};
+        padding: 6px 10px;
+        border-top: 2px solid #e6e9f2;
+        border-left: 2px solid #e6e9f2;
+        border-right: 2px solid #585c6c;
+        border-bottom: 2px solid #585c6c;
+    }}
+    .cde-status {{
+        background-color: {chrome};
+        padding: 3px 8px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+    }}
+    frame {{
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+        border-radius: 0px;
+    }}
+    button {{
+        background-image: none;
+        background-color: {chrome};
+        color: #101014;
+        border-top: 2px solid #e6e9f2;
+        border-left: 2px solid #e6e9f2;
+        border-right: 2px solid #565a69;
+        border-bottom: 2px solid #565a69;
+        border-radius: 0px;
+        padding: 3px 8px;
+        box-shadow: none;
+    }}
+    button:hover {{
+        background-color: {chrome_hi};
+    }}
+    button:active, button:checked {{
+        background-color: {chrome_lo};
+        border-top: 2px solid #565a69;
+        border-left: 2px solid #565a69;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+        font-weight: bold;
+    }}
+    button.cde-accent {{
+        background-color: #2b5b84;
+        color: #ffffff;
+        border-top: 2px solid #6899c4;
+        border-left: 2px solid #6899c4;
+        border-right: 2px solid #142c40;
+        border-bottom: 2px solid #142c40;
+        font-weight: bold;
+    }}
+    button.cde-accent:hover {{
+        background-color: #356d9c;
+    }}
+    button.cde-accent label {{ color: #ffffff; }}
+    button.cde-sub-active {{
+        background-color: #266048;
+        color: #ffffff;
+        border-top: 2px solid #52997b;
+        border-left: 2px solid #52997b;
+        border-right: 2px solid #113023;
+        border-bottom: 2px solid #113023;
+        font-weight: bold;
+    }}
+    button.cde-sub-active label {{ color: #ffffff; }}
+    entry, textview, textview text, treeview {{
+        background-color: {well};
+        color: #101014;
+        border-radius: 0px;
+    }}
+    treeview:selected {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    treeview header button {{
+        background-color: {chrome};
+        font-weight: bold;
+    }}
+    notebook header {{
+        background-color: {chrome};
+    }}
+    notebook tab {{
+        background-color: {chrome_lo};
+        padding: 4px 10px;
+        border-top: 2px solid #e6e9f2;
+        border-left: 2px solid #e6e9f2;
+        border-right: 2px solid #565a69;
+    }}
+    notebook tab:checked {{
+        background-color: {chrome};
+        font-weight: bold;
+    }}
+    """
+    return css.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Helpers: Formatting, HTML Cleanup, Artwork Placeholder & Cache
+# ---------------------------------------------------------------------------
+def strip_html(raw: str) -> str:
+    if not raw:
+        return ""
+    s = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", raw)
+    s = re.sub(r"(?i)</\s*(p|div|li|h[1-6])\s*>", "\n\n", s)
+    s = re.sub(r"(?i)<\s*li[^>]*>", "  • ", s)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = html.unescape(s)
+    s = re.sub(r"[ \t]+\n", "\n", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def format_duration(val) -> str:
+    if not val:
+        return ""
+    s = str(val).strip()
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            return f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+        if len(parts) == 3 and all(p.isdigit() for p in parts):
+            h, m, sec = int(parts[0]), int(parts[1]), int(parts[2])
+            return f"{h}:{m:02d}:{sec:02d}" if h > 0 else f"{m:02d}:{sec:02d}"
+        return s
+    try:
+        tot = int(float(s))
+        if tot <= 0:
+            return ""
+        h, rem = divmod(tot, 3600)
+        m, sec = divmod(rem, 60)
+        return f"{h}:{m:02d}:{sec:02d}" if h > 0 else f"{m:02d}:{sec:02d}"
+    except Exception:
+        return s
+
+
+def format_seconds(sec: float) -> str:
+    if sec < 0 or not sec:
+        sec = 0.0
+    tot = int(round(sec))
+    h, rem = divmod(tot, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
+
+
+def format_bytes(num: int) -> str:
+    if not num or num <= 0:
+        return ""
+    f = float(num)
+    for u in ("B", "KB", "MB", "GB"):
+        if f < 1024.0 or u == "GB":
+            return f"{f:.1f} {u}" if u != "B" else f"{int(f)} B"
+        f /= 1024.0
+    return ""
+
+
+def parse_pubdate(raw: str) -> tuple[str, float]:
+    if not raw:
+        return "", 0.0
+    s = raw.strip()
+    try:
+        dt = email.utils.parsedate_to_datetime(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.strftime("%Y-%m-%d"), dt.timestamp()
+    except Exception:
+        pass
+    try:
+        iso = s.replace("Z", "+00:00")
+        dt = datetime.datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.strftime("%Y-%m-%d"), dt.timestamp()
+    except Exception:
+        pass
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        try:
+            dt = datetime.datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=datetime.timezone.utc)
+            return m.group(0), dt.timestamp()
+        except Exception:
+            return m.group(0), 0.0
+    return s[:16], 0.0
+
+
+def sanitize_filename(name: str) -> str:
+    cleaned = re.sub(r'[\\/*?:"<>|\r\n\t]+', "_", name).strip(" ._")
+    return cleaned[:140] or "podcast_episode"
+
+
+def make_placeholder_pixbuf(size: int, label_char: str = "🎙") -> GdkPixbuf.Pixbuf:
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    cr = cairo.Context(surf)
+    # Vintage CDE purple-indigo podcast tile
+    pat = cairo.LinearGradient(0, 0, size, size)
+    pat.add_color_stop_rgb(0.0, 0.36, 0.24, 0.56)
+    pat.add_color_stop_rgb(1.0, 0.19, 0.12, 0.34)
+    cr.set_source(pat)
+    cr.rectangle(0, 0, size, size)
+    cr.fill()
+
+    # Radio waves + mic glyph in Cairo vector art
+    cx, cy = size * 0.5, size * 0.46
+    cr.set_source_rgba(1.0, 0.96, 0.90, 0.35)
+    cr.set_line_width(max(1.2, size * 0.045))
+    for r_f in (0.28, 0.39):
+        cr.arc(cx, cy, size * r_f, -0.75, 0.75)
+        cr.stroke()
+        cr.arc(cx, cy, size * r_f, math.pi - 0.75, math.pi + 0.75)
+        cr.stroke()
+
+    cr.set_source_rgb(0.98, 0.95, 0.88)
+    mw, mh = size * 0.18, size * 0.28
+    cr.arc(cx, cy - mh * 0.2, mw * 0.5, 0, 2 * 3.14159)
+    cr.fill()
+    cr.rectangle(cx - mw * 0.5, cy - mh * 0.2, mw, mh * 0.65)
+    cr.fill()
+    cr.set_line_width(max(1.5, size * 0.055))
+    cr.arc(cx, cy + mh * 0.15, mw * 0.85, 0.15, 3.14159 - 0.15)
+    cr.stroke()
+    cr.move_to(cx, cy + mh * 0.15 + mw * 0.85)
+    cr.line_to(cx, size * 0.84)
+    cr.stroke()
+    cr.move_to(cx - mw * 0.65, size * 0.84)
+    cr.line_to(cx + mw * 0.65, size * 0.84)
+    cr.stroke()
+
+    # Beveled border
+    cr.set_line_width(1.0)
+    cr.set_source_rgba(1, 1, 1, 0.4)
+    cr.move_to(0.5, size - 0.5); cr.line_to(0.5, 0.5); cr.line_to(size - 0.5, 0.5); cr.stroke()
+    cr.set_source_rgba(0, 0, 0, 0.5)
+    cr.move_to(size - 0.5, 0.5); cr.line_to(size - 0.5, size - 0.5); cr.line_to(0.5, size - 0.5); cr.stroke()
+    surf.flush()
+    return Gdk.pixbuf_get_from_surface(surf, 0, 0, size, size)
+
+
+import math
+
+
+class ArtworkCache:
+    """Thread-safe disk & memory artwork loader with automatic scaling."""
+    def __init__(self):
+        CACHE_ART_DIR.mkdir(parents=True, exist_ok=True)
+        self._mem: dict[tuple[str, int], GdkPixbuf.Pixbuf] = {}
+        self._inflight: set[str] = set()
+        self._lock = threading.Lock()
+
+    def get_cached(self, url: str, size: int) -> GdkPixbuf.Pixbuf | None:
+        if not url:
+            return None
+        key = (url, size)
+        with self._lock:
+            if key in self._mem:
+                return self._mem[key]
+        h = hashlib.sha1(url.encode("utf-8")).hexdigest()
+        disk_p = CACHE_ART_DIR / f"{h}.png"
+        if disk_p.is_file():
+            try:
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(disk_p), size, size, True)
+                with self._lock:
+                    self._mem[key] = pb
+                return pb
+            except Exception:
+                pass
+        return None
+
+    def fetch_async(self, url: str, size: int, callback):
+        if not url:
+            return
+        cached = self.get_cached(url, size)
+        if cached is not None:
+            GLib.idle_add(callback, url, cached)
+            return
+
+        with self._lock:
+            already = url in self._inflight
+            self._inflight.add(url)
+
+        def _worker():
+            try:
+                h = hashlib.sha1(url.encode("utf-8")).hexdigest()
+                disk_p = CACHE_ART_DIR / f"{h}.png"
+                if not disk_p.is_file():
+                    r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=12)
+                    r.raise_for_status()
+                    with Image.open(io.BytesIO(r.content)) as im:
+                        im.thumbnail((400, 400), Image.Resampling.LANCZOS)
+                        im.convert("RGBA").save(disk_p, format="PNG")
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(disk_p), size, size, True)
+                with self._lock:
+                    self._mem[(url, size)] = pb
+                GLib.idle_add(callback, url, pb)
+            except Exception:
+                pass
+            finally:
+                with self._lock:
+                    self._inflight.discard(url)
+
+        if not already:
+            threading.Thread(target=_worker, daemon=True).start()
+        else:
+            # Wait briefly for inflight download then resolve from disk
+            def _waiter():
+                for _ in range(30):
+                    time.sleep(0.25)
+                    pb = self.get_cached(url, size)
+                    if pb is not None:
+                        GLib.idle_add(callback, url, pb)
+                        return
+            threading.Thread(target=_waiter, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Apple Podcasts Public API & Podcast RSS XML Parser
+# ---------------------------------------------------------------------------
+def search_apple_podcasts(query: str, mode: str = "all") -> list[dict]:
+    """
+    Query Apple's public iTunes Search API (no auth needed).
+    mode: 'all' (Shows & Artists), 'artist' (Artist/Creator priority), 'title' (Show Title).
+    """
+    q = query.strip()
+    if not q:
+        return []
+
+    results_by_feed: dict[str, dict] = {}
+    calls = []
+    if mode == "artist":
+        calls.append({"media": "podcast", "entity": "podcast", "attribute": "artistTerm", "term": q, "limit": "40"})
+        calls.append({"media": "podcast", "entity": "podcast", "term": q, "limit": "25"})
+    elif mode == "title":
+        calls.append({"media": "podcast", "entity": "podcast", "attribute": "titleTerm", "term": q, "limit": "40"})
+    else:
+        calls.append({"media": "podcast", "entity": "podcast", "term": q, "limit": "45"})
+
+    for params in calls:
+        try:
+            resp = requests.get("https://itunes.apple.com/search", params=params,
+                                headers={"User-Agent": USER_AGENT}, timeout=12)
+            resp.raise_for_status()
+            data = resp.json()
+            for item in data.get("results", []):
+                feed = (item.get("feedUrl") or "").strip()
+                cid = str(item.get("collectionId") or "")
+                key = feed or cid
+                if not key or key in results_by_feed:
+                    continue
+                results_by_feed[key] = {
+                    "id": cid or hashlib.md5(feed.encode()).hexdigest()[:12],
+                    "title": (item.get("collectionName") or item.get("trackName") or "Untitled Podcast").strip(),
+                    "artist": (item.get("artistName") or "Unknown Artist").strip(),
+                    "feedUrl": feed,
+                    "artworkUrl": (item.get("artworkUrl600") or item.get("artworkUrl100") or "").strip(),
+                    "genre": (item.get("primaryGenreName") or "Podcast").strip(),
+                    "trackCount": int(item.get("trackCount") or 0),
+                }
+        except Exception as exc:
+            if not results_by_feed:
+                raise exc
+    return list(results_by_feed.values())
+
+
+def fetch_top_apple_podcasts() -> list[dict]:
+    """Fetch Apple Top Podcasts chart via public RSS/Lookup API."""
+    ids = []
+    try:
+        r = requests.get(
+            "https://itunes.apple.com/us/rss/toppodcasts/limit=25/json",
+            headers={"User-Agent": USER_AGENT},
+            timeout=12,
+        )
+        r.raise_for_status()
+        entries = r.json().get("feed", {}).get("entry", [])
+        if isinstance(entries, dict):
+            entries = [entries]
+        for e in entries:
+            cid = e.get("id", {}).get("attributes", {}).get("im:id")
+            if cid:
+                ids.append(str(cid))
+    except Exception:
+        pass
+
+    if ids:
+        try:
+            r2 = requests.get(
+                "https://itunes.apple.com/lookup",
+                params={"id": ",".join(ids)},
+                headers={"User-Agent": USER_AGENT},
+                timeout=12,
+            )
+            r2.raise_for_status()
+            shows = []
+            for item in r2.json().get("results", []):
+                feed = (item.get("feedUrl") or "").strip()
+                if not feed:
+                    continue
+                shows.append({
+                    "id": str(item.get("collectionId") or ""),
+                    "title": (item.get("collectionName") or item.get("trackName") or "Podcast").strip(),
+                    "artist": (item.get("artistName") or "").strip(),
+                    "feedUrl": feed,
+                    "artworkUrl": (item.get("artworkUrl600") or item.get("artworkUrl100") or "").strip(),
+                    "genre": (item.get("primaryGenreName") or "Podcast").strip(),
+                    "trackCount": int(item.get("trackCount") or 0),
+                })
+            if shows:
+                return shows
+        except Exception:
+            pass
+
+    return search_apple_podcasts("technology science history news", "all")
+
+
+def _local_tag(tag: str) -> str:
+    return tag.split("}", 1)[1].lower() if "}" in tag else tag.lower()
+
+
+def parse_podcast_rss(xml_bytes: bytes, fallback_show: dict | None = None) -> tuple[dict, list[dict]]:
+    """Parse an RSS/Atom podcast XML feed into (show_meta, episodes_list)."""
+    # Strip leading BOM/whitespace
+    text = xml_bytes.decode("utf-8", errors="replace").lstrip("\ufeff \t\r\n")
+    root = ET.fromstring(text)
+
+    channel = None
+    if _local_tag(root.tag) == "rss":
+        for ch in root:
+            if _local_tag(ch.tag) == "channel":
+                channel = ch
+                break
+    elif _local_tag(root.tag) in ("feed", "channel"):
+        channel = root
+
+    if channel is None:
+        raise RuntimeError("Invalid podcast RSS feed (missing <channel>).")
+
+    show = dict(fallback_show or {})
+    ch_title = ""
+    ch_author = ""
+    ch_desc = ""
+    ch_art = ""
+
+    items = []
+    for elem in channel:
+        lt = _local_tag(elem.tag)
+        if lt == "title" and not ch_title and elem.text:
+            ch_title = elem.text.strip()
+        elif lt == "author" and elem.text:
+            ch_author = elem.text.strip()
+        elif lt in ("description", "summary", "subtitle") and elem.text and len(elem.text.strip()) > len(ch_desc):
+            ch_desc = strip_html(elem.text)
+        elif lt == "image":
+            href = elem.attrib.get("href", "").strip()
+            if href:
+                ch_art = href
+            else:
+                for sub in elem:
+                    if _local_tag(sub.tag) == "url" and sub.text:
+                        ch_art = sub.text.strip()
+        elif lt in ("item", "entry"):
+            items.append(elem)
+
+    if ch_title and not show.get("title"):
+        show["title"] = ch_title
+    if ch_author and not show.get("artist"):
+        show["artist"] = ch_author
+    if ch_desc:
+        show["description"] = ch_desc
+    if ch_art and not show.get("artworkUrl"):
+        show["artworkUrl"] = ch_art
+
+    episodes = []
+    for idx, it in enumerate(items):
+        ep_title = ""
+        ep_guid = ""
+        ep_pub = ""
+        ep_dur = ""
+        ep_url = ""
+        ep_mime = ""
+        ep_len = 0
+        ep_art = ""
+        ep_desc_candidates = []
+
+        for sub in it:
+            st = _local_tag(sub.tag)
+            if st == "title" and sub.text:
+                ep_title = sub.text.strip()
+            elif st in ("guid", "id") and sub.text:
+                ep_guid = sub.text.strip()
+            elif st in ("pubdate", "published", "updated") and sub.text and not ep_pub:
+                ep_pub = sub.text.strip()
+            elif st == "duration" and sub.text:
+                ep_dur = format_duration(sub.text)
+            elif st == "enclosure":
+                u = (sub.attrib.get("url") or "").strip()
+                if u:
+                    ep_url = u
+                    ep_mime = (sub.attrib.get("type") or "").strip()
+                    try:
+                        ep_len = int(sub.attrib.get("length") or 0)
+                    except ValueError:
+                        ep_len = 0
+            elif st == "link" and not ep_url:
+                rel = sub.attrib.get("rel", "")
+                href = sub.attrib.get("href", "")
+                if rel == "enclosure" and href:
+                    ep_url = href.strip()
+            elif st in ("image", "thumbnail"):
+                href = (sub.attrib.get("href") or sub.attrib.get("url") or "").strip()
+                if href:
+                    ep_art = href
+            elif st in ("encoded", "description", "summary", "content", "subtitle") and sub.text:
+                ep_desc_candidates.append(sub.text)
+
+        if not ep_url:
+            continue
+
+        best_raw_desc = max(ep_desc_candidates, key=len) if ep_desc_candidates else ""
+        date_str, ts = parse_pubdate(ep_pub)
+        episodes.append({
+            "guid": ep_guid or ep_url or f"ep-{idx}",
+            "title": html.unescape(ep_title) or f"Episode {idx + 1}",
+            "date": date_str,
+            "timestamp": ts,
+            "duration": ep_dur,
+            "audioUrl": ep_url,
+            "mimeType": ep_mime,
+            "sizeBytes": ep_len,
+            "sizeHuman": format_bytes(ep_len),
+            "artworkUrl": ep_art or show.get("artworkUrl") or "",
+            "description": strip_html(best_raw_desc),
+            "showTitle": show.get("title") or "Podcast",
+            "showArtist": show.get("artist") or "",
+            "_feed_order": idx,
+        })
+
+    # Always sort episodes newest-to-oldest (descending by publication date/timestamp)
+    episodes.sort(
+        key=lambda e: (1 if e["timestamp"] > 0 else 0, e["timestamp"], e["date"], -e["_feed_order"]),
+        reverse=True,
+    )
+    return show, episodes
+
+
+# ---------------------------------------------------------------------------
+# Main dtPod Application Window
+# ---------------------------------------------------------------------------
+class DtPodWindow(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="dtPod — CDE Apple Podcast Browser & Player")
+        self.set_wmclass("dtpod", "DtPod")
+        self.set_default_size(1100, 720)
+        self.set_position(Gtk.WindowPosition.CENTER)
+
+        ic = DT_ICONS / "dtpod.l.pm"
+        if ic.is_file():
+            try:
+                self.set_icon_from_file(str(ic))
+            except Exception:
+                pass
+
+        self.chrome_hex, self.sel_hex, self.well_hex, self.well_alt_hex = load_cde_palette()
+        self.art_cache = ArtworkCache()
+        self.placeholder_36 = make_placeholder_pixbuf(36)
+        self.placeholder_48 = make_placeholder_pixbuf(48)
+        self.placeholder_136 = make_placeholder_pixbuf(136)
+
+        # Persistent state
+        self.subscriptions: list[dict] = []
+        self.played_guids: set[str] = set()
+        self.saved_files: dict[str, str] = {}   # guid -> local file path
+        self.last_save_dir: str = str(HOME / "Downloads" if (HOME / "Downloads").is_dir() else HOME)
+        self._load_state()
+
+        # Runtime browser state
+        self.search_results: list[dict] = []
+        self.current_show: dict | None = None
+        self.current_episodes: list[dict] = []
+        self.feed_cache: dict[str, tuple[dict, list[dict]]] = {}
+        self.playing_episode: dict | None = None
+
+        # Download state
+        self._dl_cancel = threading.Event()
+        self._dl_active = False
+
+        # GStreamer audio player
+        self.player = Gst.ElementFactory.make("playbin", "dtpod_player")
+        self.is_playing = False
+        self.playback_rate = 1.0
+        self._seeking_slider = False
+        if self.player:
+            bus = self.player.get_bus()
+            bus.add_signal_watch()
+            bus.connect("message::eos", self._on_gst_eos)
+            bus.connect("message::error", self._on_gst_error)
+            bus.connect("message::state-changed", self._on_gst_state)
+
+        self._build_ui()
+        GLib.timeout_add(400, self._tick_timeline)
+
+        # Populate initial view: select first subscription or fetch Top Shows
+        self._refresh_subs_list()
+        if self.subscriptions:
+            GLib.idle_add(self.load_show, self.subscriptions[0])
+        else:
+            self.left_nb.set_current_page(1)
+            GLib.idle_add(self.on_load_top_shows)
+
+    # ---------------- Persistence ----------------
+    def _load_state(self):
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        if SUBS_FILE.is_file():
+            try:
+                data = json.loads(SUBS_FILE.read_text(encoding="utf-8"))
+                self.subscriptions = data.get("subscriptions", [])
+                self.played_guids = set(data.get("played_guids", []))
+                self.saved_files = dict(data.get("saved_files", {}))
+                if data.get("last_save_dir"):
+                    self.last_save_dir = data["last_save_dir"]
+            except Exception:
+                pass
+
+    def _save_state(self):
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        data = {
+            "subscriptions": self.subscriptions,
+            "played_guids": sorted(list(self.played_guids))[-2000:],
+            "saved_files": self.saved_files,
+            "last_save_dir": self.last_save_dir,
+        }
+        tmp = SUBS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(SUBS_FILE)
+
+    def is_subscribed(self, show: dict | None) -> bool:
+        if not show:
+            return False
+        feed = (show.get("feedUrl") or "").strip().lower()
+        sid = str(show.get("id") or "")
+        for s in self.subscriptions:
+            if feed and (s.get("feedUrl") or "").strip().lower() == feed:
+                return True
+            if sid and str(s.get("id") or "") == sid:
+                return True
+        return False
+
+    # ---------------- UI Construction ----------------
+    def _build_ui(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(vbox)
+
+        # 1. Menu Bar
+        mbar = Gtk.MenuBar()
+
+        m_file = Gtk.Menu()
+        mi_file = Gtk.MenuItem(label="Podcasts"); mi_file.set_submenu(m_file)
+        for lbl, cb in [
+            ("Add Podcast by RSS Feed URL...", self.on_add_rss_dialog),
+            ("Refresh Current Feed  (F5)",     lambda *_: self.on_refresh_current(force=True)),
+            ("Refresh All Subscriptions",      self.on_refresh_all_subs),
+            ("-", None),
+            ("Import OPML Subscriptions...",   self.on_import_opml),
+            ("Export Subscriptions (OPML)...", self.on_export_opml),
+            ("-", None),
+            ("Exit  (Ctrl+Q)",                 lambda *_: self.on_quit()),
+        ]:
+            if lbl == "-":
+                m_file.append(Gtk.SeparatorMenuItem())
+            else:
+                it = Gtk.MenuItem(label=lbl); it.connect("activate", cb); m_file.append(it)
+        mbar.append(mi_file)
+
+        m_ep = Gtk.Menu()
+        mi_ep = Gtk.MenuItem(label="Episode"); mi_ep.set_submenu(m_ep)
+        for lbl, cb in [
+            ("Play / Stream Selected Episode", lambda *_: self.play_selected_episode()),
+            ("Save Episode As... (Download)",  lambda *_: self.save_selected_episode_as()),
+            ("Mark Played / Unplayed",         lambda *_: self.toggle_selected_played()),
+            ("Copy Episode Audio URL",         lambda *_: self.copy_selected_url()),
+        ]:
+            it = Gtk.MenuItem(label=lbl); it.connect("activate", cb); m_ep.append(it)
+        mbar.append(mi_ep)
+
+        m_help = Gtk.Menu()
+        mi_help = Gtk.MenuItem(label="Help"); mi_help.set_submenu(m_help)
+        it_ab = Gtk.MenuItem(label="About dtPod...")
+        it_ab.connect("activate", self.on_about)
+        m_help.append(it_ab)
+        mbar.append(mi_help)
+        vbox.pack_start(mbar, False, False, 0)
+
+        # 2. Top Search & Discovery CDE Toolbar
+        tb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        tb.get_style_context().add_class("cde-toolbar")
+
+        tb.pack_start(Gtk.Label(label="Search Apple Podcasts:"), False, False, 2)
+        self.ent_search = Gtk.Entry()
+        self.ent_search.set_placeholder_text("Search shows, artists, hosts, or topics...")
+        self.ent_search.set_width_chars(30)
+        self.ent_search.connect("activate", self.on_search_submit)
+        tb.pack_start(self.ent_search, True, True, 0)
+
+        self.cmb_search_mode = Gtk.ComboBoxText()
+        self.cmb_search_mode.append("all", "All (Shows & Artists)")
+        self.cmb_search_mode.append("artist", "Artist / Creator")
+        self.cmb_search_mode.append("title", "Show Title")
+        self.cmb_search_mode.set_active_id("all")
+        tb.pack_start(self.cmb_search_mode, False, False, 0)
+
+        btn_search = Gtk.Button(label="🔍 Search")
+        btn_search.get_style_context().add_class("cde-accent")
+        btn_search.connect("clicked", self.on_search_submit)
+        tb.pack_start(btn_search, False, False, 0)
+
+        tb.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 3)
+
+        btn_top = Gtk.Button(label="🔥 Top Charts")
+        btn_top.set_tooltip_text("Browse Apple Podcasts Top 25 Chart")
+        btn_top.connect("clicked", self.on_load_top_shows)
+        tb.pack_start(btn_top, False, False, 0)
+
+        btn_rss = Gtk.Button(label="＋ RSS URL...")
+        btn_rss.set_tooltip_text("Subscribe directly via RSS feed URL")
+        btn_rss.connect("clicked", self.on_add_rss_dialog)
+        tb.pack_start(btn_rss, False, False, 0)
+
+        vbox.pack_start(tb, False, False, 0)
+
+        # 3. Main Horizontal Split: Left (Subscriptions / Search Results) | Right (Show + Episodes)
+        hpaned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        hpaned.set_position(310)
+        vbox.pack_start(hpaned, True, True, 0)
+
+        # --- Left Pane: Notebook with [My Subscriptions] and [Discover / Search] ---
+        left_frame = Gtk.Frame(margin=4)
+        self.left_nb = Gtk.Notebook()
+        left_frame.add(self.left_nb)
+
+        # Tab 0: Subscriptions
+        sub_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.subs_store = Gtk.ListStore(GdkPixbuf.Pixbuf, str, int)  # art, markup, index
+        self.subs_view = Gtk.TreeView(model=self.subs_store, headers_visible=False)
+        col_s_art = Gtk.TreeViewColumn("Art", Gtk.CellRendererPixbuf(), pixbuf=0)
+        r_s_txt = Gtk.CellRendererText()
+        r_s_txt.set_property("ellipsize", Pango.EllipsizeMode.END)
+        col_s_txt = Gtk.TreeViewColumn("Show", r_s_txt, markup=1)
+        col_s_txt.set_expand(True)
+        self.subs_view.append_column(col_s_art)
+        self.subs_view.append_column(col_s_txt)
+        self.subs_view.connect("cursor-changed", self._on_sub_selected)
+        self.subs_view.connect("button-press-event", self._on_sub_button_press)
+
+        sw_subs = Gtk.ScrolledWindow()
+        sw_subs.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw_subs.add(self.subs_view)
+        sub_vbox.pack_start(sw_subs, True, True, 0)
+
+        self.lbl_subs_tab = Gtk.Label(label="★ Subscribed (0)")
+        self.left_nb.append_page(sub_vbox, self.lbl_subs_tab)
+
+        # Tab 1: Discover / Search Results
+        disc_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.disc_store = Gtk.ListStore(GdkPixbuf.Pixbuf, str, int)  # art, markup, index
+        self.disc_view = Gtk.TreeView(model=self.disc_store, headers_visible=False)
+        col_d_art = Gtk.TreeViewColumn("Art", Gtk.CellRendererPixbuf(), pixbuf=0)
+        r_d_txt = Gtk.CellRendererText()
+        r_d_txt.set_property("ellipsize", Pango.EllipsizeMode.END)
+        col_d_txt = Gtk.TreeViewColumn("Result", r_d_txt, markup=1)
+        col_d_txt.set_expand(True)
+        self.disc_view.append_column(col_d_art)
+        self.disc_view.append_column(col_d_txt)
+        self.disc_view.connect("cursor-changed", self._on_disc_selected)
+        self.disc_view.connect("button-press-event", self._on_disc_button_press)
+
+        sw_disc = Gtk.ScrolledWindow()
+        sw_disc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw_disc.add(self.disc_view)
+        disc_vbox.pack_start(sw_disc, True, True, 0)
+
+        self.lbl_disc_tab = Gtk.Label(label="🌐 Discover")
+        self.left_nb.append_page(disc_vbox, self.lbl_disc_tab)
+        hpaned.pack1(left_frame, resize=False, shrink=False)
+
+        # --- Right Pane: Podcast Artwork Header Card + Episodes Greenbar List + Show Notes ---
+        right_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin=4)
+
+        # Show / Episode Header Card
+        hdr_frame = Gtk.Frame()
+        hdr_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        hdr_box.get_style_context().add_class("cde-header-card")
+
+        art_frame = Gtk.Frame()
+        self.img_header_art = Gtk.Image.new_from_pixbuf(self.placeholder_136)
+        ev_art = Gtk.EventBox()
+        ev_art.add(self.img_header_art)
+        ev_art.set_tooltip_text("Click to inspect full cover artwork")
+        ev_art.connect("button-press-event", self._on_header_art_clicked)
+        art_frame.add(ev_art)
+        hdr_box.pack_start(art_frame, False, False, 0)
+
+        meta_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.lbl_show_title = Gtk.Label(xalign=0)
+        self.lbl_show_title.set_markup("<span size='14000' weight='bold'>Welcome to dtPod</span>")
+        self.lbl_show_title.set_line_wrap(True)
+        self.lbl_show_title.set_max_width_chars(65)
+
+        self.lbl_show_artist = Gtk.Label(xalign=0)
+        self.lbl_show_artist.set_markup("<span>Search for your favorite shows or artists above, or browse Top Charts.</span>")
+        self.lbl_show_artist.set_ellipsize(Pango.EllipsizeMode.END)
+
+        self.lbl_show_desc = Gtk.Label(xalign=0, yalign=0)
+        self.lbl_show_desc.set_line_wrap(True)
+        self.lbl_show_desc.set_lines(3)
+        self.lbl_show_desc.set_ellipsize(Pango.EllipsizeMode.END)
+
+        act_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.btn_subscribe = Gtk.Button(label="★ Subscribe")
+        self.btn_subscribe.connect("clicked", self.on_toggle_subscribe)
+        self.btn_subscribe.set_sensitive(False)
+
+        self.btn_refresh = Gtk.Button(label="↻ Refresh Episodes")
+        self.btn_refresh.connect("clicked", lambda *_: self.on_refresh_current(force=True))
+        self.btn_refresh.set_sensitive(False)
+
+        self.btn_play_latest = Gtk.Button(label="▶ Play Selected")
+        self.btn_play_latest.connect("clicked", lambda *_: self.play_selected_episode())
+        self.btn_play_latest.set_sensitive(False)
+
+        self.btn_save_ep = Gtk.Button(label="💾 Save Episode As...")
+        self.btn_save_ep.set_tooltip_text("Download selected episode to disk (also available via Right-Click)")
+        self.btn_save_ep.connect("clicked", lambda *_: self.save_selected_episode_as())
+        self.btn_save_ep.set_sensitive(False)
+
+        self.ent_ep_filter = Gtk.Entry()
+        self.ent_ep_filter.set_placeholder_text("Filter episodes...")
+        self.ent_ep_filter.set_width_chars(16)
+        self.ent_ep_filter.connect("changed", lambda *_: self._populate_episodes_store())
+
+        act_hbox.pack_start(self.btn_subscribe, False, False, 0)
+        act_hbox.pack_start(self.btn_refresh, False, False, 0)
+        act_hbox.pack_start(self.btn_play_latest, False, False, 0)
+        act_hbox.pack_start(self.btn_save_ep, False, False, 0)
+        act_hbox.pack_end(self.ent_ep_filter, False, False, 0)
+
+        meta_vbox.pack_start(self.lbl_show_title, False, False, 0)
+        meta_vbox.pack_start(self.lbl_show_artist, False, False, 0)
+        meta_vbox.pack_start(self.lbl_show_desc, True, True, 0)
+        meta_vbox.pack_start(act_hbox, False, False, 2)
+
+        hdr_box.pack_start(meta_vbox, True, True, 0)
+        hdr_frame.add(hdr_box)
+        right_vbox.pack_start(hdr_frame, False, False, 0)
+
+        # Vertical Split: Episodes Greenbar Table (top) + Episode Show Notes (bottom)
+        vpaned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+        vpaned.set_position(315)
+
+        # Store columns:
+        # 0: status_icon (str), 1: title (str), 2: date (str), 3: duration (str),
+        # 4: size (str), 5: ep_index (int), 6: row_bg (str), 7: font_weight (int)
+        self.ep_store = Gtk.ListStore(str, str, str, str, str, int, str, int)
+        self.ep_view = Gtk.TreeView(model=self.ep_store)
+        self.ep_view.set_enable_search(True)
+        self.ep_view.set_search_column(1)
+
+        cols_spec = [
+            ("",              0, 36,  False, 0.5),
+            ("Episode Title", 1, 340, True,  0.0),
+            ("Published ▼",   2, 106, False, 0.0),
+            ("Duration",      3, 82,  False, 1.0),
+            ("Size",          4, 82,  False, 1.0),
+        ]
+        for title, cidx, min_w, expand, xal in cols_spec:
+            rend = Gtk.CellRendererText()
+            rend.set_property("xalign", xal)
+            if expand:
+                rend.set_property("ellipsize", Pango.EllipsizeMode.END)
+            col = Gtk.TreeViewColumn(title, rend, text=cidx, cell_background=6, weight=7)
+            col.set_min_width(min_w)
+            col.set_resizable(True)
+            col.set_expand(expand)
+            self.ep_view.append_column(col)
+
+        self.ep_view.connect("row-activated", self._on_ep_row_activated)
+        self.ep_view.connect("cursor-changed", self._on_ep_cursor_changed)
+        self.ep_view.connect("button-press-event", self._on_ep_button_press)
+
+        sw_eps = Gtk.ScrolledWindow()
+        sw_eps.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw_eps.add(self.ep_view)
+        fr_eps = Gtk.Frame()
+        fr_eps.add(sw_eps)
+        vpaned.pack1(fr_eps, resize=True, shrink=False)
+
+        # Episode Show Notes
+        fr_notes = Gtk.Frame()
+        notes_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.lbl_notes_hdr = Gtk.Label(
+            label="  Episode Show Notes  (Double-click an episode to stream, Right-click to Save As...)",
+            xalign=0,
+        )
+        self.lbl_notes_hdr.get_style_context().add_class("cde-toolbar")
+        self.txt_notes = Gtk.TextView(editable=False, cursor_visible=False, wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        self.txt_notes.set_left_margin(10)
+        self.txt_notes.set_right_margin(10)
+        self.txt_notes.set_top_margin(6)
+        self.txt_notes.set_bottom_margin(6)
+        sw_notes = Gtk.ScrolledWindow()
+        sw_notes.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw_notes.add(self.txt_notes)
+        notes_vbox.pack_start(self.lbl_notes_hdr, False, False, 0)
+        notes_vbox.pack_start(sw_notes, True, True, 0)
+        fr_notes.add(notes_vbox)
+        vpaned.pack2(fr_notes, resize=False, shrink=False)
+
+        right_vbox.pack_start(vpaned, True, True, 0)
+        hpaned.pack2(right_vbox, resize=True, shrink=False)
+
+        # 4. Bottom Audio Player Transport Deck
+        deck = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        deck.get_style_context().add_class("cde-player-deck")
+
+        fr_np = Gtk.Frame()
+        self.img_np_art = Gtk.Image.new_from_pixbuf(self.placeholder_48)
+        fr_np.add(self.img_np_art)
+        deck.pack_start(fr_np, False, False, 0)
+
+        np_meta = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        np_meta.set_size_request(220, -1)
+        self.lbl_np_title = Gtk.Label(label="Not Playing", xalign=0)
+        self.lbl_np_title.set_ellipsize(Pango.EllipsizeMode.END)
+        self.lbl_np_show = Gtk.Label(label="Select an episode to listen", xalign=0)
+        self.lbl_np_show.set_ellipsize(Pango.EllipsizeMode.END)
+        np_meta.pack_start(self.lbl_np_title, False, False, 0)
+        np_meta.pack_start(self.lbl_np_show, False, False, 0)
+        deck.pack_start(np_meta, False, False, 0)
+
+        btn_back15 = Gtk.Button(label="↺ 15s")
+        btn_back15.set_tooltip_text("Skip Back 15 Seconds")
+        btn_back15.connect("clicked", lambda *_: self.seek_relative(-15.0))
+        deck.pack_start(btn_back15, False, False, 0)
+
+        self.btn_play_pause = Gtk.Button(label="▶ Play")
+        self.btn_play_pause.get_style_context().add_class("cde-accent")
+        self.btn_play_pause.connect("clicked", self.on_play_pause_clicked)
+        deck.pack_start(self.btn_play_pause, False, False, 0)
+
+        btn_stop = Gtk.Button(label="⏹")
+        btn_stop.set_tooltip_text("Stop Playback")
+        btn_stop.connect("clicked", self.on_stop_clicked)
+        deck.pack_start(btn_stop, False, False, 0)
+
+        btn_fwd30 = Gtk.Button(label="30s ↻")
+        btn_fwd30.set_tooltip_text("Skip Forward 30 Seconds")
+        btn_fwd30.connect("clicked", lambda *_: self.seek_relative(30.0))
+        deck.pack_start(btn_fwd30, False, False, 0)
+
+        self.lbl_pos = Gtk.Label(label="00:00", xalign=1.0)
+        deck.pack_start(self.lbl_pos, False, False, 2)
+
+        self.sl_seek = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 100.0, 1.0)
+        self.sl_seek.set_draw_value(False)
+        self.sl_seek.set_hexpand(True)
+        self.sl_seek.connect("button-press-event", self._on_seek_press)
+        self.sl_seek.connect("button-release-event", self._on_seek_release)
+        deck.pack_start(self.sl_seek, True, True, 0)
+
+        self.lbl_dur = Gtk.Label(label="00:00", xalign=0.0)
+        deck.pack_start(self.lbl_dur, False, False, 2)
+
+        self.cmb_speed = Gtk.ComboBoxText()
+        for sp in ("0.75", "1.0", "1.25", "1.5", "1.75", "2.0"):
+            self.cmb_speed.append(sp, f"{sp}×")
+        self.cmb_speed.set_active_id("1.0")
+        self.cmb_speed.set_tooltip_text("Playback Speed")
+        self.cmb_speed.connect("changed", self._on_speed_changed)
+        deck.pack_start(self.cmb_speed, False, False, 0)
+
+        deck.pack_start(Gtk.Label(label="🔊"), False, False, 0)
+        self.sl_vol = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 1.0, 0.02)
+        self.sl_vol.set_draw_value(False)
+        self.sl_vol.set_size_request(85, -1)
+        self.sl_vol.set_value(0.85)
+        if self.player:
+            self.player.set_property("volume", 0.85)
+        self.sl_vol.connect("value-changed", lambda s: self.player and self.player.set_property("volume", s.get_value()))
+        deck.pack_start(self.sl_vol, False, False, 0)
+
+        vbox.pack_start(deck, False, False, 0)
+
+        # 5. Status Bar + Download Progress Bar
+        st = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        st.get_style_context().add_class("cde-status")
+        self.lbl_status = Gtk.Label(label="Ready — Public Apple Podcasts directory connected (no login required).", xalign=0)
+        self.lbl_status.set_ellipsize(Pango.EllipsizeMode.END)
+        st.pack_start(self.lbl_status, True, True, 0)
+
+        self.dl_prog = Gtk.ProgressBar()
+        self.dl_prog.set_size_request(180, -1)
+        self.dl_prog.set_show_text(True)
+        self.dl_prog.set_no_show_all(True)
+        st.pack_end(self.dl_prog, False, False, 0)
+
+        self.btn_cancel_dl = Gtk.Button(label="Cancel Download")
+        self.btn_cancel_dl.set_no_show_all(True)
+        self.btn_cancel_dl.connect("clicked", lambda *_: self._dl_cancel.set())
+        st.pack_end(self.btn_cancel_dl, False, False, 0)
+
+        vbox.pack_start(st, False, False, 0)
+
+        self.connect("key-press-event", self._on_key_press)
+        self.connect("delete-event", lambda *_: self.on_quit())
+        self.show_all()
+
+    def set_status(self, msg: str):
+        self.lbl_status.set_text(msg)
+
+    # ---------------- Subscriptions & Search Lists ----------------
+    def _refresh_subs_list(self):
+        self.subs_store.clear()
+        self.lbl_subs_tab.set_text(f"★ Subscribed ({len(self.subscriptions)})")
+        for i, sh in enumerate(self.subscriptions):
+            url = sh.get("artworkUrl") or ""
+            pb = self.art_cache.get_cached(url, 36) or self.placeholder_36
+            t = GLib.markup_escape_text(sh.get("title") or "Podcast")
+            a = GLib.markup_escape_text(sh.get("artist") or "")
+            mk = f"<b>{t}</b>\n<span size='small'>{a}</span>"
+            self.subs_store.append([pb, mk, i])
+            if url and pb is self.placeholder_36:
+                self.art_cache.fetch_async(url, 36, self._on_sub_thumb_ready)
+
+    def _on_sub_thumb_ready(self, url: str, pb: GdkPixbuf.Pixbuf):
+        for row in self.subs_store:
+            idx = row[2]
+            if 0 <= idx < len(self.subscriptions) and self.subscriptions[idx].get("artworkUrl") == url:
+                row[0] = pb
+
+    def _populate_disc_list(self, shows: list[dict]):
+        self.search_results = shows
+        self.disc_store.clear()
+        self.lbl_disc_tab.set_text(f"🌐 Discover ({len(shows)})")
+        for i, sh in enumerate(shows):
+            url = sh.get("artworkUrl") or ""
+            pb = self.art_cache.get_cached(url, 36) or self.placeholder_36
+            t = GLib.markup_escape_text(sh.get("title") or "Podcast")
+            a = GLib.markup_escape_text(sh.get("artist") or "")
+            g = GLib.markup_escape_text(sh.get("genre") or "")
+            mk = f"<b>{t}</b>\n<span size='small'>{a}" + (f"  •  {g}</span>" if g else "</span>")
+            self.disc_store.append([pb, mk, i])
+            if url and pb is self.placeholder_36:
+                self.art_cache.fetch_async(url, 36, self._on_disc_thumb_ready)
+
+    def _on_disc_thumb_ready(self, url: str, pb: GdkPixbuf.Pixbuf):
+        for row in self.disc_store:
+            idx = row[2]
+            if 0 <= idx < len(self.search_results) and self.search_results[idx].get("artworkUrl") == url:
+                row[0] = pb
+
+    def _on_sub_selected(self, view):
+        model, it = view.get_selection().get_selected()
+        if it is not None:
+            idx = model[it][2]
+            if 0 <= idx < len(self.subscriptions):
+                self.load_show(self.subscriptions[idx])
+
+    def _on_disc_selected(self, view):
+        model, it = view.get_selection().get_selected()
+        if it is not None:
+            idx = model[it][2]
+            if 0 <= idx < len(self.search_results):
+                self.load_show(self.search_results[idx])
+
+    def _on_sub_button_press(self, view, ev):
+        if ev.button == 3:
+            pth = view.get_path_at_pos(int(ev.x), int(ev.y))
+            if pth:
+                view.set_cursor(pth[0], None, False)
+                idx = self.subs_store[pth[0]][2]
+                if 0 <= idx < len(self.subscriptions):
+                    sh = self.subscriptions[idx]
+                    menu = Gtk.Menu()
+                    mi_ref = Gtk.MenuItem(label="↻ Refresh Show Feed")
+                    mi_ref.connect("activate", lambda *_: self.load_show(sh, force_refresh=True))
+                    mi_un = Gtk.MenuItem(label="✖ Unsubscribe from Show")
+                    mi_un.connect("activate", lambda *_: self._unsubscribe_show(sh))
+                    menu.append(mi_ref)
+                    menu.append(mi_un)
+                    menu.show_all()
+                    menu.popup_at_pointer(ev)
+                    return True
+        return False
+
+    def _on_disc_button_press(self, view, ev):
+        if ev.button == 3:
+            pth = view.get_path_at_pos(int(ev.x), int(ev.y))
+            if pth:
+                view.set_cursor(pth[0], None, False)
+                idx = self.disc_store[pth[0]][2]
+                if 0 <= idx < len(self.search_results):
+                    sh = self.search_results[idx]
+                    menu = Gtk.Menu()
+                    lbl = "✔ Unsubscribe" if self.is_subscribed(sh) else "★ Subscribe to Show"
+                    mi_sub = Gtk.MenuItem(label=lbl)
+                    mi_sub.connect("activate", lambda *_: self._toggle_sub_for(sh))
+                    menu.append(mi_sub)
+                    menu.show_all()
+                    menu.popup_at_pointer(ev)
+                    return True
+        return False
+
+    # ---------------- Search & Top Charts ----------------
+    def on_search_submit(self, *_args):
+        q = self.ent_search.get_text().strip()
+        if not q:
+            return
+        mode = self.cmb_search_mode.get_active_id() or "all"
+        self.left_nb.set_current_page(1)
+        self.set_status(f"Searching Apple Podcasts for '{q}'...")
+
+        def _worker():
+            try:
+                shows = search_apple_podcasts(q, mode)
+                GLib.idle_add(self._on_search_done, q, shows, None)
+            except Exception as exc:
+                GLib.idle_add(self._on_search_done, q, [], str(exc))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_search_done(self, q: str, shows: list[dict], err: str | None):
+        if err:
+            self.set_status(f"Search error: {err}")
+            return
+        self._populate_disc_list(shows)
+        self.set_status(f"Found {len(shows)} podcast(s) matching '{q}'.")
+        if shows and self.current_show is None:
+            self.load_show(shows[0])
+
+    def on_load_top_shows(self, *_args):
+        self.left_nb.set_current_page(1)
+        self.set_status("Loading Apple Podcasts Top 25 chart...")
+
+        def _worker():
+            try:
+                shows = fetch_top_apple_podcasts()
+                GLib.idle_add(self._on_top_done, shows, None)
+            except Exception as exc:
+                GLib.idle_add(self._on_top_done, [], str(exc))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_top_done(self, shows: list[dict], err: str | None):
+        if err:
+            self.set_status(f"Could not fetch Top Charts ({err}). Check internet connection.")
+            return
+        self._populate_disc_list(shows)
+        self.set_status(f"Loaded {len(shows)} Top Apple Podcasts.")
+        if shows and self.current_show is None:
+            self.load_show(shows[0])
+
+    # ---------------- Show Loading & RSS Fetching ----------------
+    def load_show(self, show: dict, force_refresh: bool = False):
+        feed_url = (show.get("feedUrl") or "").strip()
+        if not feed_url:
+            self.set_status("This podcast entry does not expose a public RSS feed URL.")
+            return
+
+        self.current_show = dict(show)
+        self._update_header_ui(self.current_show, None)
+
+        if not force_refresh and feed_url in self.feed_cache:
+            merged_show, eps = self.feed_cache[feed_url]
+            self.current_show.update(merged_show)
+            self.current_episodes = eps
+            self._update_header_ui(self.current_show, None)
+            self._populate_episodes_store()
+            self.set_status(f"Loaded {len(eps)} episodes for '{self.current_show.get('title')}'.")
+            return
+
+        self.ep_store.clear()
+        self.set_status(f"Fetching episodes from RSS feed for '{show.get('title')}'...")
+
+        def _worker():
+            try:
+                r = requests.get(feed_url, headers={"User-Agent": USER_AGENT}, timeout=18)
+                r.raise_for_status()
+                merged_show, eps = parse_podcast_rss(r.content, show)
+                GLib.idle_add(self._on_feed_loaded, feed_url, merged_show, eps, None)
+            except Exception as exc:
+                GLib.idle_add(self._on_feed_loaded, feed_url, show, [], str(exc))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_feed_loaded(self, feed_url: str, merged_show: dict, eps: list[dict], err: str | None):
+        if err:
+            self.set_status(f"Failed to load podcast feed: {err}")
+            return
+        self.feed_cache[feed_url] = (merged_show, eps)
+        # Update subscription metadata if subscribed
+        for s in self.subscriptions:
+            if (s.get("feedUrl") or "").strip() == feed_url:
+                for k in ("title", "artist", "artworkUrl", "description"):
+                    if merged_show.get(k) and not s.get(k):
+                        s[k] = merged_show[k]
+                self._save_state()
+                self._refresh_subs_list()
+                break
+
+        if self.current_show and (self.current_show.get("feedUrl") or "").strip() == feed_url:
+            self.current_show.update(merged_show)
+            self.current_episodes = eps
+            self._update_header_ui(self.current_show, None)
+            self._populate_episodes_store()
+            self.set_status(f"Loaded {len(eps)} episodes for '{self.current_show.get('title')}'. Right-click any episode to Save As.")
+
+    def _update_header_ui(self, show: dict, art_override_url: str | None):
+        t = GLib.markup_escape_text(show.get("title") or "Untitled Podcast")
+        a = GLib.markup_escape_text(show.get("artist") or "")
+        g = GLib.markup_escape_text(show.get("genre") or "")
+        self.lbl_show_title.set_markup(f"<span size='13500' weight='bold'>{t}</span>")
+        subline = f"<b>{a}</b>" + (f"   •   <span>{g}</span>" if g else "")
+        self.lbl_show_artist.set_markup(subline)
+        self.lbl_show_desc.set_text(show.get("description") or "")
+
+        self.btn_subscribe.set_sensitive(True)
+        self.btn_refresh.set_sensitive(True)
+        ctx = self.btn_subscribe.get_style_context()
+        if self.is_subscribed(show):
+            self.btn_subscribe.set_label("✔ Subscribed (Unsubscribe)")
+            ctx.add_class("cde-sub-active")
+        else:
+            self.btn_subscribe.set_label("★ Subscribe")
+            ctx.remove_class("cde-sub-active")
+
+        art_url = art_override_url or show.get("artworkUrl") or ""
+        self._active_header_art_url = art_url
+        pb = self.art_cache.get_cached(art_url, 136)
+        if pb:
+            self.img_header_art.set_from_pixbuf(pb)
+        else:
+            self.img_header_art.set_from_pixbuf(self.placeholder_136)
+            if art_url:
+                self.art_cache.fetch_async(art_url, 136, self._on_header_art_ready)
+
+    def _on_header_art_ready(self, url: str, pb: GdkPixbuf.Pixbuf):
+        if getattr(self, "_active_header_art_url", "") == url:
+            self.img_header_art.set_from_pixbuf(pb)
+
+    def _on_header_art_clicked(self, *_args):
+        url = getattr(self, "_active_header_art_url", "")
+        if not url:
+            return
+        h = hashlib.sha1(url.encode("utf-8")).hexdigest()
+        disk_p = CACHE_ART_DIR / f"{h}.png"
+        if disk_p.is_file():
+            dlg = Gtk.Dialog(title="Podcast Artwork — dtPod", transient_for=self, flags=0)
+            dlg.add_button("Close", Gtk.ResponseType.CLOSE)
+            try:
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(disk_p), 380, 380, True)
+                im = Gtk.Image.new_from_pixbuf(pb)
+                im.set_margin_top(10); im.set_margin_bottom(10); im.set_margin_start(10); im.set_margin_end(10)
+                dlg.get_content_area().add(im)
+            except Exception:
+                pass
+            dlg.show_all()
+            dlg.run()
+            dlg.destroy()
+
+    def _populate_episodes_store(self):
+        self.ep_store.clear()
+        filt = self.ent_ep_filter.get_text().strip().lower()
+        vis_row = 0
+        for idx, ep in enumerate(self.current_episodes):
+            if filt and filt not in ep["title"].lower() and filt not in ep["description"].lower():
+                continue
+            guid = ep["guid"]
+            playing_now = bool(self.playing_episode and self.playing_episode.get("guid") == guid)
+            saved_p = self.saved_files.get(guid)
+            has_local = bool(saved_p and Path(saved_p).is_file())
+            played = guid in self.played_guids
+
+            if playing_now:
+                icon = "🔊"
+            elif has_local:
+                icon = "💾"
+            elif not played:
+                icon = "●"
+            else:
+                icon = ""
+
+            bg = self.well_alt_hex if (vis_row % 2 == 1) else self.well_hex
+            weight = Pango.Weight.BOLD if (playing_now or not played) else Pango.Weight.NORMAL
+            self.ep_store.append([
+                icon,
+                ep["title"],
+                ep["date"],
+                ep["duration"],
+                ep["sizeHuman"],
+                idx,
+                bg,
+                int(weight),
+            ])
+            vis_row += 1
+
+        has_eps = len(self.ep_store) > 0
+        self.btn_play_latest.set_sensitive(has_eps)
+        self.btn_save_ep.set_sensitive(has_eps)
+        if has_eps:
+            self.ep_view.get_selection().select_path(Gtk.TreePath.new_first())
+            self._on_ep_cursor_changed(self.ep_view)
+
+    # ---------------- Subscribe / Unsubscribe / Add RSS / OPML ----------------
+    def on_toggle_subscribe(self, *_args):
+        if self.current_show:
+            self._toggle_sub_for(self.current_show)
+
+    def _toggle_sub_for(self, show: dict):
+        if self.is_subscribed(show):
+            self._unsubscribe_show(show)
+        else:
+            entry = {
+                "id": show.get("id") or hashlib.md5((show.get("feedUrl") or "").encode()).hexdigest()[:12],
+                "title": show.get("title") or "Podcast",
+                "artist": show.get("artist") or "",
+                "feedUrl": show.get("feedUrl") or "",
+                "artworkUrl": show.get("artworkUrl") or "",
+                "genre": show.get("genre") or "Podcast",
+                "description": show.get("description") or "",
+            }
+            self.subscriptions.insert(0, entry)
+            self._save_state()
+            self._refresh_subs_list()
+            if self.current_show and self.current_show.get("feedUrl") == entry["feedUrl"]:
+                self._update_header_ui(self.current_show, None)
+            self.set_status(f"Subscribed to '{entry['title']}'!")
+
+    def _unsubscribe_show(self, show: dict):
+        feed = (show.get("feedUrl") or "").strip().lower()
+        sid = str(show.get("id") or "")
+        self.subscriptions = [
+            s for s in self.subscriptions
+            if not ((feed and (s.get("feedUrl") or "").strip().lower() == feed) or (sid and str(s.get("id") or "") == sid))
+        ]
+        self._save_state()
+        self._refresh_subs_list()
+        if self.current_show:
+            self._update_header_ui(self.current_show, None)
+        self.set_status(f"Unsubscribed from '{show.get('title')}'.")
+
+    def on_refresh_current(self, force: bool = True):
+        if self.current_show:
+            self.load_show(self.current_show, force_refresh=force)
+
+    def on_refresh_all_subs(self, *_args):
+        if not self.subscriptions:
+            self.set_status("No subscribed podcasts to refresh.")
+            return
+        self.feed_cache.clear()
+        if self.current_show:
+            self.load_show(self.current_show, force_refresh=True)
+        self.set_status(f"Cleared feed cache for {len(self.subscriptions)} subscription(s).")
+
+    def on_add_rss_dialog(self, *_args):
+        dlg = Gtk.Dialog(title="Subscribe to Podcast RSS URL — dtPod", transient_for=self, flags=0)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Subscribe", Gtk.ResponseType.OK)
+        box = dlg.get_content_area()
+        box.set_spacing(8)
+        box.set_margin_top(12); box.set_margin_bottom(12); box.set_margin_start(12); box.set_margin_end(12)
+        box.pack_start(Gtk.Label(label="Enter public Podcast RSS/XML Feed URL:", xalign=0), False, False, 0)
+        ent = Gtk.Entry(width_chars=52)
+        ent.set_placeholder_text("https://example.com/podcast/feed.xml")
+        ent.connect("activate", lambda *_: dlg.response(Gtk.ResponseType.OK))
+        box.pack_start(ent, False, False, 0)
+        dlg.show_all()
+        if dlg.run() == Gtk.ResponseType.OK:
+            url = ent.get_text().strip()
+            dlg.destroy()
+            if url:
+                stub = {"id": hashlib.md5(url.encode()).hexdigest()[:12], "title": url, "artist": "", "feedUrl": url, "artworkUrl": ""}
+                self.load_show(stub, force_refresh=True)
+                GLib.timeout_add(900, lambda: (self._toggle_sub_for(self.current_show) if self.current_show and not self.is_subscribed(self.current_show) else None) or False)
+        else:
+            dlg.destroy()
+
+    def on_export_opml(self, *_args):
+        dlg = Gtk.FileChooserDialog(title="Export Subscriptions as OPML — dtPod", parent=self, action=Gtk.FileChooserAction.SAVE)
+        dlg.set_do_overwrite_confirmation(True)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Export", Gtk.ResponseType.OK)
+        dlg.set_current_name("dtPod_Subscriptions.opml")
+        if dlg.run() == Gtk.ResponseType.OK:
+            out_p = Path(dlg.get_filename())
+            dlg.destroy()
+            lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<opml version="2.0">', '  <head><title>dtPod Subscriptions</title></head>', '  <body>']
+            for s in self.subscriptions:
+                t = html.escape(s.get("title") or "Podcast", quote=True)
+                u = html.escape(s.get("feedUrl") or "", quote=True)
+                lines.append(f'    <outline type="rss" text="{t}" title="{t}" xmlUrl="{u}" />')
+            lines += ['  </body>', '</opml>']
+            out_p.write_text("\n".join(lines), encoding="utf-8")
+            self.set_status(f"Exported {len(self.subscriptions)} subscriptions to {out_p}")
+        else:
+            dlg.destroy()
+
+    def on_import_opml(self, *_args):
+        dlg = Gtk.FileChooserDialog(title="Import OPML Subscriptions — dtPod", parent=self, action=Gtk.FileChooserAction.OPEN)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Import", Gtk.ResponseType.OK)
+        if dlg.run() == Gtk.ResponseType.OK:
+            in_p = Path(dlg.get_filename())
+            dlg.destroy()
+            try:
+                root = ET.fromstring(in_p.read_text(encoding="utf-8", errors="replace"))
+                added = 0
+                for el in root.iter():
+                    xml_url = (el.attrib.get("xmlUrl") or el.attrib.get("xmlurl") or "").strip()
+                    if xml_url:
+                        title = (el.attrib.get("title") or el.attrib.get("text") or xml_url).strip()
+                        sh = {"id": hashlib.md5(xml_url.encode()).hexdigest()[:12], "title": title, "artist": "", "feedUrl": xml_url, "artworkUrl": ""}
+                        if not self.is_subscribed(sh):
+                            self.subscriptions.append(sh)
+                            added += 1
+                self._save_state()
+                self._refresh_subs_list()
+                self.set_status(f"Imported {added} new subscription(s) from {in_p.name}.")
+            except Exception as exc:
+                self.set_status(f"OPML import failed: {exc}")
+        else:
+            dlg.destroy()
+
+    # ---------------- Episode Selection, Playback & Right-Click Save As ----------------
+    def _get_selected_episode(self) -> dict | None:
+        model, it = self.ep_view.get_selection().get_selected()
+        if it is None:
+            return None
+        idx = model[it][5]
+        if 0 <= idx < len(self.current_episodes):
+            return self.current_episodes[idx]
+        return None
+
+    def _on_ep_cursor_changed(self, _view):
+        ep = self._get_selected_episode()
+        if not ep:
+            return
+        self.lbl_notes_hdr.set_text(f"  Episode Notes — {ep['title']}  ({ep['date']})")
+        self.txt_notes.get_buffer().set_text(ep.get("description") or "No episode notes provided.")
+        # Update header artwork if episode has custom artwork
+        ep_art = ep.get("artworkUrl")
+        if self.current_show and ep_art:
+            self._update_header_ui(self.current_show, ep_art)
+
+    def _on_ep_row_activated(self, _view, _path, _col):
+        self.play_selected_episode()
+
+    def _on_ep_button_press(self, view, ev):
+        if ev.button == 3:
+            pth = view.get_path_at_pos(int(ev.x), int(ev.y))
+            if pth:
+                view.set_cursor(pth[0], None, False)
+                ep = self._get_selected_episode()
+                if ep:
+                    menu = Gtk.Menu()
+                    mi_play = Gtk.MenuItem(label="▶ Play / Stream Episode")
+                    mi_play.connect("activate", lambda *_: self.play_episode(ep))
+                    menu.append(mi_play)
+
+                    mi_save = Gtk.MenuItem(label="💾 Save Episode As... (Download for Later)")
+                    mi_save.connect("activate", lambda *_: self.save_episode_as(ep))
+                    menu.append(mi_save)
+
+                    saved_p = self.saved_files.get(ep["guid"])
+                    if saved_p and Path(saved_p).is_file():
+                        mi_local = Gtk.MenuItem(label=f"📂 Play Downloaded File ({Path(saved_p).name})")
+                        mi_local.connect("activate", lambda *_: self.play_episode(ep, prefer_local=True))
+                        menu.append(mi_local)
+
+                    menu.append(Gtk.SeparatorMenuItem())
+                    mi_played = Gtk.MenuItem(label="✔ Toggle Played / Unplayed")
+                    mi_played.connect("activate", lambda *_: self.toggle_selected_played())
+                    menu.append(mi_played)
+
+                    mi_copy = Gtk.MenuItem(label="📋 Copy Audio Stream URL")
+                    mi_copy.connect("activate", lambda *_: self.copy_selected_url())
+                    menu.append(mi_copy)
+
+                    menu.show_all()
+                    menu.popup_at_pointer(ev)
+                    return True
+        return False
+
+    def play_selected_episode(self):
+        ep = self._get_selected_episode()
+        if ep:
+            self.play_episode(ep)
+
+    def play_episode(self, ep: dict, prefer_local: bool = True):
+        if not self.player:
+            self.set_status("GStreamer playbin unavailable.")
+            return
+        self.player.set_state(Gst.State.NULL)
+
+        local_p = self.saved_files.get(ep["guid"])
+        if prefer_local and local_p and Path(local_p).is_file():
+            uri = Path(local_p).resolve().as_uri()
+            src_note = f"local file ({Path(local_p).name})"
+        else:
+            uri = ep["audioUrl"]
+            src_note = "Apple Podcast stream"
+
+        self.playing_episode = ep
+        self.played_guids.add(ep["guid"])
+        self._save_state()
+        self._populate_episodes_store()
+
+        self.lbl_np_title.set_markup(f"<b>{GLib.markup_escape_text(ep['title'])}</b>")
+        self.lbl_np_show.set_text(ep.get("showTitle") or "")
+
+        art_url = ep.get("artworkUrl") or (self.current_show.get("artworkUrl") if self.current_show else "")
+        pb = self.art_cache.get_cached(art_url, 48)
+        self.img_np_art.set_from_pixbuf(pb or self.placeholder_48)
+        if art_url and not pb:
+            self.art_cache.fetch_async(art_url, 48, lambda _u, p: self.img_np_art.set_from_pixbuf(p))
+
+        self.player.set_property("uri", uri)
+        self.player.set_state(Gst.State.PLAYING)
+        self.is_playing = True
+        self.btn_play_pause.set_label("⏸ Pause")
+        self.set_status(f"Playing '{ep['title']}' via {src_note}...")
+
+    def save_selected_episode_as(self):
+        ep = self._get_selected_episode()
+        if ep:
+            self.save_episode_as(ep)
+
+    def save_episode_as(self, ep: dict):
+        if self._dl_active:
+            self.set_status("A podcast download is already in progress.")
+            return
+
+        # Guess extension from enclosure URL or MIME type
+        parsed_u = urllib.parse.urlparse(ep["audioUrl"])
+        ext = Path(parsed_u.path).suffix.lower()
+        if ext not in (".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac", ".mp4"):
+            mt = (ep.get("mimeType") or "").lower()
+            if "mp4" in mt or "m4a" in mt:
+                ext = ".m4a"
+            elif "ogg" in mt:
+                ext = ".ogg"
+            else:
+                ext = ".mp3"
+
+        show_part = sanitize_filename(ep.get("showTitle") or "Podcast")[:50]
+        ep_part = sanitize_filename(ep.get("title") or "Episode")[:85]
+        default_name = f"{show_part} - {ep_part}{ext}"
+
+        dlg = Gtk.FileChooserDialog(
+            title="Save Podcast Episode As — dtPod",
+            parent=self,
+            action=Gtk.FileChooserAction.SAVE,
+        )
+        dlg.set_do_overwrite_confirmation(True)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save Episode", Gtk.ResponseType.OK)
+        if Path(self.last_save_dir).is_dir():
+            dlg.set_current_folder(self.last_save_dir)
+        dlg.set_current_name(default_name)
+
+        if dlg.run() != Gtk.ResponseType.OK:
+            dlg.destroy()
+            return
+        dest_path = Path(dlg.get_filename())
+        dlg.destroy()
+
+        self.last_save_dir = str(dest_path.parent)
+        self._save_state()
+
+        self._dl_active = True
+        self._dl_cancel.clear()
+        self.dl_prog.set_fraction(0.0)
+        self.dl_prog.set_text("Starting...")
+        self.dl_prog.show()
+        self.btn_cancel_dl.show()
+        self.set_status(f"Downloading '{ep['title']}' -> {dest_path.name}...")
+
+        def _dl_worker():
+            part_path = dest_path.with_suffix(dest_path.suffix + ".part")
+            try:
+                with requests.get(ep["audioUrl"], headers={"User-Agent": USER_AGENT}, stream=True, timeout=25) as r:
+                    r.raise_for_status()
+                    total = int(r.headers.get("Content-Length") or ep.get("sizeBytes") or 0)
+                    done = 0
+                    last_ui = 0.0
+                    with open(part_path, "wb") as fh:
+                        for chunk in r.iter_content(chunk_size=65536):
+                            if self._dl_cancel.is_set():
+                                raise InterruptedError("Download cancelled by user.")
+                            if not chunk:
+                                continue
+                            fh.write(chunk)
+                            done += len(chunk)
+                            now = time.monotonic()
+                            if now - last_ui >= 0.12:
+                                last_ui = now
+                                frac = min(1.0, done / float(total)) if total > 0 else 0.0
+                                txt = f"{int(frac * 100)}% ({format_bytes(done)})" if total > 0 else format_bytes(done)
+                                GLib.idle_add(self._on_dl_progress, frac, txt)
+                part_path.replace(dest_path)
+                GLib.idle_add(self._on_dl_finished, ep, dest_path, None)
+            except Exception as exc:
+                part_path.unlink(missing_ok=True)
+                GLib.idle_add(self._on_dl_finished, ep, dest_path, str(exc))
+
+        threading.Thread(target=_dl_worker, daemon=True).start()
+
+    def _on_dl_progress(self, frac: float, txt: str):
+        if frac > 0:
+            self.dl_prog.set_fraction(frac)
+        else:
+            self.dl_prog.pulse()
+        self.dl_prog.set_text(txt)
+
+    def _on_dl_finished(self, ep: dict, dest_path: Path, err: str | None):
+        self._dl_active = False
+        self.dl_prog.hide()
+        self.btn_cancel_dl.hide()
+        if err:
+            self.set_status(f"Download stopped: {err}")
+        else:
+            self.saved_files[ep["guid"]] = str(dest_path)
+            self._save_state()
+            self._populate_episodes_store()
+            self.set_status(f"Saved episode to {dest_path}")
+
+    def toggle_selected_played(self):
+        ep = self._get_selected_episode()
+        if not ep:
+            return
+        g = ep["guid"]
+        if g in self.played_guids:
+            self.played_guids.discard(g)
+        else:
+            self.played_guids.add(g)
+        self._save_state()
+        self._populate_episodes_store()
+
+    def copy_selected_url(self):
+        ep = self._get_selected_episode()
+        if not ep:
+            return
+        cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        cb.set_text(ep["audioUrl"], -1)
+        cb.store()
+        self.set_status("Copied episode audio URL to clipboard.")
+
+    # ---------------- Player Controls & GStreamer Bus ----------------
+    def on_play_pause_clicked(self, *_args):
+        if not self.player:
+            return
+        if self.playing_episode is None:
+            self.play_selected_episode()
+            return
+        if self.is_playing:
+            self.player.set_state(Gst.State.PAUSED)
+            self.is_playing = False
+            self.btn_play_pause.set_label("▶ Play")
+        else:
+            self.player.set_state(Gst.State.PLAYING)
+            self.is_playing = True
+            self.btn_play_pause.set_label("⏸ Pause")
+            if abs(self.playback_rate - 1.0) > 0.01:
+                GLib.timeout_add(250, lambda: self._apply_playback_rate() or False)
+
+    def on_stop_clicked(self, *_args):
+        if self.player:
+            self.player.set_state(Gst.State.NULL)
+        self.is_playing = False
+        self.btn_play_pause.set_label("▶ Play")
+        self.sl_seek.set_value(0.0)
+        self.lbl_pos.set_text("00:00")
+
+    def seek_relative(self, delta_sec: float):
+        if not self.player or not self.playing_episode:
+            return
+        ok_p, pos_ns = self.player.query_position(Gst.Format.TIME)
+        ok_d, dur_ns = self.player.query_duration(Gst.Format.TIME)
+        if not ok_p:
+            return
+        target_ns = max(0, pos_ns + int(delta_sec * Gst.SECOND))
+        if ok_d and dur_ns > 0:
+            target_ns = min(dur_ns, target_ns)
+        self._seek_to_ns(target_ns)
+
+    def _seek_to_ns(self, target_ns: int):
+        if not self.player:
+            return
+        flags = Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT
+        if abs(self.playback_rate - 1.0) < 0.01:
+            self.player.seek_simple(Gst.Format.TIME, flags, target_ns)
+        else:
+            self.player.seek(
+                self.playback_rate,
+                Gst.Format.TIME,
+                flags,
+                Gst.SeekType.SET,
+                target_ns,
+                Gst.SeekType.NONE,
+                0,
+            )
+
+    def _apply_playback_rate(self):
+        if not self.player or not self.playing_episode:
+            return
+        ok_p, pos_ns = self.player.query_position(Gst.Format.TIME)
+        if ok_p:
+            self._seek_to_ns(pos_ns)
+
+    def _on_speed_changed(self, cmb):
+        try:
+            self.playback_rate = float(cmb.get_active_id() or "1.0")
+        except ValueError:
+            self.playback_rate = 1.0
+        self._apply_playback_rate()
+
+    def _on_seek_press(self, *_args):
+        self._seeking_slider = True
+        return False
+
+    def _on_seek_release(self, scale, _ev):
+        self._seeking_slider = False
+        if self.player and self.playing_episode:
+            ok_d, dur_ns = self.player.query_duration(Gst.Format.TIME)
+            if ok_d and dur_ns > 0:
+                frac = scale.get_value() / 100.0
+                self._seek_to_ns(int(dur_ns * frac))
+        return False
+
+    def _tick_timeline(self) -> bool:
+        if self.player and self.playing_episode and not self._seeking_slider:
+            ok_p, pos_ns = self.player.query_position(Gst.Format.TIME)
+            ok_d, dur_ns = self.player.query_duration(Gst.Format.TIME)
+            if ok_p and pos_ns >= 0:
+                pos_s = pos_ns / float(Gst.SECOND)
+                self.lbl_pos.set_text(format_seconds(pos_s))
+                if ok_d and dur_ns > 0:
+                    dur_s = dur_ns / float(Gst.SECOND)
+                    self.lbl_dur.set_text(format_seconds(dur_s))
+                    self.sl_seek.set_value(min(100.0, (pos_s / dur_s) * 100.0))
+        return True
+
+    def _on_gst_eos(self, _bus, _msg):
+        self.on_stop_clicked()
+        self.set_status("Finished playing episode.")
+
+    def _on_gst_error(self, _bus, msg):
+        err, _dbg = msg.parse_error()
+        self.on_stop_clicked()
+        self.set_status(f"Playback error: {err.message}")
+
+    def _on_gst_state(self, _bus, msg):
+        if msg.src == self.player:
+            _old, new_st, _pend = msg.parse_state_changed()
+            if new_st == Gst.State.PLAYING and abs(self.playback_rate - 1.0) > 0.01:
+                # Ensure chosen rate stays active
+                pass
+
+    # ---------------- Shortcuts, About & Quit ----------------
+    def _on_key_press(self, _w, ev):
+        ctrl = bool(ev.state & Gdk.ModifierType.CONTROL_MASK)
+        if ctrl and ev.keyval in (Gdk.KEY_q, Gdk.KEY_Q):
+            self.on_quit()
+            return True
+        if ctrl and ev.keyval in (Gdk.KEY_f, Gdk.KEY_F):
+            self.ent_search.grab_focus()
+            return True
+        if ev.keyval == Gdk.KEY_F5:
+            self.on_refresh_current(force=True)
+            return True
+        foc = self.get_focus()
+        if not isinstance(foc, Gtk.Entry) and ev.keyval == Gdk.KEY_space:
+            self.on_play_pause_clicked()
+            return True
+        return False
+
+    def on_about(self, *_args):
+        md = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text="dtPod — CDE Apple Podcast Browser & Player",
+        )
+        md.format_secondary_text(
+            "Native Common Desktop Environment podcast directory, subscriber & audio player.\n\n"
+            "• Powered by the public Apple Podcasts API & RSS feeds (no login required)\n"
+            "• Search by show title, artist/creator, or browse Apple Top Charts\n"
+            "• Subscribe to favorite shows, view high-res cover art & show notes\n"
+            "• Right-click any episode -> 'Save Episode As...' to download for offline listening"
+        )
+        md.run()
+        md.destroy()
+
+    def on_quit(self):
+        if self.player:
+            self.player.set_state(Gst.State.NULL)
+        self._dl_cancel.set()
+        self._save_state()
+        self.destroy()
+        Gtk.main_quit()
+        return False
+
+
+def main():
+    chrome, sel, well, well_alt = load_cde_palette()
+    prov = Gtk.CssProvider()
+    prov.load_from_data(build_cde_css(chrome, sel, well, well_alt))
+    scr = Gdk.Screen.get_default()
+    if scr is not None:
+        Gtk.StyleContext.add_provider_for_screen(scr, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    win = DtPodWindow()
+    win.connect("destroy", Gtk.main_quit)
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

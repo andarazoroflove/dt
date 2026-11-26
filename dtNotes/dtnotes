@@ -1,0 +1,1125 @@
+#!/usr/bin/env python3
+"""
+dtNotes — Common Desktop Environment (CDE) Rich Text, Markdown, & Plain Text Editor
+Replaces stock dtpad with multi-tab editing, native .rtf reading/writing, .md Markdown
+editing + live rendered preview, and crisp .txt / code editing (GtkSourceView 4).
+Styled natively to match CDE's active OSF/Motif palette.
+"""
+
+import html
+import os
+import re
+import subprocess
+import sys
+import urllib.parse
+from pathlib import Path
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("Pango", "1.0")
+gi.require_version("GtkSource", "4")
+gi.require_version("WebKit2", "4.1")
+from gi.repository import Gdk, GLib, Gtk, GtkSource, Pango, WebKit2
+
+HOME = Path.home()
+DT_ICONS = HOME / ".dt" / "icons"
+
+
+def load_cde_palette() -> tuple[str, str, str]:
+    chrome, sel, well = "#aeb2c3", "#2c567e", "#fff7e9"
+    try:
+        out = subprocess.check_output(["xrdb", "-query"], text=True, stderr=subprocess.DEVNULL)
+        pal_name = "Crimson.dp"
+        for ln in out.splitlines():
+            if "ColorPalette:" in ln:
+                pal_name = ln.split(":", 1)[1].strip()
+                break
+        for pdir in (HOME / ".dt/palettes", Path("/usr/dt/palettes")):
+            pf = pdir / pal_name
+            if pf.is_file():
+                hexes = [l.strip() for l in pf.read_text().splitlines() if l.strip().startswith("#")]
+                if len(hexes) >= 4:
+                    def norm16(h):
+                        h = h.lstrip("#")
+                        return f"#{h[0:2]}{h[4:6]}{h[8:10]}" if len(h) == 12 else "#" + h[:6]
+                    chrome, sel, well = norm16(hexes[1]), norm16(hexes[2]), norm16(hexes[3])
+                break
+    except Exception:
+        pass
+    return chrome, sel, well
+
+
+def build_cde_css(chrome: str, sel: str, well: str) -> bytes:
+    css = f"""
+    window, dialog, .background {{
+        background-color: {chrome};
+        color: #101014;
+        font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+        font-size: 10pt;
+    }}
+    menubar {{
+        background-color: {chrome};
+        border-bottom: 2px solid #585c6c;
+    }}
+    menuitem:hover {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    .cde-toolbar {{
+        background-color: {chrome};
+        padding: 4px 6px;
+        border-top: 2px solid #e6e9f2;
+        border-left: 2px solid #e6e9f2;
+        border-right: 2px solid #585c6c;
+        border-bottom: 2px solid #585c6c;
+    }}
+    .cde-status {{
+        background-color: {chrome};
+        padding: 3px 8px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+    }}
+    frame {{
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+        border-radius: 0px;
+    }}
+    button {{
+        background-image: none;
+        background-color: {chrome};
+        color: #101014;
+        border-top: 2px solid #e6e9f2;
+        border-left: 2px solid #e6e9f2;
+        border-right: 2px solid #565a69;
+        border-bottom: 2px solid #565a69;
+        border-radius: 0px;
+        padding: 3px 8px;
+        box-shadow: none;
+    }}
+    button:active, button:checked {{
+        border-top: 2px solid #565a69;
+        border-left: 2px solid #565a69;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+    }}
+    notebook header {{
+        background-color: #9ba0b2;
+    }}
+    notebook tab {{
+        background-color: {chrome};
+        border-top: 2px solid #e6e9f2;
+        border-left: 2px solid #e6e9f2;
+        border-right: 2px solid #565a69;
+        border-radius: 0px;
+        padding: 3px 9px;
+    }}
+    notebook tab:checked {{
+        background-color: {well};
+        font-weight: bold;
+    }}
+    textview, textview text, entry {{
+        background-color: {well};
+        color: #101014;
+        border-radius: 0px;
+    }}
+    """
+    return css.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Pure-Python RTF Parser & Writer (Supports Bold, Italic, Underline, Strike,
+# Headings/Sizes, Unicode \uN?, Windows-1252 \'hh escapes, Paragraphs)
+# ---------------------------------------------------------------------------
+SKIP_RTF_DESTS = {
+    "fonttbl", "colortbl", "stylesheet", "info", "pict", "object",
+    "header", "footer", "headerl", "headerr", "footerl", "footerr",
+    " listtable", "listtable", "listoverridetable", "rsidtbl", "generator",
+}
+
+
+def parse_rtf_to_runs(rtf_text: str) -> list[tuple[str, set[str]]]:
+    """Parse an RTF document into [(text_chunk, {tag_names}), ...]."""
+    runs: list[tuple[str, set[str]]] = []
+    buf: list[str] = []
+
+    state = {"b": False, "i": False, "ul": False, "strike": False, "fs": 24, "uc": 1, "skip": False}
+    stack: list[dict] = []
+
+    def current_tags() -> set[str]:
+        t = set()
+        if state["b"]:
+            t.add("bold")
+        if state["i"]:
+            t.add("italic")
+        if state["ul"]:
+            t.add("underline")
+        if state["strike"]:
+            t.add("strike")
+        fs = state["fs"]
+        if fs >= 38:
+            t.add("h1")
+        elif fs >= 30:
+            t.add("h2")
+        elif fs >= 26:
+            t.add("h3")
+        return t
+
+    cur_tags = current_tags()
+
+    def flush():
+        nonlocal cur_tags
+        if buf:
+            runs.append(("".join(buf), set(cur_tags)))
+            buf.clear()
+        cur_tags = current_tags()
+
+    n = len(rtf_text)
+    i = 0
+    star_pending = False
+
+    while i < n:
+        ch = rtf_text[i]
+        if ch == "{":
+            flush()
+            stack.append(dict(state))
+            i += 1
+            star_pending = False
+        elif ch == "}":
+            flush()
+            if stack:
+                state = stack.pop()
+            cur_tags = current_tags()
+            i += 1
+            star_pending = False
+        elif ch == "\\":
+            i += 1
+            if i >= n:
+                break
+            nxt = rtf_text[i]
+            if nxt in ("\\", "{", "}"):
+                if not state["skip"]:
+                    buf.append(nxt)
+                i += 1
+            elif nxt == "*":
+                star_pending = True
+                i += 1
+            elif nxt in ("\r", "\n"):
+                if not state["skip"]:
+                    buf.append("\n")
+                i += 1
+            elif nxt == "~":
+                if not state["skip"]:
+                    buf.append("\u00A0")
+                i += 1
+            elif nxt == "_":
+                if not state["skip"]:
+                    buf.append("-")
+                i += 1
+            elif nxt == "'" and i + 2 < n:
+                hex_s = rtf_text[i + 1 : i + 3]
+                i += 3
+                if not state["skip"]:
+                    try:
+                        bval = bytes([int(hex_s, 16)])
+                        buf.append(bval.decode("cp1252", errors="replace"))
+                    except ValueError:
+                        pass
+            elif nxt.isalpha():
+                m = re.match(r"([a-zA-Z]+)(-?\d+)? ?", rtf_text[i:])
+                if not m:
+                    i += 1
+                    continue
+                word = m.group(1)
+                num_s = m.group(2)
+                val = int(num_s) if num_s is not None else None
+                i += m.end()
+
+                if star_pending or word in SKIP_RTF_DESTS:
+                    state["skip"] = True
+                    star_pending = False
+                    continue
+                star_pending = False
+                if state["skip"]:
+                    continue
+
+                if word in ("par", "line", "sect", "page"):
+                    buf.append("\n")
+                elif word == "tab":
+                    buf.append("\t")
+                elif word in ("bullet",):
+                    buf.append("•")
+                elif word in ("endash",):
+                    buf.append("–")
+                elif word in ("emdash",):
+                    buf.append("—")
+                elif word in ("lquote",):
+                    buf.append("‘")
+                elif word in ("rquote",):
+                    buf.append("’")
+                elif word in ("ldblquote",):
+                    buf.append("“")
+                elif word in ("rdblquote",):
+                    buf.append("”")
+                elif word == "uc" and val is not None:
+                    state["uc"] = max(0, val)
+                elif word == "u" and val is not None:
+                    cp = val if val >= 0 else (val + 65536)
+                    try:
+                        buf.append(chr(cp))
+                    except ValueError:
+                        buf.append("?")
+                    # Skip uc fallback replacement chars in RTF
+                    skip_left = state["uc"]
+                    while skip_left > 0 and i < n:
+                        if rtf_text[i : i + 2] == "\\'" and i + 4 <= n:
+                            i += 4
+                        elif rtf_text[i] not in ("{", "}"):
+                            i += 1
+                        else:
+                            break
+                        skip_left -= 1
+                elif word == "plain":
+                    flush()
+                    state["b"] = state["i"] = state["ul"] = state["strike"] = False
+                    state["fs"] = 24
+                    cur_tags = current_tags()
+                elif word == "b":
+                    flush()
+                    state["b"] = (val != 0)
+                    cur_tags = current_tags()
+                elif word == "i":
+                    flush()
+                    state["i"] = (val != 0)
+                    cur_tags = current_tags()
+                elif word == "ul":
+                    flush()
+                    state["ul"] = (val != 0)
+                    cur_tags = current_tags()
+                elif word in ("ulnone", "ul0"):
+                    flush()
+                    state["ul"] = False
+                    cur_tags = current_tags()
+                elif word == "strike":
+                    flush()
+                    state["strike"] = (val != 0)
+                    cur_tags = current_tags()
+                elif word == "fs" and val is not None:
+                    flush()
+                    state["fs"] = val
+                    cur_tags = current_tags()
+            else:
+                i += 1
+        elif ch in ("\r", "\n"):
+            i += 1
+        else:
+            if not state["skip"]:
+                buf.append(ch)
+            i += 1
+
+    flush()
+    return runs
+
+
+def serialize_buffer_to_rtf(buf: Gtk.TextBuffer) -> str:
+    """Serialize Gtk.TextBuffer with formatting tags into standards-compliant RTF."""
+    out = [r"{\rtf1\ansi\deff0{\fonttbl{\f0 DejaVu Sans;}{\f1 DejaVu Sans Mono;}}\uc1\pard\f0\fs22 "]
+    it = buf.get_start_iter()
+    active: set[str] = set()
+
+    def tag_names_at(itr: Gtk.TextIter) -> set[str]:
+        return {t.get_property("name") for t in itr.get_tags() if t.get_property("name")}
+
+    while not it.is_end():
+        tags = tag_names_at(it)
+        if tags != active:
+            # Emit transitions cleanly
+            parts = [r"\plain\f0\fs22"]
+            if "mono" in tags:
+                parts.append(r"\f1")
+            if "h1" in tags:
+                parts.append(r"\b\fs38")
+            elif "h2" in tags:
+                parts.append(r"\b\fs30")
+            elif "h3" in tags:
+                parts.append(r"\b\fs26")
+            if "bold" in tags and "h1" not in tags and "h2" not in tags and "h3" not in tags:
+                parts.append(r"\b")
+            if "italic" in tags:
+                parts.append(r"\i")
+            if "underline" in tags:
+                parts.append(r"\ul")
+            if "strike" in tags:
+                parts.append(r"\strike")
+            out.append("".join(parts) + " ")
+            active = tags
+
+        ch = it.get_char()
+        if ch == "\n":
+            out.append("\\par\n")
+        elif ch == "\t":
+            out.append("\\tab ")
+        elif ch in ("\\", "{", "}"):
+            out.append("\\" + ch)
+        elif ord(ch) < 128:
+            out.append(ch)
+        else:
+            cp = ord(ch)
+            if cp <= 0xFFFF:
+                signed = cp if cp < 32768 else (cp - 65536)
+                out.append(f"\\u{signed}?")
+            else:
+                out.append("?")
+        it.forward_char()
+
+    out.append("}\n")
+    return "".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Lightweight Built-in Markdown -> HTML Renderer (for Live .md Preview)
+# ---------------------------------------------------------------------------
+def markdown_to_html(md_text: str, paper_hex: str = "#fff7e9") -> str:
+    lines = md_text.splitlines()
+    html_out = []
+    in_code = False
+    in_ul = False
+    in_ol = False
+
+    def inline_fmt(s: str) -> str:
+        s = html.escape(s)
+        s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+        s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
+        s = re.sub(r"__([^_]+)__", r"<strong>\1</strong>", s)
+        s = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", s)
+        s = re.sub(r"~~([^~]+)~~", r"<del>\1</del>", s)
+        s = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', s)
+        return s
+
+    def close_lists():
+        nonlocal in_ul, in_ol
+        if in_ul:
+            html_out.append("</ul>")
+            in_ul = False
+        if in_ol:
+            html_out.append("</ol>")
+            in_ol = False
+
+    for ln in lines:
+        if ln.strip().startswith("```"):
+            close_lists()
+            if not in_code:
+                html_out.append("<pre><code>")
+                in_code = True
+            else:
+                html_out.append("</code></pre>")
+                in_code = False
+            continue
+        if in_code:
+            html_out.append(html.escape(ln))
+            continue
+
+        stripped = ln.strip()
+        if not stripped:
+            close_lists()
+            continue
+
+        m_h = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if m_h:
+            close_lists()
+            lvl = len(m_h.group(1))
+            html_out.append(f"<h{lvl}>{inline_fmt(m_h.group(2))}</h{lvl}>")
+            continue
+
+        if re.match(r"^(\-{3,}|\*{3,}|_{3,})$", stripped):
+            close_lists()
+            html_out.append("<hr/>")
+            continue
+
+        if stripped.startswith(">"):
+            close_lists()
+            html_out.append(f"<blockquote>{inline_fmt(stripped.lstrip('> '))}</blockquote>")
+            continue
+
+        m_ul = re.match(r"^[\-\*\+]\s+(.*)$", stripped)
+        if m_ul:
+            if in_ol:
+                html_out.append("</ol>"); in_ol = False
+            if not in_ul:
+                html_out.append("<ul>"); in_ul = True
+            item_txt = m_ul.group(1)
+            if item_txt.startswith("[x] ") or item_txt.startswith("[X] "):
+                html_out.append(f"<li>☑ {inline_fmt(item_txt[4:])}</li>")
+            elif item_txt.startswith("[ ] "):
+                html_out.append(f"<li>☐ {inline_fmt(item_txt[4:])}</li>")
+            else:
+                html_out.append(f"<li>{inline_fmt(item_txt)}</li>")
+            continue
+
+        m_ol = re.match(r"^\d+\.\s+(.*)$", stripped)
+        if m_ol:
+            if in_ul:
+                html_out.append("</ul>"); in_ul = False
+            if not in_ol:
+                html_out.append("<ol>"); in_ol = True
+            html_out.append(f"<li>{inline_fmt(m_ol.group(1))}</li>")
+            continue
+
+        close_lists()
+        html_out.append(f"<p>{inline_fmt(stripped)}</p>")
+
+    close_lists()
+    if in_code:
+        html_out.append("</code></pre>")
+
+    body = "\n".join(html_out)
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"/>
+    <style>
+      body {{ background: {paper_hex}; color: #141418; font-family: "DejaVu Sans", sans-serif;
+              font-size: 11pt; line-height: 1.5; margin: 14px 18px; }}
+      h1, h2, h3 {{ color: #1e3d5c; border-bottom: 1px solid #b5bac9; padding-bottom: 3px; }}
+      code {{ background: #e6e4d8; padding: 1px 4px; font-family: "DejaVu Sans Mono", monospace; font-size: 10pt; }}
+      pre {{ background: #e6e4d8; padding: 10px; border: 1px solid #9aa0b2; overflow-x: auto; }}
+      pre code {{ background: none; padding: 0; }}
+      blockquote {{ border-left: 4px solid #2c567e; margin: 8px 0; padding: 2px 12px; color: #353a47; }}
+      a {{ color: #185abd; }}
+    </style></head><body>{body}</body></html>"""
+
+
+# ---------------------------------------------------------------------------
+# Editor Tab Component
+# ---------------------------------------------------------------------------
+class NoteTab(Gtk.Box):
+    def __init__(self, paper_hex: str, file_path: Path | None = None):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.paper_hex = paper_hex
+        self.file_path: Path | None = file_path
+        self.doc_mode: str = "txt"  # "txt", "md", "rtf"
+        self.modified: bool = False
+        self._loading: bool = False
+
+        self.lang_mgr = GtkSource.LanguageManager.get_default()
+        self.buf = GtkSource.Buffer()
+        self._init_rich_tags()
+
+        self.view = GtkSource.View.new_with_buffer(self.buf)
+        self.view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.view.set_show_line_numbers(False)
+        self.view.set_tab_width(4)
+        self.view.set_left_margin(8)
+        self.view.set_right_margin(8)
+        self.view.set_top_margin(6)
+        self.view.set_bottom_margin(6)
+
+        self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, wide_handle=True)
+        fr_ed = Gtk.Frame(margin=2)
+        sc_ed = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        sc_ed.add(self.view)
+        fr_ed.add(sc_ed)
+        self.paned.pack1(fr_ed, resize=True, shrink=False)
+
+        self.fr_prev = Gtk.Frame(label=" Markdown Preview ", margin=2)
+        self.webview = WebKit2.WebView()
+        self.webview.get_settings().set_enable_javascript(False)
+        self.fr_prev.add(self.webview)
+        self.paned.pack2(self.fr_prev, resize=True, shrink=False)
+
+        self.pack_start(self.paned, True, True, 0)
+        self.show_all()
+        self.fr_prev.hide()
+
+        self.buf.connect("changed", self._on_buf_changed)
+
+        if file_path and file_path.is_file():
+            self.load_from_disk(file_path)
+
+    def _init_rich_tags(self):
+        tt = self.buf.get_tag_table()
+        tt.add(Gtk.TextTag(name="bold", weight=Pango.Weight.BOLD))
+        tt.add(Gtk.TextTag(name="italic", style=Pango.Style.ITALIC))
+        tt.add(Gtk.TextTag(name="underline", underline=Pango.Underline.SINGLE))
+        tt.add(Gtk.TextTag(name="strike", strikethrough=True))
+        tt.add(Gtk.TextTag(name="mono", family="DejaVu Sans Mono"))
+        tt.add(Gtk.TextTag(name="h1", weight=Pango.Weight.BOLD, scale=1.65))
+        tt.add(Gtk.TextTag(name="h2", weight=Pango.Weight.BOLD, scale=1.35))
+        tt.add(Gtk.TextTag(name="h3", weight=Pango.Weight.BOLD, scale=1.15))
+
+    def load_from_disk(self, path: Path):
+        self._loading = True
+        try:
+            self.file_path = path.resolve()
+            ext = path.suffix.lower()
+            raw = path.read_bytes()
+            text = raw.decode("utf-8", errors="replace")
+
+            self.buf.set_text("")
+            if ext == ".rtf" or text.lstrip().startswith(r"{\rtf"):
+                self.doc_mode = "rtf"
+                self.buf.set_language(None)
+                self.buf.set_highlight_syntax(False)
+                # RTF files use cp1252/ascii container
+                rtf_s = raw.decode("latin-1", errors="replace")
+                runs = parse_rtf_to_runs(rtf_s)
+                end_it = self.buf.get_end_iter()
+                for chunk, tags in runs:
+                    if not chunk:
+                        continue
+                    if tags:
+                        self.buf.insert_with_tags_by_name(end_it, chunk, *tags)
+                    else:
+                        self.buf.insert(end_it, chunk)
+                    end_it = self.buf.get_end_iter()
+                self.fr_prev.hide()
+            elif ext in (".md", ".markdown"):
+                self.doc_mode = "md"
+                lang = self.lang_mgr.get_language("markdown")
+                self.buf.set_language(lang)
+                self.buf.set_highlight_syntax(bool(lang))
+                self.buf.set_text(text)
+                self.fr_prev.show()
+                self.paned.set_position(460)
+                self.refresh_md_preview()
+            else:
+                self.doc_mode = "txt"
+                lang = self.lang_mgr.guess_language(str(path), None)
+                self.buf.set_language(lang)
+                self.buf.set_highlight_syntax(bool(lang))
+                self.buf.set_text(text)
+                self.fr_prev.hide()
+
+            self.buf.place_cursor(self.buf.get_start_iter())
+            self.modified = False
+        finally:
+            self._loading = False
+
+    def save_to_disk(self, path: Path):
+        self.file_path = path.resolve()
+        ext = path.suffix.lower()
+        if ext == ".rtf":
+            self.doc_mode = "rtf"
+            rtf_out = serialize_buffer_to_rtf(self.buf)
+            path.write_text(rtf_out, encoding="ascii", errors="replace")
+        else:
+            if ext in (".md", ".markdown"):
+                self.doc_mode = "md"
+                lang = self.lang_mgr.get_language("markdown")
+                self.buf.set_language(lang)
+                self.buf.set_highlight_syntax(bool(lang))
+            else:
+                self.doc_mode = "txt"
+            start, end = self.buf.get_bounds()
+            txt = self.buf.get_text(start, end, True)
+            path.write_text(txt, encoding="utf-8")
+        self.modified = False
+
+    def refresh_md_preview(self):
+        if not self.fr_prev.get_visible():
+            return
+        start, end = self.buf.get_bounds()
+        md_txt = self.buf.get_text(start, end, True)
+        self.webview.load_html(markdown_to_html(md_txt, self.paper_hex), "file:///")
+
+    def _on_buf_changed(self, *_args):
+        if self._loading:
+            return
+        self.modified = True
+        if self.fr_prev.get_visible():
+            self.refresh_md_preview()
+
+    def title_label(self) -> str:
+        name = self.file_path.name if self.file_path else "Untitled.txt"
+        return ("* " + name) if self.modified else name
+
+
+# ---------------------------------------------------------------------------
+# Main dtNotes Window
+# ---------------------------------------------------------------------------
+class DtNotesWindow(Gtk.Window):
+    def __init__(self, initial_files: list[Path], paper_hex: str):
+        super().__init__(title="dtNotes — CDE Rich Text, Markdown & Text Editor")
+        self.set_wmclass("dtnotes", "DtNotes")
+        self.set_default_size(940, 660)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.paper_hex = paper_hex
+        self.font_pt = 11
+
+        ic = DT_ICONS / "dtnotes.l.pm"
+        if ic.is_file():
+            try:
+                self.set_icon_from_file(str(ic))
+            except Exception:
+                pass
+
+        accel = Gtk.AccelGroup()
+        self.add_accel_group(accel)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(vbox)
+
+        # 1. Menu Bar
+        mbar = Gtk.MenuBar()
+        m_file = Gtk.Menu()
+        mi_file = Gtk.MenuItem(label="File")
+        mi_file.set_submenu(m_file)
+        for lbl, key, mod, cb in [
+            ("New Tab", Gdk.KEY_t, Gdk.ModifierType.CONTROL_MASK, self.on_new_tab),
+            ("Open...", Gdk.KEY_o, Gdk.ModifierType.CONTROL_MASK, self.on_open),
+            ("Save", Gdk.KEY_s, Gdk.ModifierType.CONTROL_MASK, self.on_save),
+            ("Save As (.txt / .md / .rtf)...", Gdk.KEY_s, Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK, self.on_save_as),
+            ("-", None, 0, None),
+            ("Close Tab", Gdk.KEY_w, Gdk.ModifierType.CONTROL_MASK, self.on_close_tab),
+            ("Exit", Gdk.KEY_q, Gdk.ModifierType.CONTROL_MASK, lambda *_: self.destroy()),
+        ]:
+            if lbl == "-":
+                m_file.append(Gtk.SeparatorMenuItem())
+            else:
+                it = Gtk.MenuItem(label=lbl)
+                it.connect("activate", cb)
+                if key:
+                    it.add_accelerator("activate", accel, key, mod, Gtk.AccelFlags.VISIBLE)
+                m_file.append(it)
+        mbar.append(mi_file)
+
+        m_edit = Gtk.Menu()
+        mi_edit = Gtk.MenuItem(label="Edit")
+        mi_edit.set_submenu(m_edit)
+        for lbl, key, mod, cb in [
+            ("Undo", Gdk.KEY_z, Gdk.ModifierType.CONTROL_MASK, self.on_undo),
+            ("Redo", Gdk.KEY_y, Gdk.ModifierType.CONTROL_MASK, self.on_redo),
+            ("-", None, 0, None),
+            ("Find & Replace...", Gdk.KEY_f, Gdk.ModifierType.CONTROL_MASK, self.on_toggle_find),
+        ]:
+            if lbl == "-":
+                m_edit.append(Gtk.SeparatorMenuItem())
+            else:
+                it = Gtk.MenuItem(label=lbl)
+                it.connect("activate", cb)
+                if key:
+                    it.add_accelerator("activate", accel, key, mod, Gtk.AccelFlags.VISIBLE)
+                m_edit.append(it)
+        mbar.append(mi_edit)
+
+        m_view = Gtk.Menu()
+        mi_view = Gtk.MenuItem(label="View")
+        mi_view.set_submenu(m_view)
+        for lbl, key, mod, cb in [
+            ("Toggle Markdown Preview", Gdk.KEY_p, Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK, self.on_toggle_md_preview),
+            ("Toggle Line Numbers", Gdk.KEY_l, Gdk.ModifierType.CONTROL_MASK, self.on_toggle_lines),
+            ("Toggle Word Wrap", None, 0, self.on_toggle_wrap),
+            ("-", None, 0, None),
+            ("Zoom In", Gdk.KEY_plus, Gdk.ModifierType.CONTROL_MASK, lambda *_: self._zoom(1)),
+            ("Zoom Out", Gdk.KEY_minus, Gdk.ModifierType.CONTROL_MASK, lambda *_: self._zoom(-1)),
+        ]:
+            if lbl == "-":
+                m_view.append(Gtk.SeparatorMenuItem())
+            else:
+                it = Gtk.MenuItem(label=lbl)
+                it.connect("activate", cb)
+                if key:
+                    it.add_accelerator("activate", accel, key, mod, Gtk.AccelFlags.VISIBLE)
+                m_view.append(it)
+        mbar.append(mi_view)
+
+        m_help = Gtk.Menu()
+        mi_help = Gtk.MenuItem(label="Help")
+        mi_help.set_submenu(m_help)
+        it_ab = Gtk.MenuItem(label="About dtNotes...")
+        it_ab.connect("activate", self.on_about)
+        m_help.append(it_ab)
+        mbar.append(mi_help)
+        vbox.pack_start(mbar, False, False, 0)
+
+        # 2. CDE Formatting & File Toolbar
+        tbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        tbar.get_style_context().add_class("cde-toolbar")
+        for lbl, tip, cb in [
+            ("New", "New document tab (Ctrl+T)", self.on_new_tab),
+            ("Open...", "Open .txt, .md, or .rtf (Ctrl+O)", self.on_open),
+            ("Save", "Save current document (Ctrl+S)", self.on_save),
+            ("Save As...", "Save as .txt, .md, or .rtf", self.on_save_as),
+        ]:
+            b = Gtk.Button(label=lbl)
+            b.set_tooltip_text(tip)
+            b.connect("clicked", cb)
+            tbar.pack_start(b, False, False, 0)
+
+        tbar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 3)
+
+        # Rich / Markdown Formatting Buttons
+        for lbl, tag, tip in [
+            ("B", "bold", "Bold (.rtf rich tag / .md **bold**)"),
+            ("I", "italic", "Italic (.rtf rich tag / .md *italic*)"),
+            ("U", "underline", "Underline (.rtf rich tag)"),
+            ("H1", "h1", "Heading 1"),
+            ("H2", "h2", "Heading 2"),
+            ("Mono", "mono", "Monospace / Code"),
+        ]:
+            b = Gtk.Button(label=lbl)
+            b.set_tooltip_text(tip)
+            b.connect("clicked", lambda _b, tg=tag: self.apply_format(tg))
+            tbar.pack_start(b, False, False, 0)
+
+        tbar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 3)
+
+        b_md = Gtk.Button(label="MD Preview")
+        b_md.set_tooltip_text("Toggle live side-by-side Markdown preview")
+        b_md.connect("clicked", self.on_toggle_md_preview)
+        tbar.pack_start(b_md, False, False, 0)
+
+        b_ln = Gtk.Button(label="Line #")
+        b_ln.connect("clicked", self.on_toggle_lines)
+        tbar.pack_start(b_ln, False, False, 0)
+
+        b_fnd = Gtk.Button(label="Find / Replace")
+        b_fnd.connect("clicked", self.on_toggle_find)
+        tbar.pack_end(b_fnd, False, False, 0)
+        vbox.pack_start(tbar, False, False, 0)
+
+        # 3. Collapsible Find & Replace Bar
+        self.find_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5, margin=4)
+        self.find_bar.pack_start(Gtk.Label(label="Find:"), False, False, 2)
+        self.ent_find = Gtk.Entry(width_chars=18)
+        self.ent_find.connect("activate", self.on_find_next)
+        self.find_bar.pack_start(self.ent_find, False, False, 0)
+        b_fn = Gtk.Button(label="Find Next")
+        b_fn.connect("clicked", self.on_find_next)
+        self.find_bar.pack_start(b_fn, False, False, 0)
+
+        self.find_bar.pack_start(Gtk.Label(label="Replace:"), False, False, 4)
+        self.ent_repl = Gtk.Entry(width_chars=18)
+        self.find_bar.pack_start(self.ent_repl, False, False, 0)
+        b_rp = Gtk.Button(label="Replace")
+        b_rp.connect("clicked", self.on_replace_one)
+        b_ra = Gtk.Button(label="Replace All")
+        b_ra.connect("clicked", self.on_replace_all)
+        b_fx = Gtk.Button(label="✕")
+        b_fx.connect("clicked", self.on_toggle_find)
+        self.find_bar.pack_start(b_rp, False, False, 0)
+        self.find_bar.pack_start(b_ra, False, False, 0)
+        self.find_bar.pack_end(b_fx, False, False, 0)
+        vbox.pack_start(self.find_bar, False, False, 0)
+
+        # 4. Multi-Tab Notebook
+        self.nb = Gtk.Notebook(scrollable=True)
+        self.nb.connect("switch-page", lambda *_: self._refresh_status())
+        vbox.pack_start(self.nb, True, True, 0)
+
+        # 5. Status Bar
+        st = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        st.get_style_context().add_class("cde-status")
+        self.lbl_status = Gtk.Label(label="Ready", xalign=0)
+        self.lbl_mode = Gtk.Label(label="Format: TXT", xalign=1)
+        st.pack_start(self.lbl_status, True, True, 0)
+        st.pack_end(self.lbl_mode, False, False, 0)
+        vbox.pack_start(st, False, False, 0)
+
+        # Drag-and-drop file opening
+        targets = [
+            Gtk.TargetEntry.new("text/uri-list", 0, 0),
+            Gtk.TargetEntry.new("text/plain", 0, 1),
+            Gtk.TargetEntry.new("STRING", 0, 2),
+        ]
+        self.drag_dest_set(Gtk.DestDefaults.ALL, targets, Gdk.DragAction.COPY)
+        self.connect("drag-data-received", self._on_drop)
+
+        self.show_all()
+        self.find_bar.hide()
+
+        if initial_files:
+            for fp in initial_files:
+                self.add_tab(fp)
+        else:
+            self.add_tab(None)
+
+    def _on_drop(self, _w, context, _x, _y, data, _info, time_):
+        opened = False
+        for u in (data.get_uris() or []):
+            if u.startswith("file://"):
+                p = Path(urllib.parse.unquote(urllib.parse.urlparse(u).path))
+                if p.is_file():
+                    self.add_tab(p)
+                    opened = True
+        if not opened:
+            for ln in (data.get_text() or "").splitlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                p = Path(urllib.parse.unquote(urllib.parse.urlparse(ln).path)) if ln.startswith("file://") else Path(ln)
+                if p.is_file():
+                    self.add_tab(p)
+                    opened = True
+        Gtk.drag_finish(context, opened, False, time_)
+
+    def add_tab(self, file_path: Path | None):
+        tab = NoteTab(self.paper_hex, file_path)
+        lbl = Gtk.Label(label=tab.title_label())
+        idx = self.nb.append_page(tab, lbl)
+        self.nb.show_all()
+        if tab.doc_mode != "md":
+            tab.fr_prev.hide()
+        self.nb.set_current_page(idx)
+        tab.buf.connect("changed", lambda _b, t=tab, l=lbl: (l.set_text(t.title_label()), self._refresh_status()))
+        tab.buf.connect("mark-set", lambda *_: self._refresh_status())
+        self._apply_editor_font(tab)
+        self._refresh_status()
+
+    def cur_tab(self) -> NoteTab | None:
+        idx = self.nb.get_current_page()
+        return self.nb.get_nth_page(idx) if idx >= 0 else None
+
+    def _refresh_status(self):
+        t = self.cur_tab()
+        if not t:
+            return
+        lines = t.buf.get_line_count()
+        chars = t.buf.get_char_count()
+        it = t.buf.get_iter_at_mark(t.buf.get_insert())
+        ln = it.get_line() + 1
+        col = it.get_line_offset() + 1
+        p_str = str(t.file_path) if t.file_path else "Unsaved Document"
+        self.lbl_status.set_text(f"Ln {ln}, Col {col}  |  {lines} lines, {chars} chars  |  {p_str}")
+        self.lbl_mode.set_text(f"Mode: {t.doc_mode.upper()}")
+        self.set_title(f"{t.title_label()} — dtNotes")
+
+    def on_new_tab(self, *_args):
+        self.add_tab(None)
+
+    def on_open(self, *_args):
+        dlg = Gtk.FileChooserDialog(title="Open Document — dtNotes", parent=self, action=Gtk.FileChooserAction.OPEN)
+        dlg.set_select_multiple(True)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Open", Gtk.ResponseType.OK)
+        flt = Gtk.FileFilter()
+        flt.set_name("Documents & Text (*.rtf, *.md, *.txt, *.*)")
+        for p in ("*.rtf", "*.RTF", "*.md", "*.MD", "*.markdown", "*.txt", "*.TXT", "*.log", "*.conf", "*.ini", "*.csv"):
+            flt.add_pattern(p)
+        dlg.add_filter(flt)
+        flt_all = Gtk.FileFilter()
+        flt_all.set_name("All Files")
+        flt_all.add_pattern("*")
+        dlg.add_filter(flt_all)
+        if dlg.run() == Gtk.ResponseType.OK:
+            for fn in dlg.get_filenames():
+                p = Path(fn)
+                # Reuse single empty untitled tab if unmodified
+                cur = self.cur_tab()
+                if cur and not cur.file_path and not cur.modified and cur.buf.get_char_count() == 0:
+                    cur.load_from_disk(p)
+                    self.nb.set_tab_label_text(cur, cur.title_label())
+                    self._refresh_status()
+                else:
+                    self.add_tab(p)
+        dlg.destroy()
+
+    def on_save(self, *_args):
+        t = self.cur_tab()
+        if not t:
+            return
+        if not t.file_path:
+            self.on_save_as()
+            return
+        try:
+            t.save_to_disk(t.file_path)
+            self.nb.set_tab_label_text(t, t.title_label())
+            self._refresh_status()
+        except Exception as exc:
+            self._error(f"Failed to save '{t.file_path}':\n{exc}")
+
+    def on_save_as(self, *_args):
+        t = self.cur_tab()
+        if not t:
+            return
+        dlg = Gtk.FileChooserDialog(title="Save Document As (.txt, .md, or .rtf) — dtNotes", parent=self, action=Gtk.FileChooserAction.SAVE)
+        dlg.set_do_overwrite_confirmation(True)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save", Gtk.ResponseType.OK)
+        if t.file_path:
+            dlg.set_current_folder(str(t.file_path.parent))
+            dlg.set_current_name(t.file_path.name)
+        else:
+            ext = ".rtf" if t.doc_mode == "rtf" else (".md" if t.doc_mode == "md" else ".txt")
+            dlg.set_current_name(f"notes{ext}")
+        if dlg.run() == Gtk.ResponseType.OK:
+            dest = Path(dlg.get_filename())
+            dlg.destroy()
+            try:
+                t.save_to_disk(dest)
+                self.nb.set_tab_label_text(t, t.title_label())
+                self._refresh_status()
+            except Exception as exc:
+                self._error(f"Save As failed:\n{exc}")
+        else:
+            dlg.destroy()
+
+    def on_close_tab(self, *_args):
+        if self.nb.get_n_pages() <= 1:
+            self.destroy()
+        else:
+            self.nb.remove_page(self.nb.get_current_page())
+
+    def on_undo(self, *_args):
+        t = self.cur_tab()
+        if t and t.buf.can_undo():
+            t.buf.undo()
+
+    def on_redo(self, *_args):
+        t = self.cur_tab()
+        if t and t.buf.can_redo():
+            t.buf.redo()
+
+    def apply_format(self, tag_name: str):
+        t = self.cur_tab()
+        if not t:
+            return
+        bounds = t.buf.get_selection_bounds()
+        if t.doc_mode == "md":
+            # Insert clean Markdown syntax around selection
+            md_map = {
+                "bold": ("**", "**"),
+                "italic": ("*", "*"),
+                "underline": ("<u>", "</u>"),
+                "mono": ("`", "`"),
+                "h1": ("# ", ""),
+                "h2": ("## ", ""),
+            }
+            pre, suf = md_map.get(tag_name, ("", ""))
+            if bounds:
+                s, e = bounds
+                sel_txt = t.buf.get_text(s, e, True)
+                t.buf.delete(s, e)
+                t.buf.insert(s, f"{pre}{sel_txt}{suf}")
+            else:
+                t.buf.insert_at_cursor(f"{pre}{suf}")
+            return
+
+        # Rich tag mode (auto-switches untitled plain buffer to RTF-capable formatting)
+        if not t.file_path and t.doc_mode == "txt":
+            t.doc_mode = "rtf"
+        if bounds:
+            s, e = bounds
+            tag = t.buf.get_tag_table().lookup(tag_name)
+            if tag:
+                if s.has_tag(tag):
+                    t.buf.remove_tag(tag, s, e)
+                else:
+                    t.buf.apply_tag(tag, s, e)
+        self._refresh_status()
+
+    def on_toggle_md_preview(self, *_args):
+        t = self.cur_tab()
+        if not t:
+            return
+        if t.fr_prev.get_visible():
+            t.fr_prev.hide()
+        else:
+            t.fr_prev.show()
+            t.paned.set_position(max(320, self.get_allocated_width() // 2))
+            t.refresh_md_preview()
+
+    def on_toggle_lines(self, *_args):
+        t = self.cur_tab()
+        if t:
+            t.view.set_show_line_numbers(not t.view.get_show_line_numbers())
+
+    def on_toggle_wrap(self, *_args):
+        t = self.cur_tab()
+        if t:
+            cur = t.view.get_wrap_mode()
+            t.view.set_wrap_mode(Gtk.WrapMode.NONE if cur != Gtk.WrapMode.NONE else Gtk.WrapMode.WORD_CHAR)
+
+    def _zoom(self, delta: int):
+        self.font_pt = max(8, min(26, self.font_pt + delta))
+        for i in range(self.nb.get_n_pages()):
+            self._apply_editor_font(self.nb.get_nth_page(i))
+
+    def _apply_editor_font(self, tab: NoteTab):
+        desc = Pango.FontDescription(f"DejaVu Sans {self.font_pt}")
+        tab.view.override_font(desc)
+
+    def on_toggle_find(self, *_args):
+        if self.find_bar.get_visible():
+            self.find_bar.hide()
+        else:
+            self.find_bar.show()
+            self.ent_find.grab_focus()
+
+    def on_find_next(self, *_args):
+        t = self.cur_tab()
+        q = self.ent_find.get_text()
+        if not t or not q:
+            return
+        bounds = t.buf.get_selection_bounds()
+        start = bounds[1] if bounds else t.buf.get_iter_at_mark(t.buf.get_insert())
+        res = start.forward_search(q, Gtk.TextSearchFlags.CASE_INSENSITIVE, None)
+        if not res:
+            res = t.buf.get_start_iter().forward_search(q, Gtk.TextSearchFlags.CASE_INSENSITIVE, None)
+        if res:
+            ms, me = res
+            t.buf.select_range(ms, me)
+            t.view.scroll_to_iter(ms, 0.15, False, 0.0, 0.0)
+
+    def on_replace_one(self, *_args):
+        t = self.cur_tab()
+        q = self.ent_find.get_text()
+        rep = self.ent_repl.get_text()
+        if not t or not q:
+            return
+        bounds = t.buf.get_selection_bounds()
+        if bounds and t.buf.get_text(bounds[0], bounds[1], True).lower() == q.lower():
+            t.buf.delete(bounds[0], bounds[1])
+            t.buf.insert(bounds[0], rep)
+        self.on_find_next()
+
+    def on_replace_all(self, *_args):
+        t = self.cur_tab()
+        q = self.ent_find.get_text()
+        rep = self.ent_repl.get_text()
+        if not t or not q:
+            return
+        it = t.buf.get_start_iter()
+        while True:
+            res = it.forward_search(q, Gtk.TextSearchFlags.CASE_INSENSITIVE, None)
+            if not res:
+                break
+            ms, me = res
+            t.buf.delete(ms, me)
+            t.buf.insert(ms, rep)
+            it = ms
+
+    def on_about(self, *_args):
+        md = Gtk.MessageDialog(
+            transient_for=self, flags=0, message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK, text="dtNotes — CDE Rich Text, Markdown & Text Editor",
+        )
+        md.format_secondary_text(
+            "Native CDE replacement for dtpad supporting .rtf (Rich Text), .md (Markdown + Live Preview), and .txt / code files."
+        )
+        md.run()
+        md.destroy()
+
+    def _error(self, msg: str):
+        md = Gtk.MessageDialog(transient_for=self, flags=0, message_type=Gtk.MessageType.ERROR,
+                               buttons=Gtk.ButtonsType.OK, text=msg)
+        md.run()
+        md.destroy()
+
+
+def main():
+    chrome, sel, well = load_cde_palette()
+    provider = Gtk.CssProvider()
+    provider.load_from_data(build_cde_css(chrome, sel, well))
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+    )
+
+    init_files = [Path(a).expanduser().resolve() for a in sys.argv[1:] if Path(a).expanduser().is_file()]
+    win = DtNotesWindow(init_files, well)
+    win.connect("destroy", Gtk.main_quit)
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

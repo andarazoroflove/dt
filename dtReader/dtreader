@@ -1,0 +1,658 @@
+#!/usr/bin/env python3
+"""
+dtReader — Common Desktop Environment (CDE) PDF Reader & Fillable Form Editor
+Powered by EvinceDocument 3.0 + EvinceView 3.0 (Poppler + native AcroForm engine).
+
+Features:
+- Crisp PDF viewing with thumbnails/outline sidebar, zoom, rotation, search, & print
+- Interactive fillable PDF form editing directly on the page (text fields, checkboxes,
+  radio buttons, combo boxes/dropdowns)
+- Atomic Save (Ctrl+S) and Save As (Ctrl+Shift+S) preserving filled AcroForm data
+- Styled natively to match CDE's active OSF/Motif palette
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+from pathlib import Path
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("EvinceDocument", "3.0")
+gi.require_version("EvinceView", "3.0")
+from gi.repository import EvinceDocument, EvinceView, Gdk, GLib, Gtk
+
+HOME = Path.home()
+DT_ICONS = HOME / ".dt" / "icons"
+
+
+def load_cde_css() -> bytes:
+    chrome = "#aeb2c3"
+    sel = "#2c567e"
+    well = "#fff7e9"
+    try:
+        out = subprocess.check_output(["xrdb", "-query"], text=True, stderr=subprocess.DEVNULL)
+        pal_name = "Crimson.dp"
+        for ln in out.splitlines():
+            if "ColorPalette:" in ln:
+                pal_name = ln.split(":", 1)[1].strip()
+                break
+        for pdir in (HOME / ".dt/palettes", Path("/usr/dt/palettes")):
+            pf = pdir / pal_name
+            if pf.is_file():
+                hexes = [l.strip() for l in pf.read_text().splitlines() if l.strip().startswith("#")]
+                if len(hexes) >= 4:
+                    def norm16(h):
+                        h = h.lstrip("#")
+                        return f"#{h[0:2]}{h[4:6]}{h[8:10]}" if len(h) == 12 else "#" + h[:6]
+                    chrome = norm16(hexes[1])
+                    sel = norm16(hexes[2])
+                    well = norm16(hexes[3])
+                break
+    except Exception:
+        pass
+
+    css = f"""
+    window, dialog, .background {{
+        background-color: {chrome};
+        color: #101014;
+        font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+        font-size: 10pt;
+    }}
+    menubar {{
+        background-color: {chrome};
+        border-bottom: 2px solid #585c6c;
+    }}
+    menuitem:hover {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    .cde-toolbar {{
+        background-color: {chrome};
+        padding: 4px 6px;
+        border-top: 2px solid #e6e9f2;
+        border-left: 2px solid #e6e9f2;
+        border-right: 2px solid #585c6c;
+        border-bottom: 2px solid #585c6c;
+    }}
+    .cde-form-banner {{
+        background-color: #eef4db;
+        color: #163020;
+        padding: 4px 10px;
+        border-bottom: 2px solid #585c6c;
+        font-weight: bold;
+    }}
+    .cde-status {{
+        background-color: {chrome};
+        padding: 3px 8px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+    }}
+    frame {{
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+        border-radius: 0px;
+    }}
+    button {{
+        background-image: none;
+        background-color: {chrome};
+        color: #101014;
+        border-top: 2px solid #e6e9f2;
+        border-left: 2px solid #e6e9f2;
+        border-right: 2px solid #565a69;
+        border-bottom: 2px solid #565a69;
+        border-radius: 0px;
+        padding: 4px 8px;
+        box-shadow: none;
+    }}
+    button:active, button:checked {{
+        border-top: 2px solid #565a69;
+        border-left: 2px solid #565a69;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+    }}
+    button.cde-save {{
+        background-color: #266048;
+        color: #ffffff;
+        border-top: 2px solid #52997b;
+        border-left: 2px solid #52997b;
+        border-right: 2px solid #113023;
+        border-bottom: 2px solid #113023;
+        font-weight: bold;
+    }}
+    button.cde-save label {{ color: #ffffff; }}
+    entry, list, treeview {{
+        background-color: {well};
+        color: #101014;
+        border-radius: 0px;
+    }}
+    row:selected, treeview:selected {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    row:selected label {{ color: #ffffff; }}
+    """
+    return css.encode("utf-8")
+
+
+def has_interactive_forms(doc) -> bool:
+    if not isinstance(doc, EvinceDocument.DocumentForms):
+        return False
+    try:
+        n = doc.get_n_pages()
+        for i in range(min(n, 50)):
+            page = doc.get_page(i)
+            mapping = doc.get_form_field_mapping(page)
+            if mapping and mapping.length() > 0:
+                return True
+    except Exception:
+        # Even if length helper differs across GI bindings, truthy non-empty MappingList check
+        try:
+            for i in range(min(doc.get_n_pages(), 50)):
+                m = doc.get_form_field_mapping(doc.get_page(i))
+                if m:
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+class DtReaderWindow(Gtk.Window):
+    def __init__(self, initial_pdf: Path | None = None):
+        super().__init__(title="dtReader — CDE PDF Reader & Form Filler")
+        self.set_wmclass("dtreader", "DtReader")
+        self.set_default_size(980, 720)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        ic = DT_ICONS / "dtreader.l.pm"
+        if ic.is_file():
+            try:
+                self.set_icon_from_file(str(ic))
+            except Exception:
+                pass
+
+        self.current_path: Path | None = None
+        self.doc = None
+        self.model = EvinceView.DocumentModel()
+        self.model.set_continuous(True)
+        self.model.set_sizing_mode(EvinceView.SizingMode.FIT_WIDTH)
+        self.model.connect("page-changed", self._on_page_changed)
+        self.find_job = None
+
+        accel = Gtk.AccelGroup()
+        self.add_accel_group(accel)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(vbox)
+
+        # 1. Menu Bar
+        mbar = Gtk.MenuBar()
+        m_file = Gtk.Menu()
+        mi_file = Gtk.MenuItem(label="File")
+        mi_file.set_submenu(m_file)
+        for lbl, key, mod, cb in [
+            ("Open PDF...", Gdk.KEY_o, Gdk.ModifierType.CONTROL_MASK, self.on_open),
+            ("Save Filled PDF", Gdk.KEY_s, Gdk.ModifierType.CONTROL_MASK, self.on_save),
+            ("Save PDF As...", Gdk.KEY_s, Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK, self.on_save_as),
+            ("-", None, 0, None),
+            ("Print...", Gdk.KEY_p, Gdk.ModifierType.CONTROL_MASK, self.on_print),
+            ("-", None, 0, None),
+            ("Exit", Gdk.KEY_q, Gdk.ModifierType.CONTROL_MASK, lambda *_: self.destroy()),
+        ]:
+            if lbl == "-":
+                m_file.append(Gtk.SeparatorMenuItem())
+            else:
+                it = Gtk.MenuItem(label=lbl)
+                it.connect("activate", cb)
+                if key:
+                    it.add_accelerator("activate", accel, key, mod, Gtk.AccelFlags.VISIBLE)
+                m_file.append(it)
+        mbar.append(mi_file)
+
+        m_view = Gtk.Menu()
+        mi_view = Gtk.MenuItem(label="View")
+        mi_view.set_submenu(m_view)
+        for lbl, key, mod, cb in [
+            ("Toggle Pages Sidebar", Gdk.KEY_F9, 0, self.on_toggle_sidebar),
+            ("Find in Document...", Gdk.KEY_f, Gdk.ModifierType.CONTROL_MASK, self.on_toggle_find),
+            ("-", None, 0, None),
+            ("Zoom In", Gdk.KEY_plus, Gdk.ModifierType.CONTROL_MASK, self.on_zoom_in),
+            ("Zoom Out", Gdk.KEY_minus, Gdk.ModifierType.CONTROL_MASK, self.on_zoom_out),
+            ("Fit Width", Gdk.KEY_1, Gdk.ModifierType.CONTROL_MASK, lambda *_: self._set_sizing("fit_width")),
+            ("Fit Page", Gdk.KEY_0, Gdk.ModifierType.CONTROL_MASK, lambda *_: self._set_sizing("fit_page")),
+            ("-", None, 0, None),
+            ("Rotate Left", None, 0, lambda *_: self._rotate(-90)),
+            ("Rotate Right", None, 0, lambda *_: self._rotate(90)),
+        ]:
+            if lbl == "-":
+                m_view.append(Gtk.SeparatorMenuItem())
+            else:
+                it = Gtk.MenuItem(label=lbl)
+                it.connect("activate", cb)
+                if key:
+                    it.add_accelerator("activate", accel, key, mod, Gtk.AccelFlags.VISIBLE)
+                m_view.append(it)
+        mbar.append(mi_view)
+
+        m_help = Gtk.Menu()
+        mi_help = Gtk.MenuItem(label="Help")
+        mi_help.set_submenu(m_help)
+        it_ab = Gtk.MenuItem(label="About dtReader...")
+        it_ab.connect("activate", self.on_about)
+        m_help.append(it_ab)
+        mbar.append(mi_help)
+        vbox.pack_start(mbar, False, False, 0)
+
+        # 2. CDE Toolbar
+        tbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        tbar.get_style_context().add_class("cde-toolbar")
+
+        b_open = Gtk.Button(label="Open...")
+        b_open.connect("clicked", self.on_open)
+        tbar.pack_start(b_open, False, False, 0)
+
+        b_save = Gtk.Button(label="Save PDF")
+        b_save.set_tooltip_text("Save filled PDF form changes (Ctrl+S)")
+        b_save.get_style_context().add_class("cde-save")
+        b_save.connect("clicked", self.on_save)
+        tbar.pack_start(b_save, False, False, 0)
+
+        b_save_as = Gtk.Button(label="Save As...")
+        b_save_as.connect("clicked", self.on_save_as)
+        tbar.pack_start(b_save_as, False, False, 0)
+
+        b_print = Gtk.Button(label="Print")
+        b_print.connect("clicked", self.on_print)
+        tbar.pack_start(b_print, False, False, 0)
+
+        tbar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 3)
+
+        b_prev = Gtk.Button(label="◀ Prev")
+        b_prev.connect("clicked", lambda *_: self.view.previous_page())
+        tbar.pack_start(b_prev, False, False, 0)
+
+        self.ent_page = Gtk.Entry(width_chars=4, xalign=0.5)
+        self.ent_page.connect("activate", self._on_page_entry)
+        tbar.pack_start(self.ent_page, False, False, 0)
+        self.lbl_pages = Gtk.Label(label="/ 0")
+        tbar.pack_start(self.lbl_pages, False, False, 2)
+
+        b_next = Gtk.Button(label="Next ▶")
+        b_next.connect("clicked", lambda *_: self.view.next_page())
+        tbar.pack_start(b_next, False, False, 0)
+
+        tbar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 3)
+
+        b_zout = Gtk.Button(label="－")
+        b_zout.connect("clicked", self.on_zoom_out)
+        tbar.pack_start(b_zout, False, False, 0)
+
+        self.cmb_zoom = Gtk.ComboBoxText()
+        for zid, zlbl in [
+            ("fit_width", "Fit Width"),
+            ("fit_page", "Fit Page"),
+            ("0.75", "75%"),
+            ("1.0", "100%"),
+            ("1.25", "125%"),
+            ("1.5", "150%"),
+            ("2.0", "200%"),
+        ]:
+            self.cmb_zoom.append(zid, zlbl)
+        self.cmb_zoom.set_active_id("fit_width")
+        self.cmb_zoom.connect("changed", self._on_zoom_combo)
+        tbar.pack_start(self.cmb_zoom, False, False, 0)
+
+        b_zin = Gtk.Button(label="＋")
+        b_zin.connect("clicked", self.on_zoom_in)
+        tbar.pack_start(b_zin, False, False, 0)
+
+        b_find = Gtk.Button(label="Find")
+        b_find.connect("clicked", self.on_toggle_find)
+        tbar.pack_end(b_find, False, False, 0)
+
+        b_side = Gtk.Button(label="Pages")
+        b_side.connect("clicked", self.on_toggle_sidebar)
+        tbar.pack_end(b_side, False, False, 0)
+        vbox.pack_start(tbar, False, False, 0)
+
+        # 3. Fillable Form Notification Strip (shown automatically for AcroForm PDFs)
+        self.form_banner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.form_banner.get_style_context().add_class("cde-form-banner")
+        self.form_banner.pack_start(
+            Gtk.Label(
+                label="✎  Fillable PDF Form Detected — Click directly on form fields in the document to fill them out, then click 'Save PDF' (Ctrl+S) or 'Save As...'.",
+                xalign=0,
+            ),
+            True, True, 0,
+        )
+        vbox.pack_start(self.form_banner, False, False, 0)
+
+        # 4. Collapsible Find Bar
+        self.find_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6, margin=4)
+        self.find_bar.pack_start(Gtk.Label(label="Find:"), False, False, 4)
+        self.ent_find = Gtk.SearchEntry(hexpand=True)
+        self.ent_find.connect("search-changed", self._on_find_changed)
+        self.ent_find.connect("activate", lambda *_: self.view.find_next())
+        self.find_bar.pack_start(self.ent_find, True, True, 0)
+        b_fp = Gtk.Button(label="▲ Prev")
+        b_fp.connect("clicked", lambda *_: self.view.find_previous())
+        b_fn = Gtk.Button(label="▼ Next")
+        b_fn.connect("clicked", lambda *_: self.view.find_next())
+        b_fc = Gtk.Button(label="✕")
+        b_fc.connect("clicked", self.on_toggle_find)
+        self.find_bar.pack_start(b_fp, False, False, 0)
+        self.find_bar.pack_start(b_fn, False, False, 0)
+        self.find_bar.pack_start(b_fc, False, False, 0)
+        vbox.pack_start(self.find_bar, False, False, 0)
+
+        # 5. Split Workspace: Left Page List Sidebar + Right Sunken EvinceView PDF Canvas
+        self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, wide_handle=True)
+        self.paned.set_position(165)
+
+        self.side_frame = Gtk.Frame(label=" Pages ", margin=4)
+        sc_side = Gtk.ScrolledWindow(vexpand=True)
+        self.page_list = Gtk.ListBox()
+        self.page_list.connect("row-selected", self._on_sidebar_row_selected)
+        sc_side.add(self.page_list)
+        self.side_frame.add(sc_side)
+        self.paned.pack1(self.side_frame, resize=False, shrink=False)
+
+        view_frame = Gtk.Frame(margin=4)
+        self.sc_pdf = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        self.view = EvinceView.View()
+        self.view.set_model(self.model)
+        self.sc_pdf.add(self.view)
+        view_frame.add(self.sc_pdf)
+        self.paned.pack2(view_frame, resize=True, shrink=False)
+        vbox.pack_start(self.paned, True, True, 0)
+
+        # 6. Status Bar
+        st = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        st.get_style_context().add_class("cde-status")
+        self.lbl_status = Gtk.Label(label="Ready — Open or drop a PDF document.", xalign=0)
+        st.pack_start(self.lbl_status, True, True, 0)
+        vbox.pack_start(st, False, False, 0)
+
+        # Drag-and-drop PDF open
+        targets = [
+            Gtk.TargetEntry.new("text/uri-list", 0, 0),
+            Gtk.TargetEntry.new("text/plain", 0, 1),
+            Gtk.TargetEntry.new("STRING", 0, 2),
+        ]
+        self.drag_dest_set(Gtk.DestDefaults.ALL, targets, Gdk.DragAction.COPY)
+        self.connect("drag-data-received", self._on_drop)
+
+        self.show_all()
+        self.form_banner.hide()
+        self.find_bar.hide()
+
+        if initial_pdf and initial_pdf.is_file():
+            GLib.idle_add(self.load_pdf, initial_pdf)
+
+    def _on_drop(self, _w, context, _x, _y, data, _info, time_):
+        uris = data.get_uris()
+        cand = None
+        if uris:
+            for u in uris:
+                if u.startswith("file://"):
+                    p = Path(urllib.parse.unquote(urllib.parse.urlparse(u).path))
+                    if p.is_file():
+                        cand = p
+                        break
+        if not cand:
+            raw = (data.get_text() or "").strip().splitlines()
+            if raw:
+                t = raw[0].strip()
+                p = Path(urllib.parse.unquote(urllib.parse.urlparse(t).path)) if t.startswith("file://") else Path(t)
+                if p.is_file():
+                    cand = p
+        Gtk.drag_finish(context, bool(cand), False, time_)
+        if cand:
+            self.load_pdf(cand)
+
+    def load_pdf(self, pdf_path: Path, restore_page: int = 0):
+        try:
+            rp = pdf_path.expanduser().resolve()
+            uri = rp.as_uri()
+            doc = EvinceDocument.Document.factory_get_document(uri)
+            self.doc = doc
+            self.current_path = rp
+            self.model.set_document(doc)
+
+            n_pages = doc.get_n_pages()
+            self.lbl_pages.set_text(f"/ {n_pages}")
+            self._rebuild_sidebar(n_pages)
+
+            if 0 <= restore_page < n_pages:
+                self.model.set_page(restore_page)
+            self._sync_page_ui()
+
+            is_form = has_interactive_forms(doc)
+            if is_form:
+                self.form_banner.show()
+                self.lbl_status.set_text(f"Loaded '{rp.name}' ({n_pages} pages) — Interactive Fillable PDF Form")
+            else:
+                self.form_banner.hide()
+                self.lbl_status.set_text(f"Loaded '{rp.name}' ({n_pages} pages)")
+            self.set_title(f"{rp.name} — dtReader")
+        except Exception as exc:
+            self._error(f"Failed to open PDF '{pdf_path}':\n{exc}")
+
+    def _rebuild_sidebar(self, n_pages: int):
+        for ch in self.page_list.get_children():
+            self.page_list.remove(ch)
+        for i in range(n_pages):
+            row = Gtk.ListBoxRow()
+            lbl = Gtk.Label(label=f"  Page {i + 1}", xalign=0, margin=4)
+            row.add(lbl)
+            self.page_list.add(row)
+        self.page_list.show_all()
+
+    def _on_sidebar_row_selected(self, _lb, row):
+        if row is not None and self.doc is not None:
+            idx = row.get_index()
+            if idx != self.model.get_page():
+                self.model.set_page(idx)
+
+    def _on_page_changed(self, *_args):
+        self._sync_page_ui()
+
+    def _sync_page_ui(self):
+        if not self.doc:
+            return
+        cur = self.model.get_page()
+        self.ent_page.set_text(str(cur + 1))
+        r = self.page_list.get_row_at_index(cur)
+        if r and r != self.page_list.get_selected_row():
+            self.page_list.select_row(r)
+
+    def _on_page_entry(self, _ent):
+        if not self.doc:
+            return
+        try:
+            p = int(self.ent_page.get_text().strip()) - 1
+            p = max(0, min(p, self.doc.get_n_pages() - 1))
+            self.model.set_page(p)
+        except ValueError:
+            self._sync_page_ui()
+
+    def on_open(self, *_args):
+        dlg = Gtk.FileChooserDialog(title="Open PDF Document — dtReader", parent=self, action=Gtk.FileChooserAction.OPEN)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Open", Gtk.ResponseType.OK)
+        flt = Gtk.FileFilter()
+        flt.set_name("PDF Documents (*.pdf)")
+        flt.add_pattern("*.pdf")
+        flt.add_pattern("*.PDF")
+        flt.add_mime_type("application/pdf")
+        dlg.add_filter(flt)
+        if dlg.run() == Gtk.ResponseType.OK:
+            self.load_pdf(Path(dlg.get_filename()))
+        dlg.destroy()
+
+    def _commit_active_focus(self):
+        """Move focus away from any active inline PDF Entry widget so its text commits to Poppler before saving."""
+        self.set_focus(None)
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+
+    def on_save(self, *_args):
+        if not self.doc or not self.current_path:
+            return
+        self._commit_active_focus()
+        cur_page = self.model.get_page()
+        parent_dir = self.current_path.parent
+        try:
+            # Poppler cannot overwrite an mmap'd source PDF directly; write sibling temp & atomic replace
+            fd, tmp_str = tempfile.mkstemp(prefix=f".{self.current_path.stem}_", suffix=".pdf", dir=str(parent_dir))
+            os.close(fd)
+            tmp_path = Path(tmp_str)
+            try:
+                self.doc.save(tmp_path.as_uri())
+                os.replace(tmp_path, self.current_path)
+            finally:
+                tmp_path.unlink(missing_ok=True)
+            self.load_pdf(self.current_path, restore_page=cur_page)
+            self.lbl_status.set_text(f"Saved filled PDF changes to {self.current_path}")
+        except Exception as exc:
+            self._error(f"Could not save '{self.current_path.name}' (try Save As...):\n{exc}")
+
+    def on_save_as(self, *_args):
+        if not self.doc:
+            return
+        self._commit_active_focus()
+        dlg = Gtk.FileChooserDialog(title="Save PDF As — dtReader", parent=self, action=Gtk.FileChooserAction.SAVE)
+        dlg.set_do_overwrite_confirmation(True)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save PDF", Gtk.ResponseType.OK)
+        if self.current_path:
+            dlg.set_current_folder(str(self.current_path.parent))
+            dlg.set_current_name(self.current_path.name)
+        else:
+            dlg.set_current_name("filled_document.pdf")
+        if dlg.run() == Gtk.ResponseType.OK:
+            dest = Path(dlg.get_filename()).resolve()
+            dlg.destroy()
+            cur_page = self.model.get_page()
+            try:
+                if self.current_path and dest == self.current_path:
+                    self.on_save()
+                    return
+                self.doc.save(dest.as_uri())
+                self.load_pdf(dest, restore_page=cur_page)
+                self.lbl_status.set_text(f"Saved PDF as {dest}")
+            except Exception as exc:
+                self._error(f"Save As failed:\n{exc}")
+        else:
+            dlg.destroy()
+
+    def on_print(self, *_args):
+        if not self.doc:
+            return
+        try:
+            pop = EvinceView.PrintOperation.new(self.doc)
+            pop.run(self)
+        except Exception as exc:
+            self._error(f"Print error:\n{exc}")
+
+    def on_zoom_in(self, *_args):
+        self.model.set_sizing_mode(EvinceView.SizingMode.FREE)
+        if self.view.can_zoom_in():
+            self.view.zoom_in()
+
+    def on_zoom_out(self, *_args):
+        self.model.set_sizing_mode(EvinceView.SizingMode.FREE)
+        if self.view.can_zoom_out():
+            self.view.zoom_out()
+
+    def _set_sizing(self, mode: str):
+        if mode == "fit_width":
+            self.model.set_sizing_mode(EvinceView.SizingMode.FIT_WIDTH)
+        elif mode == "fit_page":
+            self.model.set_sizing_mode(EvinceView.SizingMode.FIT_PAGE)
+
+    def _on_zoom_combo(self, cmb):
+        zid = cmb.get_active_id()
+        if not zid:
+            return
+        if zid in ("fit_width", "fit_page"):
+            self._set_sizing(zid)
+        else:
+            self.model.set_sizing_mode(EvinceView.SizingMode.FREE)
+            self.model.set_scale(float(zid))
+
+    def _rotate(self, delta: int):
+        cur = self.model.get_rotation()
+        self.model.set_rotation((cur + delta) % 360)
+
+    def on_toggle_sidebar(self, *_args):
+        if self.side_frame.get_visible():
+            self.side_frame.hide()
+        else:
+            self.side_frame.show()
+
+    def on_toggle_find(self, *_args):
+        if self.find_bar.get_visible():
+            self.find_bar.hide()
+            self.view.find_set_highlight_search(False)
+        else:
+            self.find_bar.show()
+            self.ent_find.grab_focus()
+
+    def _on_find_changed(self, _ent):
+        if not self.doc:
+            return
+        txt = self.ent_find.get_text().strip()
+        if not txt:
+            self.view.find_set_highlight_search(False)
+            return
+        try:
+            job = EvinceView.JobFind.new(self.doc, self.model.get_page(), self.doc.get_n_pages(), txt, False)
+            self.view.find_started(job)
+            self.view.find_set_highlight_search(True)
+            EvinceView.Job.scheduler_push_job(job, EvinceView.JobPriority.PRIORITY_NONE)
+        except Exception:
+            pass
+
+    def on_about(self, *_args):
+        md = Gtk.MessageDialog(
+            transient_for=self, flags=0, message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK, text="dtReader — CDE PDF Reader & Form Filler",
+        )
+        md.format_secondary_text(
+            "Native Common Desktop Environment PDF viewer and interactive AcroForm editor.\n"
+            "Click fillable fields directly on any PDF form and press Ctrl+S (or Save As) to save."
+        )
+        md.run()
+        md.destroy()
+
+    def _error(self, msg: str):
+        md = Gtk.MessageDialog(transient_for=self, flags=0, message_type=Gtk.MessageType.ERROR,
+                               buttons=Gtk.ButtonsType.OK, text=msg)
+        md.run()
+        md.destroy()
+
+
+def main():
+    EvinceDocument.init()
+    provider = Gtk.CssProvider()
+    provider.load_from_data(load_cde_css())
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+    )
+
+    init_pdf = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else None
+    win = DtReaderWindow(init_pdf)
+    win.connect("destroy", Gtk.main_quit)
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

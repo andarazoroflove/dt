@@ -1,0 +1,1022 @@
+#!/usr/bin/env python3
+"""
+dtZip — Common Desktop Environment (CDE) Archive Manager
+Drag-and-drop GUI for extracting and creating .zip, .tar.gz/.tgz, .tar.bz2/.tbz2,
+.tar.xz/.txz, .tar, .7z, .rar (extract), .gz, .bz2, and .xz archives.
+Styled natively to match CDE's active OSF/Motif palette.
+"""
+
+import bz2
+import datetime
+import gzip
+import lzma
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import urllib.parse
+import zipfile
+from pathlib import Path
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Pango", "1.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango
+
+HOME = Path.home()
+DT_ICONS = HOME / ".dt" / "icons"
+SEVENZ = shutil.which("7z") or shutil.which("7za") or "/usr/bin/7z"
+
+ARCHIVE_EXT_RE = re.compile(
+    r"\.(tar\.gz|tgz|tar\.bz2|tbz2|tbz|tar\.xz|txz|tar\.zst|tzst|tar|zip|7z|rar|gz|bz2|xz|z|iso|cab)$",
+    re.IGNORECASE,
+)
+
+CREATE_FORMATS = [
+    (".zip",     "ZIP Archive (.zip) — Universal compatibility"),
+    (".tar.gz",  "Gzip Compressed Tar (.tar.gz)"),
+    (".tar.bz2", "BZip2 Compressed Tar (.tar.bz2)"),
+    (".tar.xz",  "XZ Compressed Tar (.tar.xz)"),
+    (".tar",     "Uncompressed UNIX Tar (.tar)"),
+    (".7z",      "7-Zip High Compression (.7z)"),
+]
+
+
+def _lighten_hex(hex_color: str, factor: float = 1.06) -> str:
+    h = hex_color.lstrip("#")
+    if len(h) != 6:
+        return hex_color
+    r = min(255, int(int(h[0:2], 16) * factor))
+    g = min(255, int(int(h[2:4], 16) * factor))
+    b = min(255, int(int(h[4:6], 16) * factor))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def load_cde_css() -> bytes:
+    """Build authentic CDE OSF/Motif GTK3 CSS bound to ~/.dt/palettes or Crimson.dp."""
+    chrome = "#aeb2c3"
+    sel = "#2c567e"
+    well = "#fff7e9"
+    well_alt = "#eef4db"
+    try:
+        out = subprocess.check_output(["xrdb", "-query"], text=True, stderr=subprocess.DEVNULL)
+        pal_name = "Crimson.dp"
+        for ln in out.splitlines():
+            if "ColorPalette:" in ln:
+                pal_name = ln.split(":", 1)[1].strip()
+                break
+        for pdir in (HOME / ".dt/palettes", Path("/usr/dt/palettes")):
+            pf = pdir / pal_name
+            if pf.is_file():
+                hexes = [l.strip() for l in pf.read_text().splitlines() if l.strip().startswith("#")]
+                if len(hexes) >= 4:
+                    def norm16(h):
+                        h = h.lstrip("#")
+                        if len(h) == 12:
+                            return f"#{h[0:2]}{h[4:6]}{h[8:10]}"
+                        return "#" + h[:6]
+                    chrome = norm16(hexes[1])
+                    sel = norm16(hexes[2])
+                    well = norm16(hexes[3])
+                break
+    except Exception:
+        pass
+
+    chrome_hover = _lighten_hex(chrome, 1.06)
+
+    css = f"""
+    window, dialog, .background {{
+        background-color: {chrome};
+        color: #101014;
+        font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+        font-size: 10pt;
+    }}
+    menubar {{
+        background-color: {chrome};
+        border-bottom: 2px solid #5c6070;
+    }}
+    menuitem:hover {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    .cde-toolbar {{
+        background-color: {chrome};
+        padding: 4px 6px;
+        border-top: 2px solid #e6e9f2;
+        border-left: 2px solid #e6e9f2;
+        border-right: 2px solid #585c6c;
+        border-bottom: 2px solid #585c6c;
+    }}
+    .cde-dropbar {{
+        background-color: {well_alt};
+        color: #1c2826;
+        padding: 6px 10px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+    }}
+    .cde-status {{
+        background-color: {chrome};
+        padding: 3px 8px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+    }}
+    frame {{
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+        border-radius: 0px;
+    }}
+    button {{
+        background-image: none;
+        background-color: {chrome};
+        color: #101014;
+        border-top: 2px solid #e6e9f2;
+        border-left: 2px solid #e6e9f2;
+        border-right: 2px solid #565a69;
+        border-bottom: 2px solid #565a69;
+        border-radius: 0px;
+        padding: 4px 9px;
+        box-shadow: none;
+    }}
+    button:hover {{
+        background-color: {chrome_hover};
+    }}
+    button:active, button:checked {{
+        border-top: 2px solid #565a69;
+        border-left: 2px solid #565a69;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+    }}
+    button.cde-accent {{
+        background-color: #2b5b84;
+        color: #ffffff;
+        border-top: 2px solid #6899c4;
+        border-left: 2px solid #6899c4;
+        border-right: 2px solid #142c40;
+        border-bottom: 2px solid #142c40;
+        font-weight: bold;
+    }}
+    button.cde-accent:hover {{
+        background-color: #346b99;
+    }}
+    button.cde-accent label {{ color: #ffffff; }}
+    entry, treeview {{
+        background-color: {well};
+        color: #101014;
+        border-radius: 0px;
+    }}
+    treeview:selected {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    treeview header button {{
+        background-color: {chrome};
+        font-weight: bold;
+    }}
+    """
+    return css.encode("utf-8")
+
+
+def is_archive_path(p: Path) -> bool:
+    return bool(p.is_file() and ARCHIVE_EXT_RE.search(p.name))
+
+
+def detect_archive_kind(p: Path) -> str:
+    n = p.name.lower()
+    for compound in (".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tbz", ".tar.xz", ".txz", ".tar.zst", ".tzst"):
+        if n.endswith(compound):
+            return "tar"
+    ext = p.suffix.lower()
+    if ext == ".tar":
+        return "tar"
+    if ext == ".zip":
+        return "zip"
+    if ext in (".7z", ".rar", ".iso", ".cab", ".z"):
+        return "7z"
+    if ext in (".gz", ".bz2", ".xz"):
+        return "single_comp"
+    return "7z"
+
+
+def human_size(num: int) -> str:
+    if num < 1024:
+        return f"{num} B"
+    for unit in ("KB", "MB", "GB"):
+        num /= 1024.0
+        if num < 1024.0 or unit == "GB":
+            return f"{num:.1f} {unit}"
+    return f"{num:.1f} GB"
+
+
+def parse_dropped_paths(selection_data) -> list[Path]:
+    paths = []
+    uris = selection_data.get_uris()
+    if uris:
+        for u in uris:
+            if u.startswith("file://"):
+                p = Path(urllib.parse.unquote(urllib.parse.urlparse(u).path))
+                if p.exists():
+                    paths.append(p)
+    if not paths:
+        raw = selection_data.get_text() or ""
+        if not raw:
+            try:
+                raw = selection_data.get_data().decode("utf-8", errors="ignore")
+            except Exception:
+                raw = ""
+        for token in re.split(r"[\r\n\x00]+", raw):
+            token = token.strip()
+            if not token or token.startswith("#"):
+                continue
+            if token.startswith("file://"):
+                p = Path(urllib.parse.unquote(urllib.parse.urlparse(token).path))
+            else:
+                p = Path(token)
+            if p.exists():
+                paths.append(p)
+    # Deduplicate preserving order
+    seen = set()
+    unique = []
+    for p in paths:
+        rp = p.resolve()
+        if rp not in seen:
+            seen.add(rp)
+            unique.append(rp)
+    return unique
+
+
+def list_archive_entries(arch_path: Path) -> list[dict]:
+    """Return list of {name, size, packed, mtime, is_dir}."""
+    kind = detect_archive_kind(arch_path)
+    rows = []
+
+    if kind == "zip":
+        with zipfile.ZipFile(arch_path, "r") as zf:
+            for info in zf.infolist():
+                dt_s = f"{info.date_time[0]:04d}-{info.date_time[1]:02d}-{info.date_time[2]:02d} {info.date_time[3]:02d}:{info.date_time[4]:02d}"
+                rows.append({
+                    "name": info.filename,
+                    "size": info.file_size,
+                    "packed": info.compress_size,
+                    "mtime": dt_s,
+                    "is_dir": info.is_dir(),
+                })
+        return rows
+
+    if kind == "tar":
+        if arch_path.name.lower().endswith((".tar.zst", ".tzst")):
+            kind = "7z"
+        else:
+            with tarfile.open(arch_path, "r:*") as tf:
+                for m in tf.getmembers():
+                    dt_s = datetime.datetime.fromtimestamp(m.mtime).strftime("%Y-%m-%d %H:%M") if m.mtime else ""
+                    rows.append({
+                        "name": m.name + ("/" if m.isdir() and not m.name.endswith("/") else ""),
+                        "size": m.size,
+                        "packed": m.size,
+                        "mtime": dt_s,
+                        "is_dir": m.isdir(),
+                    })
+            return rows
+
+    if kind == "single_comp":
+        stem = arch_path.stem
+        st = arch_path.stat()
+        dt_s = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+        rows.append({
+            "name": stem,
+            "size": st.st_size,
+            "packed": st.st_size,
+            "mtime": dt_s,
+            "is_dir": False,
+        })
+        return rows
+
+    # 7z technical listing (-slt) handles .7z, .rar (RAR4/RAR5), .iso, .cab, .tar.zst, etc.
+    out = subprocess.check_output(
+        [SEVENZ, "l", "-slt", "-bd", str(arch_path)],
+        text=True, stderr=subprocess.STDOUT, errors="replace",
+    )
+    in_items = False
+    cur = {}
+    for line in out.splitlines():
+        if line.strip() == "----------":
+            in_items = True
+            cur = {}
+            continue
+        if not in_items:
+            continue
+        if not line.strip():
+            if "Path" in cur:
+                attr = cur.get("Attributes", "")
+                folder = cur.get("Folder", "-")
+                is_d = (folder == "+") or ("D" in attr)
+                sz = int(cur.get("Size") or 0)
+                pk = int(cur.get("Packed Size") or sz)
+                rows.append({
+                    "name": cur["Path"] + ("/" if is_d and not cur["Path"].endswith("/") else ""),
+                    "size": sz,
+                    "packed": pk,
+                    "mtime": (cur.get("Modified") or "")[:16],
+                    "is_dir": is_d,
+                })
+            cur = {}
+            continue
+        if " = " in line:
+            k, v = line.split(" = ", 1)
+            cur[k.strip()] = v.strip()
+    if "Path" in cur:
+        is_d = (cur.get("Folder") == "+") or ("D" in cur.get("Attributes", ""))
+        sz = int(cur.get("Size") or 0)
+        rows.append({
+            "name": cur["Path"],
+            "size": sz,
+            "packed": int(cur.get("Packed Size") or sz),
+            "mtime": (cur.get("Modified") or "")[:16],
+            "is_dir": is_d,
+        })
+    return rows
+
+
+def safe_member_dest(dest_dir: Path, member_name: str) -> Path:
+    clean = member_name.lstrip("/\\")
+    parts = [p for p in Path(clean).parts if p not in ("", ".", "..")]
+    return dest_dir.joinpath(*parts) if parts else dest_dir
+
+
+def extract_archive(arch_path: Path, dest_dir: Path, selected_names: list[str] | None = None):
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    kind = detect_archive_kind(arch_path)
+    sel_set = set(selected_names) if selected_names else None
+
+    if kind == "zip":
+        with zipfile.ZipFile(arch_path, "r") as zf:
+            for info in zf.infolist():
+                if sel_set and info.filename not in sel_set:
+                    continue
+                target = safe_member_dest(dest_dir, info.filename)
+                if info.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(info, "r") as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+        return
+
+    if kind == "tar" and not arch_path.name.lower().endswith((".tar.zst", ".tzst")):
+        with tarfile.open(arch_path, "r:*") as tf:
+            for m in tf.getmembers():
+                m_key = m.name + ("/" if m.isdir() and not m.name.endswith("/") else "")
+                if sel_set and (m.name not in sel_set and m_key not in sel_set):
+                    continue
+                target = safe_member_dest(dest_dir, m.name)
+                if m.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                elif m.isfile():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    fobj = tf.extractfile(m)
+                    if fobj:
+                        with fobj, open(target, "wb") as dst:
+                            shutil.copyfileobj(fobj, dst)
+                        if m.mode:
+                            try:
+                                os.chmod(target, m.mode & 0o777)
+                            except OSError:
+                                pass
+        return
+
+    if kind == "single_comp":
+        ext = arch_path.suffix.lower()
+        out_file = dest_dir / arch_path.stem
+        opener = gzip.open if ext == ".gz" else (bz2.open if ext == ".bz2" else lzma.open)
+        with opener(arch_path, "rb") as src, open(out_file, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        return
+
+    cmd = [SEVENZ, "x", "-y", "-bd", f"-o{dest_dir}", str(arch_path)]
+    if selected_names:
+        cmd.extend([n.rstrip("/") for n in selected_names])
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(res.stdout[-400:] or res.stderr[-400:] or "7z extraction failed")
+
+
+def create_archive(out_path: Path, sources: list[Path]):
+    n = out_path.name.lower()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if n.endswith(".rar"):
+        raise RuntimeError("RAR creation is proprietary; please choose .7z, .zip, or .tar.gz (RAR extraction is fully supported).")
+
+    if n.endswith(".zip"):
+        with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            for src in sources:
+                if src.is_dir():
+                    base_parent = src.parent
+                    for root, dirs, files in os.walk(src):
+                        rp = Path(root)
+                        if not files and not dirs:
+                            zf.writestr(str(rp.relative_to(base_parent)) + "/", "")
+                        for f in files:
+                            fp = rp / f
+                            zf.write(fp, str(fp.relative_to(base_parent)))
+                elif src.is_file():
+                    zf.write(src, src.name)
+        return
+
+    tar_mode = None
+    if n.endswith((".tar.gz", ".tgz")):
+        tar_mode = "w:gz"
+    elif n.endswith((".tar.bz2", ".tbz2", ".tbz")):
+        tar_mode = "w:bz2"
+    elif n.endswith((".tar.xz", ".txz")):
+        tar_mode = "w:xz"
+    elif n.endswith(".tar"):
+        tar_mode = "w"
+
+    if tar_mode is not None:
+        with tarfile.open(out_path, tar_mode) as tf:
+            for src in sources:
+                tf.add(src, arcname=src.name)
+        return
+
+    if n.endswith(".7z"):
+        if out_path.exists():
+            out_path.unlink()
+        cmd = [SEVENZ, "a", "-t7z", "-mx=5", "-bd", str(out_path)] + [str(s) for s in sources]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(res.stdout[-400:] or res.stderr[-400:] or "7z creation failed")
+        return
+
+    # Fallback: default to .zip
+    create_archive(out_path.with_suffix(".zip"), sources)
+
+
+def open_in_cde_utility(file_path: Path):
+    ext = file_path.suffix.lower()
+    local_bin = HOME / ".local/bin"
+    pic_exts = {
+        ".png", ".jpg", ".jpeg", ".jpe", ".jfif", ".bmp", ".dib", ".gif",
+        ".heic", ".heif", ".avif", ".jxl", ".webp", ".tif", ".tiff",
+        ".svg", ".svgz", ".ico", ".icns", ".ppm", ".pgm", ".pbm", ".pnm",
+        ".xpm", ".xbm", ".tga", ".targa", ".pcx", ".qoi", ".dds", ".psd",
+    }
+    if ext in pic_exts and (local_bin / "dtpics").is_file():
+        subprocess.Popen([str(local_bin / "dtpics"), str(file_path)], start_new_session=True)
+    elif ext == ".pdf" and (local_bin / "dtreader").is_file():
+        subprocess.Popen([str(local_bin / "dtreader"), str(file_path)], start_new_session=True)
+    elif ext in (".rtf", ".txt", ".md", ".markdown", ".log", ".ini", ".cfg", ".conf", ".csv") and (local_bin / "dtnotes").is_file():
+        subprocess.Popen([str(local_bin / "dtnotes"), str(file_path)], start_new_session=True)
+    elif is_archive_path(file_path) and (local_bin / "dtzip").is_file():
+        subprocess.Popen([str(local_bin / "dtzip"), str(file_path)], start_new_session=True)
+    elif Path("/usr/dt/bin/dtaction").is_file():
+        env = os.environ.copy()
+        env["PATH"] = f"/usr/dt/bin:{env.get('PATH', '')}"
+        subprocess.Popen(["/usr/dt/bin/dtaction", "Open", str(file_path)], env=env, start_new_session=True)
+    else:
+        subprocess.Popen(["xdg-open", str(file_path)], start_new_session=True)
+
+
+class CreateArchiveDialog(Gtk.Dialog):
+    def __init__(self, parent, initial_sources: list[Path] | None = None):
+        super().__init__(title="Create Archive — dtZip", transient_for=parent, flags=0)
+        self.set_default_size(580, 420)
+        self.sources: list[Path] = list(initial_sources or [])
+
+        box = self.get_content_area()
+        box.set_spacing(8)
+        box.set_margin_start(10)
+        box.set_margin_end(10)
+        box.set_margin_top(8)
+        box.set_margin_bottom(8)
+
+        fr_out = Gtk.Frame(label=" Archive Format & Destination ")
+        g = Gtk.Grid(column_spacing=8, row_spacing=6, margin=8)
+        fr_out.add(g)
+
+        g.attach(Gtk.Label(label="Format:", xalign=0), 0, 0, 1, 1)
+        self.cmb_fmt = Gtk.ComboBoxText(hexpand=True)
+        for ext, desc in CREATE_FORMATS:
+            self.cmb_fmt.append(ext, desc)
+        self.cmb_fmt.set_active_id(".zip")
+        self.cmb_fmt.connect("changed", self._on_fmt_changed)
+        g.attach(self.cmb_fmt, 1, 0, 2, 1)
+
+        g.attach(Gtk.Label(label="Output Archive:", xalign=0), 0, 1, 1, 1)
+        self.ent_out = Gtk.Entry(hexpand=True)
+        default_dir = self.sources[0].parent if self.sources else HOME
+        default_stem = self.sources[0].stem if len(self.sources) == 1 else "archive"
+        self.ent_out.set_text(str(default_dir / f"{default_stem}.zip"))
+        btn_b = Gtk.Button(label="Browse...")
+        btn_b.connect("clicked", self._on_browse_out)
+        g.attach(self.ent_out, 1, 1, 1, 1)
+        g.attach(btn_b, 2, 1, 1, 1)
+        box.pack_start(fr_out, False, False, 0)
+
+        fr_in = Gtk.Frame(label=" Files & Folders to Compress (Drag & Drop Here) ")
+        vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=8)
+        fr_in.add(vb)
+
+        sc = Gtk.ScrolledWindow(vexpand=True)
+        self.store = Gtk.ListStore(str, str)
+        tv = Gtk.TreeView(model=self.store)
+        tv.append_column(Gtk.TreeViewColumn("Item", Gtk.CellRendererText(), text=0))
+        tv.append_column(Gtk.TreeViewColumn("Full Path", Gtk.CellRendererText(), text=1))
+        sc.add(tv)
+        vb.pack_start(sc, True, True, 0)
+
+        # Enable drag-and-drop onto file list too
+        targets = [
+            Gtk.TargetEntry.new("text/uri-list", 0, 0),
+            Gtk.TargetEntry.new("text/plain", 0, 1),
+            Gtk.TargetEntry.new("STRING", 0, 2),
+        ]
+        tv.drag_dest_set(Gtk.DestDefaults.ALL, targets, Gdk.DragAction.COPY)
+        tv.connect("drag-data-received", self._on_drop)
+
+        hb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        b_add_f = Gtk.Button(label="＋ Add Files...")
+        b_add_f.connect("clicked", lambda _b: self._pick_items(False))
+        b_add_d = Gtk.Button(label="＋ Add Folder...")
+        b_add_d.connect("clicked", lambda _b: self._pick_items(True))
+        b_clr = Gtk.Button(label="Clear List")
+        b_clr.connect("clicked", lambda _b: (self.sources.clear(), self._refresh_store()))
+        hb.pack_start(b_add_f, False, False, 0)
+        hb.pack_start(b_add_d, False, False, 0)
+        hb.pack_end(b_clr, False, False, 0)
+        vb.pack_start(hb, False, False, 0)
+        box.pack_start(fr_in, True, True, 0)
+
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        ok_b = self.add_button("Create Archive", Gtk.ResponseType.OK)
+        ok_b.get_style_context().add_class("cde-accent")
+
+        self._refresh_store()
+        self.show_all()
+
+    def _refresh_store(self):
+        self.store.clear()
+        for p in self.sources:
+            kind = "[Folder]" if p.is_dir() else "[File]"
+            self.store.append([f"{kind} {p.name}", str(p)])
+
+    def _on_fmt_changed(self, _cmb):
+        ext = self.cmb_fmt.get_active_id() or ".zip"
+        cur = self.ent_out.get_text().strip()
+        if cur:
+            base = ARCHIVE_EXT_RE.sub("", cur)
+            self.ent_out.set_text(base + ext)
+
+    def _on_browse_out(self, _btn):
+        dlg = Gtk.FileChooserDialog(title="Save Archive As", parent=self, action=Gtk.FileChooserAction.SAVE)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save", Gtk.ResponseType.OK)
+        dlg.set_current_name(Path(self.ent_out.get_text().strip() or "archive.zip").name)
+        if dlg.run() == Gtk.ResponseType.OK:
+            self.ent_out.set_text(dlg.get_filename())
+        dlg.destroy()
+
+    def _pick_items(self, folder: bool):
+        act = Gtk.FileChooserAction.SELECT_FOLDER if folder else Gtk.FileChooserAction.OPEN
+        dlg = Gtk.FileChooserDialog(title="Select Items to Add", parent=self, action=act)
+        dlg.set_select_multiple(True)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Add", Gtk.ResponseType.OK)
+        if dlg.run() == Gtk.ResponseType.OK:
+            for fn in dlg.get_filenames():
+                p = Path(fn).resolve()
+                if p not in self.sources:
+                    self.sources.append(p)
+            self._refresh_store()
+        dlg.destroy()
+
+    def _on_drop(self, _w, context, _x, _y, data, _info, time_):
+        for p in parse_dropped_paths(data):
+            if p not in self.sources:
+                self.sources.append(p)
+        self._refresh_store()
+        Gtk.drag_finish(context, True, False, time_)
+
+
+class DtZipWindow(Gtk.Window):
+    def __init__(self, initial_paths: list[Path]):
+        super().__init__(title="dtZip — CDE Archive Manager")
+        self.set_wmclass("dtzip", "DtZip")
+        self.set_default_size(840, 560)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        ic = DT_ICONS / "dtzip.l.pm"
+        if ic.is_file():
+            try:
+                self.set_icon_from_file(str(ic))
+            except Exception:
+                pass
+
+        self.current_archive: Path | None = None
+        self.entries: list[dict] = []
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(vbox)
+
+        # 1. Menu Bar
+        mbar = Gtk.MenuBar()
+        m_file = Gtk.Menu()
+        mi_file = Gtk.MenuItem(label="Archive")
+        mi_file.set_submenu(m_file)
+        for lbl, cb in [
+            ("New Archive...", self.on_new_archive),
+            ("Open Archive...", self.on_open_archive),
+            ("-", None),
+            ("Extract All...", self.on_extract_all),
+            ("Extract Here (Auto-Subfolder)", self.on_extract_here),
+            ("Extract Selected...", self.on_extract_selected),
+            ("-", None),
+            ("Exit", lambda *_: self.destroy()),
+        ]:
+            if lbl == "-":
+                m_file.append(Gtk.SeparatorMenuItem())
+            else:
+                it = Gtk.MenuItem(label=lbl)
+                it.connect("activate", cb)
+                m_file.append(it)
+        mbar.append(mi_file)
+
+        m_help = Gtk.Menu()
+        mi_help = Gtk.MenuItem(label="Help")
+        mi_help.set_submenu(m_help)
+        it_ab = Gtk.MenuItem(label="About dtZip...")
+        it_ab.connect("activate", self.on_about)
+        m_help.append(it_ab)
+        mbar.append(mi_help)
+        vbox.pack_start(mbar, False, False, 0)
+
+        # 2. CDE Beveled Toolbar
+        tbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        tbar.get_style_context().add_class("cde-toolbar")
+        b_new = Gtk.Button(label="＋ New Archive")
+        b_new.get_style_context().add_class("cde-accent")
+        b_new.connect("clicked", self.on_new_archive)
+        tbar.pack_start(b_new, False, False, 0)
+
+        for lbl, cb in [
+            ("Open...", self.on_open_archive),
+            ("Extract All...", self.on_extract_all),
+            ("Extract Here", self.on_extract_here),
+            ("Extract Selected...", self.on_extract_selected),
+            ("Add Files...", self.on_add_to_current),
+        ]:
+            b = Gtk.Button(label=lbl)
+            b.connect("clicked", cb)
+            tbar.pack_start(b, False, False, 0)
+
+        self.ent_filter = Gtk.SearchEntry(placeholder_text="Filter contents...")
+        self.ent_filter.connect("search-changed", lambda _e: self._populate_table())
+        tbar.pack_end(self.ent_filter, False, False, 0)
+        vbox.pack_start(tbar, False, False, 0)
+
+        # 3. Drag-and-Drop Banner
+        drop_banner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        drop_banner.get_style_context().add_class("cde-dropbar")
+        self.lbl_drop = Gtk.Label(
+            label="Drag & Drop any archive (.zip, .tar.gz, .tar.bz2, .tar, .7z, .rar) here to inspect/extract — or drop files & folders here to create a new archive.",
+            xalign=0,
+        )
+        self.lbl_drop.set_ellipsize(Pango.EllipsizeMode.END)
+        drop_banner.pack_start(self.lbl_drop, True, True, 0)
+        vbox.pack_start(drop_banner, False, False, 0)
+
+        # 4. Contents Table (with subtle greenbar alternating rows)
+        fr_tbl = Gtk.Frame(margin=6)
+        sc = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        fr_tbl.add(sc)
+        # Columns: name, human_size, human_packed, ratio, mtime, row_bg, raw_name
+        self.store = Gtk.ListStore(str, str, str, str, str, str, str)
+        self.tv = Gtk.TreeView(model=self.store)
+        self.tv.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        self.tv.connect("row-activated", self.on_row_double_clicked)
+
+        cols = [
+            ("Name / Path inside Archive", 0, 360, True),
+            ("Size", 1, 95, False),
+            ("Packed", 2, 95, False),
+            ("Ratio", 3, 65, False),
+            ("Modified", 4, 140, False),
+        ]
+        for title, cidx, min_w, expand in cols:
+            rend = Gtk.CellRendererText()
+            if cidx in (1, 2, 3):
+                rend.set_property("xalign", 1.0)
+            col = Gtk.TreeViewColumn(title, rend, text=cidx, cell_background=5)
+            col.set_resizable(True)
+            col.set_min_width(min_w)
+            col.set_expand(expand)
+            col.set_sort_column_id(cidx)
+            self.tv.append_column(col)
+
+        sc.add(self.tv)
+        vbox.pack_start(fr_tbl, True, True, 0)
+
+        # 5. Status Bar
+        st_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        st_bar.get_style_context().add_class("cde-status")
+        self.lbl_status = Gtk.Label(label="Ready — No archive loaded.", xalign=0)
+        st_bar.pack_start(self.lbl_status, True, True, 0)
+        vbox.pack_start(st_bar, False, False, 0)
+
+        # Configure Drag-and-Drop on the entire window & table
+        targets = [
+            Gtk.TargetEntry.new("text/uri-list", 0, 0),
+            Gtk.TargetEntry.new("text/plain", 0, 1),
+            Gtk.TargetEntry.new("STRING", 0, 2),
+        ]
+        for w in (self, self.tv, drop_banner):
+            w.drag_dest_set(Gtk.DestDefaults.ALL, targets, Gdk.DragAction.COPY)
+            w.connect("drag-data-received", self.on_drag_data_received)
+
+        self.show_all()
+
+        if initial_paths:
+            GLib.idle_add(self.handle_incoming_paths, initial_paths)
+
+    def set_status(self, msg: str):
+        GLib.idle_add(self.lbl_status.set_text, msg)
+
+    def handle_incoming_paths(self, paths: list[Path]):
+        if len(paths) == 1 and is_archive_path(paths[0]):
+            self.load_archive(paths[0])
+        elif paths:
+            self.open_create_dialog(paths)
+
+    def on_drag_data_received(self, _widget, context, _x, _y, data, _info, time_):
+        paths = parse_dropped_paths(data)
+        Gtk.drag_finish(context, bool(paths), False, time_)
+        if not paths:
+            return
+        if len(paths) == 1 and is_archive_path(paths[0]):
+            self.load_archive(paths[0])
+            return
+        # Regular files/folders dropped: if writable zip/7z open, offer Add vs New Archive
+        if self.current_archive and self.current_archive.suffix.lower() in (".zip", ".7z"):
+            md = Gtk.MessageDialog(
+                transient_for=self, flags=0, message_type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.NONE,
+                text=f"Add {len(paths)} dropped item(s) to '{self.current_archive.name}', or create a new archive?",
+            )
+            md.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
+                           "Create New Archive...", 1,
+                           f"Add to {self.current_archive.name}", 2)
+            resp = md.run()
+            md.destroy()
+            if resp == 2:
+                self._add_paths_to_current(paths)
+            elif resp == 1:
+                self.open_create_dialog(paths)
+        else:
+            self.open_create_dialog(paths)
+
+    def load_archive(self, arch_path: Path):
+        try:
+            entries = list_archive_entries(arch_path)
+            self.current_archive = arch_path.resolve()
+            self.entries = entries
+            self.set_title(f"{arch_path.name} — dtZip")
+            self.lbl_drop.set_text(f"Archive: {self.current_archive}  (Double-click any entry to preview, or drag files to add/create)")
+            self._populate_table()
+            tot_sz = sum(e["size"] for e in entries if not e["is_dir"])
+            n_files = sum(1 for e in entries if not e["is_dir"])
+            self.set_status(f"{n_files} file(s), {human_size(tot_sz)} uncompressed  —  {arch_path.name}")
+        except Exception as exc:
+            self._error(f"Could not open archive '{arch_path.name}':\n{exc}")
+
+    def _populate_table(self):
+        self.store.clear()
+        q = self.ent_filter.get_text().strip().lower()
+        vis_idx = 0
+        for e in self.entries:
+            if q and q not in e["name"].lower():
+                continue
+            bg = "#eef4db" if (vis_idx & 1) else "#fff7e9"
+            vis_idx += 1
+            if e["is_dir"]:
+                self.store.append([f"📁 {e['name']}", "<Folder>", "", "", e["mtime"], bg, e["name"]])
+            else:
+                sz = e["size"]
+                pk = e["packed"]
+                ratio = f"{int(round((1.0 - pk / sz) * 100))}%" if sz > 0 and pk <= sz else "0%"
+                self.store.append([e["name"], human_size(sz), human_size(pk), ratio, e["mtime"], bg, e["name"]])
+
+    def on_new_archive(self, *_args):
+        self.open_create_dialog([])
+
+    def open_create_dialog(self, initial_sources: list[Path]):
+        dlg = CreateArchiveDialog(self, initial_sources)
+        while True:
+            resp = dlg.run()
+            if resp != Gtk.ResponseType.OK:
+                dlg.destroy()
+                return
+            out_txt = dlg.ent_out.get_text().strip()
+            sources = list(dlg.sources)
+            if not sources:
+                self._error("Please add or drop at least one file or folder to compress.")
+                continue
+            if not out_txt:
+                self._error("Please specify an output archive filename.")
+                continue
+            out_path = Path(out_txt).expanduser().resolve()
+            dlg.destroy()
+            break
+
+        self.set_status(f"Creating {out_path.name}...")
+
+        def worker():
+            try:
+                create_archive(out_path, sources)
+                GLib.idle_add(self.load_archive, out_path)
+                self.set_status(f"Created archive: {out_path}")
+            except Exception as exc:
+                GLib.idle_add(self._error, f"Archive creation failed:\n{exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_open_archive(self, *_args):
+        dlg = Gtk.FileChooserDialog(title="Open Archive — dtZip", parent=self, action=Gtk.FileChooserAction.OPEN)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Open", Gtk.ResponseType.OK)
+        flt = Gtk.FileFilter()
+        flt.set_name("All Supported Archives (*.zip, *.tar.*, *.7z, *.rar, *.gz, *.bz2, *.xz)")
+        for pat in ("*.zip", "*.ZIP", "*.tar", "*.tar.gz", "*.tgz", "*.tar.bz2", "*.tbz2",
+                    "*.tar.xz", "*.txz", "*.7z", "*.rar", "*.RAR", "*.gz", "*.bz2", "*.xz", "*.iso", "*.cab"):
+            flt.add_pattern(pat)
+        dlg.add_filter(flt)
+        flt_all = Gtk.FileFilter()
+        flt_all.set_name("All Files")
+        flt_all.add_pattern("*")
+        dlg.add_filter(flt_all)
+        if dlg.run() == Gtk.ResponseType.OK:
+            self.load_archive(Path(dlg.get_filename()))
+        dlg.destroy()
+
+    def _selected_raw_names(self) -> list[str]:
+        model, paths = self.tv.get_selection().get_selected_rows()
+        return [model[p][6] for p in paths]
+
+    def on_extract_all(self, *_args):
+        if not self.current_archive:
+            return
+        dlg = Gtk.FileChooserDialog(title="Extract Archive To...", parent=self, action=Gtk.FileChooserAction.SELECT_FOLDER)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Extract Here", Gtk.ResponseType.OK)
+        dlg.set_current_folder(str(self.current_archive.parent))
+        if dlg.run() == Gtk.ResponseType.OK:
+            dest = Path(dlg.get_filename())
+            dlg.destroy()
+            self._run_extract(dest, None)
+        else:
+            dlg.destroy()
+
+    def on_extract_here(self, *_args):
+        if not self.current_archive:
+            return
+        stem = ARCHIVE_EXT_RE.sub("", self.current_archive.name) or (self.current_archive.stem + "_extracted")
+        top_roots = {e["name"].lstrip("/").split("/", 1)[0] for e in self.entries if e["name"].strip("/")}
+        dest = self.current_archive.parent if len(top_roots) == 1 else (self.current_archive.parent / stem)
+        self._run_extract(dest, None)
+
+    def on_extract_selected(self, *_args):
+        if not self.current_archive:
+            return
+        sel = self._selected_raw_names()
+        if not sel:
+            self._error("Select one or more items in the archive list first.")
+            return
+        dlg = Gtk.FileChooserDialog(title=f"Extract {len(sel)} Selected Item(s) To...", parent=self, action=Gtk.FileChooserAction.SELECT_FOLDER)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Extract Selected", Gtk.ResponseType.OK)
+        dlg.set_current_folder(str(self.current_archive.parent))
+        if dlg.run() == Gtk.ResponseType.OK:
+            dest = Path(dlg.get_filename())
+            dlg.destroy()
+            self._run_extract(dest, sel)
+        else:
+            dlg.destroy()
+
+    def _run_extract(self, dest: Path, sel: list[str] | None):
+        arch = self.current_archive
+        self.set_status(f"Extracting {arch.name} -> {dest} ...")
+
+        def worker():
+            try:
+                extract_archive(arch, dest, sel)
+                self.set_status(f"Extracted cleanly to {dest}")
+            except Exception as exc:
+                GLib.idle_add(self._error, f"Extraction failed:\n{exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_add_to_current(self, *_args):
+        if not self.current_archive:
+            self.open_create_dialog([])
+            return
+        if self.current_archive.suffix.lower() not in (".zip", ".7z"):
+            self._error("In-place adding is supported for .zip and .7z archives. Use 'New Archive' for compressed tarballs.")
+            return
+        dlg = Gtk.FileChooserDialog(title=f"Add Files to {self.current_archive.name}", parent=self, action=Gtk.FileChooserAction.OPEN)
+        dlg.set_select_multiple(True)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Add", Gtk.ResponseType.OK)
+        if dlg.run() == Gtk.ResponseType.OK:
+            paths = [Path(f).resolve() for f in dlg.get_filenames()]
+            dlg.destroy()
+            self._add_paths_to_current(paths)
+        else:
+            dlg.destroy()
+
+    def _add_paths_to_current(self, paths: list[Path]):
+        arch = self.current_archive
+        if not arch:
+            return
+        try:
+            if arch.suffix.lower() == ".zip":
+                with zipfile.ZipFile(arch, "a", compression=zipfile.ZIP_DEFLATED) as zf:
+                    for p in paths:
+                        if p.is_file():
+                            zf.write(p, p.name)
+                        elif p.is_dir():
+                            for root, _, files in os.walk(p):
+                                for f in files:
+                                    fp = Path(root) / f
+                                    zf.write(fp, str(fp.relative_to(p.parent)))
+            elif arch.suffix.lower() == ".7z":
+                subprocess.run([SEVENZ, "a", "-bd", str(arch)] + [str(p) for p in paths], check=True)
+            self.load_archive(arch)
+        except Exception as exc:
+            self._error(f"Could not add files:\n{exc}")
+
+    def on_row_double_clicked(self, _tv, path, _col):
+        if not self.current_archive:
+            return
+        raw_name = self.store[path][6]
+        if raw_name.endswith("/"):
+            return
+        tmp_dir = Path(tempfile.mkdtemp(prefix="dtzip_preview_"))
+        try:
+            extract_archive(self.current_archive, tmp_dir, [raw_name])
+            target = safe_member_dest(tmp_dir, raw_name)
+            if target.is_file():
+                open_in_cde_utility(target)
+        except Exception as exc:
+            self._error(f"Could not preview '{raw_name}':\n{exc}")
+
+    def on_about(self, *_args):
+        md = Gtk.MessageDialog(
+            transient_for=self, flags=0, message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK, text="dtZip — CDE Archive Manager",
+        )
+        md.format_secondary_text(
+            "Drag-and-drop archive manager for Common Desktop Environment.\n"
+            "Supports .zip, .tar.gz, .tar.bz2, .tar.xz, .tar, .7z, .rar, .gz, .bz2, and .xz."
+        )
+        md.run()
+        md.destroy()
+
+    def _error(self, msg: str):
+        md = Gtk.MessageDialog(transient_for=self, flags=0, message_type=Gtk.MessageType.ERROR,
+                               buttons=Gtk.ButtonsType.OK, text=msg)
+        md.run()
+        md.destroy()
+
+
+def main():
+    if len(sys.argv) >= 3 and sys.argv[1] == "--extract-here":
+        arch = Path(sys.argv[2]).expanduser().resolve()
+        entries = list_archive_entries(arch)
+        stem = ARCHIVE_EXT_RE.sub("", arch.name) or (arch.stem + "_extracted")
+        top_roots = {e["name"].lstrip("/").split("/", 1)[0] for e in entries if e["name"].strip("/")}
+        dest = arch.parent if len(top_roots) == 1 else (arch.parent / stem)
+        extract_archive(arch, dest, None)
+        return 0
+
+    provider = Gtk.CssProvider()
+    provider.load_from_data(load_cde_css())
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+    )
+
+    init_paths = [
+        Path(a).expanduser().resolve()
+        for a in sys.argv[1:]
+        if a.strip() and not a.startswith("-") and Path(a).expanduser().exists()
+    ]
+    win = DtZipWindow(init_paths)
+    win.connect("destroy", Gtk.main_quit)
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
