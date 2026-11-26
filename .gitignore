@@ -3,6 +3,7 @@ __pycache__/
 *.o
 cde-mail
 cde-calendar
+cde-term
 tokens.json
 config.json
 *.db

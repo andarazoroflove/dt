@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APPS=(
     dtMail
     dtCalendar
+    dtTerm
     dtPod
     dtPaint
     dtPlay
@@ -28,5 +29,5 @@ if [ -x /usr/dt/bin/dtaction ]; then
 fi
 
 echo ""
-echo "All 12 CDE applications installed! Restart dtwm (Workspace Menu -> Restart Workspace Manager)"
+echo "All 13 CDE applications installed! Restart dtwm (Workspace Menu -> Restart Workspace Manager)"
 echo "to see all launchers in your Utilities and Mail Front Panel subpanels."

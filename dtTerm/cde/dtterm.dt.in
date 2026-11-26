@@ -1,0 +1,42 @@
+set DtDbVersion=1.0
+
+ACTION dtTerm
+{
+     LABEL         dtTerm
+     ARG_COUNT     0
+     ICON          dtterm
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtTerm
+     DESCRIPTION   dtTerm — Multi-Tab OSF/Motif CDE Terminal Emulator.
+}
+
+ACTION dtTerm
+{
+     LABEL         dtTerm
+     ICON          dtterm
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtTerm "%(File)Arg_1%"
+     DESCRIPTION   Open folder or file location in dtTerm.
+}
+
+ACTION Terminal
+{
+     LABEL         dtTerm
+     ICON          dtterm
+     TYPE          MAP
+     MAP_ACTION    dtTerm
+     DESCRIPTION   dtTerm — Multi-Tab OSF/Motif CDE Terminal Emulator.
+}
+
+ACTION Dtterm
+{
+     LABEL         dtTerm
+     ARG_COUNT     0
+     ICON          dtterm
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtTerm
+     DESCRIPTION   dtTerm — Multi-Tab OSF/Motif CDE Terminal Emulator.
+}

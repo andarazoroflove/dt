@@ -257,6 +257,7 @@ PYTHON_CDE_APPS = [
 MOTIF_TARGET_MAP = [
     ("dtMail (cde-mail)",   "cde-mail",                LOCAL_BIN / "cde-mail",                  ["cde_mail.c", "cde_oe_icons.h"]),
     ("dtCalendar (dtcm)",   "cde-calendar",            LOCAL_BIN / "cde-calendar",              ["cde_calendar.c"]),
+    ("dtTerm (cde-term)",   "cde-term",                LOCAL_BIN / "cde-term",                  ["cde_term.c", "cde_term_icon.h"]),
     ("CDE Screenshot",      "cde-shot",                LOCAL_BIN / "cde-shot",                  ["cde_shot.c", "cde_motif_theme.h"]),
     ("CDE Panel Tray",      "cde-panel-tray",          LOCAL_BIN / "cde-panel-tray",            ["cde_panel_tray.c"]),
     ("CDE Layout Helper",   "cde-apply-layout",        LOCAL_BIN / "cde-apply-layout",          ["cde_apply_layout.c"]),

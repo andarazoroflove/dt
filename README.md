@@ -2,7 +2,7 @@
 
 # `dt` — Modern Workstation Application Suite for CDE
 
-**Twelve cohesive, native-feeling desktop applications crafted for the Common Desktop Environment (CDE) on Linux & UNIX.**
+**Thirteen cohesive, native-feeling desktop applications crafted for the Common Desktop Environment (CDE) on Linux & UNIX.**
 
 <p>
   <img src="assets/screenshots/hero-collage.png" alt="dt CDE Application Suite Showcase" width="100%" />
@@ -10,7 +10,7 @@
 
 <p>
   <a href="#quick-start--installation"><b>Quick Install</b></a> •
-  <a href="#application-directory"><b>All 12 Apps</b></a> •
+  <a href="#application-directory"><b>All 13 Apps</b></a> •
   <a href="#cde-palette--front-panel-architecture"><b>Palette Architecture</b></a> •
   <a href="./LICENSE"><b>MIT License</b></a>
 </p>
@@ -31,8 +31,9 @@ Every application lives in **its own self-contained directory** with its source 
 
 | Icon | Folder | Purpose | CDE Panel Location |
 | :---: | :--- | :--- | :--- |
-| <img src="assets/icons/dtmail.png" width="32" height="32" alt="dtMail" /> | **[`dtMail/`](./dtMail/)** | **Native OSF/Motif 2.3 Microsoft 365 & Mail Client** | `Mail Subpanel` |
+| <img src="assets/icons/dtmail.png" width="32" height="32" alt="dtMail" /> | **[`dtMail/`](./dtMail/)** | **Native OSF/Motif 2.3 Microsoft 365 & Mail Client** | `Front Panel / Mail` |
 | <img src="assets/icons/dtcalendar.png" width="32" height="32" alt="dtCalendar (`dtcm`)" /> | **[`dtCalendar/`](./dtCalendar/)** | **Native OSF/Motif 2.3 Calendar & Microsoft 365 Companion** | `Front Panel Date / Calendar (`Dtcm`)` |
+| <img src="assets/icons/dtterm.png" width="32" height="32" alt="dtTerm" /> | **[`dtTerm/`](./dtTerm/)** | **Multi-Tab Native OSF/Motif 2.3 & `libDtTerm` Terminal Emulator** | `Utilities Subpanel` |
 | <img src="assets/icons/dtpod.png" width="32" height="32" alt="dtPod" /> | **[`dtPod/`](./dtPod/)** | **Apple Podcasts Directory Browser, Subscriber & Streaming Player** | `Utilities Subpanel` |
 | <img src="assets/icons/dtpaint.png" width="32" height="32" alt="dtPaint" /> | **[`dtPaint/`](./dtPaint/)** | **Classic MS Paint Ribbon Studio with Universal Image Format Support** | `Utilities Subpanel` |
 | <img src="assets/icons/dtplay.png" width="32" height="32" alt="dtPlay" /> | **[`dtPlay/`](./dtPlay/)** | **VLC-Style Music & Movie Player with 60-Second Clip Studio** | `Utilities Subpanel` |
@@ -69,9 +70,9 @@ sudo apt install -y \
   python3-pil python3-requests imagemagick p7zip-full
 ```
 
-*(Note: `dtMail` and `dtCalendar` also link against `/usr/dt/include` and `/usr/dt/lib` from a standard CDE installation.)*
+*(Note: `dtMail`, `dtCalendar`, and `dtTerm` also link against `/usr/dt/include` and `/usr/dt/lib` from a standard CDE installation.)*
 
-### Install All 12 Applications
+### Install All 13 Applications
 
 ```bash
 git clone https://github.com/andarazoroflove/dt.git
@@ -128,6 +129,22 @@ A drop-in native OSF/Motif replacement for stock CDE `dtcm` that shares OAuth 2.
 
 ```bash
 cd dtCalendar && make && ./install.sh
+```
+---
+
+## <img src="assets/icons/dtterm.png" width="40" height="40" align="absmiddle" alt="dtTerm icon" /> dtTerm
+
+**Folder:** [`./dtTerm/`](./dtTerm/) &nbsp;•&nbsp; **Front Panel:** `Utilities Subpanel` &nbsp;•&nbsp; **Stack:** C11 • OSF/Motif (`libXm`) • CDE `libDtTerm` (`DtCreateTerm`)
+
+A multi-tab upgrade to CDE's classic `dtterm` that embeds genuine `DtCreateTerm` terminal widgets inside a 3D beveled Motif tab deck. Preserves authentic CDE terminal emulation, scrollbars, fonts, and palette resources while adding 1-click tab management and built-in smart clipboard shortcuts.
+
+### Highlights
+- **Multi-Tab Motif Deck (`+ New Tab` / `Ctrl+Shift+T`)** — Open additional tabs that automatically inherit the active tab's working directory (`/proc/<pid>/cwd`), switch with `Ctrl+Tab` / `Alt+1`–`Alt+9`, and right-click tabs to **Duplicate**, **Rename**, or **Close Other Tabs**.
+- **Built-in Smart Clipboard** — `Ctrl+C` copies selected text to `CLIPBOARD` and clears the highlight (or sends normal `^C` `SIGINT` when nothing is selected); `Ctrl+V` pastes from `CLIPBOARD`.
+- **Dynamic CDE Palette & Retro Themes** — Syncs with your active CDE palette (`Crimson.dp`, `Broica.dp`, etc.) and switches instantly between **CDE Palette**, **Dark Workstation**, **Green Phosphor**, and **Amber Phosphor**, plus `[A-]`/`[A+]` (`Ctrl+-`/`Ctrl++`) font zoom.
+
+```bash
+cd dtTerm && ./install.sh
 ```
 ---
 
