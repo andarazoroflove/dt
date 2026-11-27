@@ -1,0 +1,12 @@
+set DtDbVersion=1.0
+
+ACTION dtScope
+{
+     LABEL         dtScope
+     ARG_COUNT     0
+     ICON          dtscope
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtscope
+     DESCRIPTION   dtScope — Vintage Analog CRT & Digital Storage Audio Oscilloscope / Function Generator.
+}

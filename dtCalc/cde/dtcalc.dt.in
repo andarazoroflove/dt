@@ -1,0 +1,14 @@
+# ##########################################################################
+# dtCalc CDE Action Definition
+# ##########################################################################
+set DtDbVersion=1.0
+
+ACTION dtCalc
+{
+    LABEL           dtCalc
+    TYPE            COMMAND
+    WINDOW_TYPE     NO_STDIO
+    ICON            dtcalc
+    EXEC_STRING     __HOME__/.local/bin/cde-calc
+    DESCRIPTION     Native OSF/Motif RPN, Scientific, RF & 64-Bit Programmer Calculator for CDE.
+}

@@ -1,0 +1,12 @@
+set DtDbVersion=1.0
+
+ACTION dtSat
+{
+     LABEL         dtSat
+     ARG_COUNT     0
+     ICON          dtsat
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtsat
+     DESCRIPTION   dtSat — Vintage NASA/NORAD & Amateur Radio Satellite Pass & Doppler Tracker.
+}

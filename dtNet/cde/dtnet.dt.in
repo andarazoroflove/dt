@@ -1,0 +1,12 @@
+set DtDbVersion=1.0
+
+ACTION dtNet
+{
+     LABEL         dtNet
+     ARG_COUNT     0
+     ICON          dtnet
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtnet
+     DESCRIPTION   dtNet — Vintage Analog Network Telemetry, World Traceroute Radar & Socket Console.
+}

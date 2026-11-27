@@ -1,0 +1,3360 @@
+#!/usr/bin/env python3
+"""
+dtLog — Vintage Amateur Radio QSO & SWL Station Logbook for CDE
+
+Features:
+  - Authentic 1980s/1990s shack console & tractor-feed greenbar logbook styled for CDE (OSF/Motif bevels)
+  - Pre-configured for W1AW • Grid FN31pr (41.7292° N, -72.7083° W — Newington, CT), editable in Station Setup
+  - Top Vintage Shack Console Deck:
+      * Glowing VFD UTC / Local Shack Clock + 6-Counter Telemetry Strip
+      * Tactical VFD Callsign / DXCC / Zone / Dupe Annunciator Panel
+      * Warm Backlit 360° Analog Rotor / Great-Circle Azimuth Beam Compass (Red Short-Path + Cyan Long-Path)
+  - Offline 265+ Entity ITU / ARRL DXCC Prefix & US/VE/JA/VK Call-Area Resolver + Maidenhead Geodesic Engine
+  - Fast Shack Entry Strip supporting both HAM QSO and SWL / UTILITY reception logs
+  - Direct [⚡ GRAB FROM dtRadio] bridge reading ~/.config/dtradio/state.json live
+  - SQLite backend (~/.local/share/dtlog/logbook.sqlite) with instant search/filter & sortable greenbar table
+  - Full ADIF 3.1.4 (.adi) Import/Export + one-click [IMPORT WSJT-X LOG] (~/.local/share/WSJT-X/wsjtx_log.adi)
+  - Vintage Postcard QSL Card Generator (Cairo .PNG export + copyable ASCII QSL slip)
+"""
+
+import datetime
+import json
+import math
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import cairo
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("Pango", "1.0")
+try:
+    gi.require_version("PangoCairo", "1.0")
+    from gi.repository import PangoCairo
+except Exception:
+    PangoCairo = None
+from gi.repository import Gdk, GLib, Gtk, Pango
+
+HOME = Path.home()
+SCRIPT_DIR = Path(__file__).resolve().parent
+CONFIG_DIR = HOME / ".config" / "dtlog"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+DATA_DIR = HOME / ".local" / "share" / "dtlog"
+DB_FILE = DATA_DIR / "logbook.sqlite"
+DTRADIO_STATE_FILE = HOME / ".config" / "dtradio" / "state.json"
+WSJTX_LOG_FILE = HOME / ".local" / "share" / "WSJT-X" / "wsjtx_log.adi"
+
+DEFAULT_CONFIG = {
+    "callsign": "W1AW",
+    "grid": "FN31pr",
+    "lat": 41.7292,
+    "lon": -72.7083,
+    "qth": "Newington, CT",
+    "itu_zone": 8,
+    "cq_zone": 5,
+    "tx_pwr": "100",
+}
+
+BAND_PLAN: list[tuple[str, float, float, float]] = [
+    ("2200m", 0.1357, 0.1378, 0.1360),
+    ("630m", 0.4720, 0.4790, 0.4742),
+    ("160m", 1.8000, 2.0000, 1.8400),
+    ("80m", 3.5000, 4.0000, 3.8600),
+    ("60m", 5.2500, 5.4500, 5.3570),
+    ("40m", 7.0000, 7.3000, 7.1850),
+    ("30m", 10.1000, 10.1500, 10.1360),
+    ("20m", 14.0000, 14.3500, 14.2300),
+    ("17m", 18.0680, 18.1680, 18.1300),
+    ("15m", 21.0000, 21.4500, 21.2850),
+    ("12m", 24.8900, 24.9900, 24.9500),
+    ("10m", 28.0000, 29.7000, 28.4000),
+    ("6m", 50.0000, 54.0000, 50.1250),
+    ("2m", 144.0000, 148.0000, 146.5200),
+    ("1.25m", 219.0000, 225.0000, 223.5000),
+    ("70cm", 420.0000, 450.0000, 446.0000),
+    ("33cm", 902.0000, 928.0000, 906.5000),
+    ("23cm", 1240.0000, 1300.0000, 1294.5000),
+]
+
+ALL_BANDS = [b[0] for b in BAND_PLAN] + ["MW", "SWL/HF", "VHF/UHF"]
+ALL_MODES = ["SSB", "USB", "LSB", "CW", "FT8", "FT4", "FM", "AM", "RTTY", "SSTV", "JS8", "SWL"]
+
+
+# ---------------------------------------------------------------------------
+# CDE Palette Loader & Vintage Shack Console Motif CSS
+# ---------------------------------------------------------------------------
+def load_cde_palette() -> tuple[str, str, str]:
+    chrome, sel, well = "#aeb2c3", "#2c567e", "#fff7e9"
+    try:
+        out = subprocess.check_output(["xrdb", "-query"], text=True, stderr=subprocess.DEVNULL)
+        pal_name = "Crimson.dp"
+        for ln in out.splitlines():
+            if "ColorPalette:" in ln:
+                pal_name = ln.split(":", 1)[1].strip()
+                break
+        for pdir in (HOME / ".dt/palettes", Path("/usr/dt/palettes")):
+            pf = pdir / pal_name
+            if pf.is_file():
+                hexes = [l.strip() for l in pf.read_text().splitlines() if l.strip().startswith("#")]
+                if len(hexes) >= 4:
+                    def norm16(h: str) -> str:
+                        h = h.lstrip("#")
+                        return f"#{h[0:2]}{h[4:6]}{h[8:10]}" if len(h) == 12 else "#" + h[:6]
+                    chrome, sel, well = norm16(hexes[1]), norm16(hexes[2]), norm16(hexes[3])
+                break
+    except Exception:
+        pass
+    return chrome, sel, well
+
+
+def build_shack_css(chrome: str, sel: str, well: str) -> bytes:
+    css = f"""
+    window, dialog, .background {{
+        background-color: {chrome};
+        color: #101216;
+        font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+        font-size: 9pt;
+    }}
+    .rx-cabinet {{
+        background-color: #2c313c;
+        border-top: 2px solid #5a6275;
+        border-left: 2px solid #5a6275;
+        border-right: 2px solid #161920;
+        border-bottom: 2px solid #161920;
+        padding: 5px;
+    }}
+    .rx-strip {{
+        background-color: #363c49;
+        border-top: 2px solid #565e70;
+        border-left: 2px solid #565e70;
+        border-right: 2px solid #1a1e26;
+        border-bottom: 2px solid #1a1e26;
+        padding: 4px 6px;
+    }}
+    .rx-engraved {{
+        color: #d7dfec;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8pt;
+    }}
+    .log-sunken {{
+        background-color: {well};
+        border-top: 2px solid #4d5260;
+        border-left: 2px solid #4d5260;
+        border-right: 2px solid #eef1f7;
+        border-bottom: 2px solid #eef1f7;
+    }}
+    entry {{
+        background-image: none;
+        background-color: #fff7e9;
+        color: #10151c;
+        caret-color: #10151c;
+        border-top: 2px solid #1a1e26;
+        border-left: 2px solid #1a1e26;
+        border-right: 2px solid #6b7488;
+        border-bottom: 2px solid #6b7488;
+        border-radius: 0px;
+        padding: 2px 5px;
+        min-height: 22px;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 9pt;
+        font-weight: bold;
+    }}
+    entry.call-entry {{
+        background-color: #0d1f1d;
+        color: #48fce2;
+        caret-color: #48fce2;
+        font-size: 10.5pt;
+        font-weight: bold;
+    }}
+    entry.freq-entry {{
+        background-color: #11221f;
+        color: #ffca58;
+        caret-color: #ffca58;
+        font-size: 9.5pt;
+    }}
+    button {{
+        background-image: none;
+        background-color: #464d5c;
+        color: #edf2f7;
+        border-top: 2px solid #768096;
+        border-left: 2px solid #768096;
+        border-right: 2px solid #1c2028;
+        border-bottom: 2px solid #1c2028;
+        border-radius: 0px;
+        padding: 3px 8px;
+        box-shadow: none;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8.5pt;
+    }}
+    button label {{
+        color: #edf2f7;
+    }}
+    button:hover {{
+        background-color: #525b6d;
+    }}
+    button:active, button:checked {{
+        background-color: #272c36;
+        border-top: 2px solid #181b21;
+        border-left: 2px solid #181b21;
+        border-right: 2px solid #6d768a;
+        border-bottom: 2px solid #6d768a;
+    }}
+    button.sw-active {{
+        background-color: #214d3f;
+        color: #68f7c4;
+        border-top: 2px solid #132c24;
+        border-left: 2px solid #132c24;
+        border-right: 2px solid #4fa688;
+        border-bottom: 2px solid #4fa688;
+    }}
+    button.sw-active label {{
+        color: #68f7c4;
+    }}
+    button.btn-grab {{
+        background-color: #b56514;
+        color: #ffffff;
+        border-top: 2px solid #f7a654;
+        border-left: 2px solid #f7a654;
+        border-right: 2px solid #4f2a05;
+        border-bottom: 2px solid #4f2a05;
+    }}
+    button.btn-grab:hover {{
+        background-color: #cc7419;
+    }}
+    button.btn-grab label {{
+        color: #fff8eb;
+    }}
+    button.btn-log {{
+        background-color: #1f6b45;
+        color: #ffffff;
+        border-top: 2px solid #62c491;
+        border-left: 2px solid #62c491;
+        border-right: 2px solid #0d3320;
+        border-bottom: 2px solid #0d3320;
+        padding: 3px 11px;
+    }}
+    button.btn-log:hover {{
+        background-color: #267d52;
+    }}
+    button.btn-log label {{
+        color: #ffffff;
+    }}
+    button.btn-update {{
+        background-color: #235789;
+        color: #ffffff;
+        border-top: 2px solid #6aa8e0;
+        border-left: 2px solid #6aa8e0;
+        border-right: 2px solid #0e263d;
+        border-bottom: 2px solid #0e263d;
+    }}
+    button.btn-update label {{
+        color: #ffffff;
+    }}
+    combobox button.combo {{
+        background-color: #232832;
+        color: #d8f8ee;
+        border-top: 2px solid #15181f;
+        border-left: 2px solid #15181f;
+        border-right: 2px solid #626b7f;
+        border-bottom: 2px solid #626b7f;
+        padding: 2px 6px;
+    }}
+    combobox button.combo label, combobox cellview {{
+        color: #d8f8ee;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8.5pt;
+    }}
+    treeview.view {{
+        background-color: #fff7e9;
+        color: #12161d;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8.5pt;
+    }}
+    treeview.view:selected, treeview.view:selected:focus {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    treeview.view header button {{
+        background-color: #3a414f;
+        color: #e6ecf5;
+        border-top: 1px solid #687287;
+        border-left: 1px solid #687287;
+        border-right: 1px solid #1d2129;
+        border-bottom: 2px solid #1d2129;
+        padding: 3px 5px;
+        font-size: 8pt;
+    }}
+    treeview.view header button label {{
+        color: #e6ecf5;
+        font-weight: bold;
+    }}
+    menu {{
+        background-color: #2b303b;
+        color: #edf2f7;
+        border: 1px solid #6c758a;
+    }}
+    menuitem {{
+        color: #edf2f7;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8.5pt;
+        padding: 3px 8px;
+    }}
+    menuitem:hover {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    .cde-status {{
+        background-color: {chrome};
+        color: #101216;
+        padding: 2px 8px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8pt;
+    }}
+    """
+    return css.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Maidenhead Grid Locator & Great-Circle Geodesic Math
+# ---------------------------------------------------------------------------
+GRID_RE = re.compile(r"^[A-Ra-r]{2}[0-9]{2}([A-Xa-x]{2}([0-9]{2})?)?$")
+
+
+def is_valid_grid(grid: str) -> bool:
+    return bool(GRID_RE.match((grid or "").strip()))
+
+
+def grid_to_latlon(grid: str) -> tuple[float, float] | None:
+    g = (grid or "").strip()
+    if not is_valid_grid(g):
+        return None
+    g_up = g.upper()
+    lon = (ord(g_up[0]) - ord("A")) * 20.0 - 180.0
+    lat = (ord(g_up[1]) - ord("A")) * 10.0 - 90.0
+    lon += int(g_up[2]) * 2.0
+    lat += int(g_up[3]) * 1.0
+    if len(g_up) >= 6:
+        lon += (ord(g_up[4]) - ord("A")) * (2.0 / 24.0)
+        lat += (ord(g_up[5]) - ord("A")) * (1.0 / 24.0)
+        if len(g_up) >= 8:
+            lon += int(g_up[6]) * (2.0 / 240.0) + (1.0 / 240.0)
+            lat += int(g_up[7]) * (1.0 / 240.0) + (0.5 / 240.0)
+        else:
+            lon += 1.0 / 24.0
+            lat += 0.5 / 24.0
+    else:
+        lon += 1.0
+        lat += 0.5
+    return round(lat, 4), round(lon, 4)
+
+
+def latlon_to_grid(lat: float, lon: float, chars: int = 6) -> str:
+    lon_adj = max(-179.9999, min(179.9999, lon)) + 180.0
+    lat_adj = max(-89.9999, min(89.9999, lat)) + 90.0
+    f_lon = int(lon_adj // 20.0)
+    f_lat = int(lat_adj // 10.0)
+    lon_rem = lon_adj - f_lon * 20.0
+    lat_rem = lat_adj - f_lat * 10.0
+    s_lon = int(lon_rem // 2.0)
+    s_lat = int(lat_rem // 1.0)
+    out = f"{chr(ord('A') + f_lon)}{chr(ord('A') + f_lat)}{s_lon}{s_lat}"
+    if chars >= 6:
+        sub_lon = int((lon_rem - s_lon * 2.0) * 12.0)
+        sub_lat = int((lat_rem - s_lat * 1.0) * 24.0)
+        sub_lon = max(0, min(23, sub_lon))
+        sub_lat = max(0, min(23, sub_lat))
+        out += f"{chr(ord('a') + sub_lon)}{chr(ord('a') + sub_lat)}"
+    return out
+
+
+def great_circle(lat1: float, lon1: float, lat2: float, lon2: float) -> dict:
+    """Compute short-path & long-path azimuth bearings (deg) and distances (km/mi)."""
+    if abs(lat1 - lat2) < 1e-6 and abs(lon1 - lon2) < 1e-6:
+        return {
+            "sp_deg": 0.0,
+            "lp_deg": 180.0,
+            "sp_km": 0.0,
+            "sp_mi": 0.0,
+            "lp_km": 40030.2,
+            "lp_mi": 24873.6,
+            "compass": "LOCAL",
+        }
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    dlat = p2 - p1
+
+    a = math.sin(dlat * 0.5) ** 2 + math.cos(p1) * math.cos(p2) * (math.sin(dlon * 0.5) ** 2)
+    a = max(0.0, min(1.0, a))
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
+
+    earth_r_km = 6371.0088
+    circum_km = 2.0 * math.pi * earth_r_km
+    sp_km = earth_r_km * c
+    lp_km = max(0.0, circum_km - sp_km)
+
+    y = math.sin(dlon) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dlon)
+    sp_deg = (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+    lp_deg = (sp_deg + 180.0) % 360.0
+
+    dirs = ("N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW")
+    compass = dirs[int(((sp_deg + 11.25) % 360.0) // 22.5)]
+    return {
+        "sp_deg": sp_deg,
+        "lp_deg": lp_deg,
+        "sp_km": sp_km,
+        "sp_mi": sp_km * 0.6213712,
+        "lp_km": lp_km,
+        "lp_mi": lp_km * 0.6213712,
+        "compass": compass,
+    }
+
+
+def freq_mhz_to_band(freq_mhz: float, is_swl: bool = False) -> str:
+    if freq_mhz <= 0:
+        return "SWL/HF" if is_swl else "20m"
+    for bname, flo, fhi, _fdef in BAND_PLAN:
+        if flo <= freq_mhz <= fhi:
+            return bname
+    if 0.52 <= freq_mhz <= 1.7999:
+        return "MW"
+    if freq_mhz < 30.0:
+        return "SWL/HF"
+    return "VHF/UHF"
+
+
+def default_rst_for_mode(mode: str, is_swl: bool = False) -> tuple[str, str]:
+    m = (mode or "SSB").upper()
+    if is_swl or m == "SWL":
+        return "--", "45444"
+    if m in ("CW", "RTTY"):
+        return "599", "599"
+    if m in ("FT8", "FT4", "JS8"):
+        return "-10", "-10"
+    if m == "SSTV":
+        return "595", "595"
+    return "59", "59"
+
+
+# ---------------------------------------------------------------------------
+# Offline ITU / ARRL DXCC Prefix & US/VE/VK/JA Call-Area Resolver (270+ Entities)
+# ---------------------------------------------------------------------------
+def iso_flag(iso2: str) -> str:
+    if len(iso2) == 2 and iso2.isalpha():
+        u = iso2.upper()
+        return chr(0x1F1E6 + ord(u[0]) - 65) + chr(0x1F1E6 + ord(u[1]) - 65)
+    return "🌐"
+
+
+# Special SWL / Time / Broadcast / Utility Station Identifiers
+SWL_STATIONS: dict[str, tuple[str, str, str, int, int, float, float, str]] = {
+    "WWV": ("NIST WWV Ft. Collins, CO", "US", "NA", 4, 7, 40.6781, -105.0469, "DN70jq"),
+    "WWVH": ("NIST WWVH Kekaha, Kauai HI", "US", "OC", 31, 61, 21.9886, -159.7639, "BK01cx"),
+    "WWVB": ("NIST WWVB Ft. Collins, CO", "US", "NA", 4, 7, 40.6781, -105.0469, "DN70jq"),
+    "CHU": ("NRC CHU Time Ottawa, ON", "CA", "NA", 5, 4, 45.2950, -75.7536, "FN25dh"),
+    "WRMI": ("WRMI Radio Miami Okeechobee, FL", "US", "NA", 5, 8, 27.4600, -80.9300, "EL97ml"),
+    "WBCQ": ("WBCQ The Planet Monticello, ME", "US", "NA", 5, 8, 46.3060, -67.8400, "FN66ch"),
+    "WINB": ("WINB Shortwave Red Lion, PA", "US", "NA", 5, 8, 39.8950, -76.5780, "FM19rv"),
+    "WTWW": ("WTWW Shortwave Lebanon, TN", "US", "NA", 4, 8, 36.2280, -86.2560, "EM66uf"),
+    "WWCR": ("WWCR Shortwave Nashville, TN", "US", "NA", 4, 8, 36.2100, -86.8800, "EM66nf"),
+    "CFRX": ("CFRX Shortwave Toronto, ON", "CA", "NA", 5, 4, 43.6100, -79.6600, "FN03ep"),
+    "RNZI": ("RNZ Pacific Rangitaiki, NZ", "NZ", "OC", 32, 60, -38.8470, 176.4250, "RF81fd"),
+    "RNZ": ("RNZ Pacific Rangitaiki, NZ", "NZ", "OC", 32, 60, -38.8470, 176.4250, "RF81fd"),
+    "BBC": ("BBC World Service Woofferton, UK", "GB", "EU", 14, 27, 52.3150, -2.7180, "IO82ph"),
+    "UVB-76": ("UVB-76 'The Buzzer' Western RU", "RU", "EU", 16, 29, 60.2700, 30.2200, "KP50dg"),
+    "UVB76": ("UVB-76 'The Buzzer' Western RU", "RU", "EU", 16, 29, 60.2700, 30.2200, "KP50dg"),
+    "HFGCS": ("USAF HFGCS Andrews AFB, MD", "US", "NA", 5, 8, 38.8100, -76.8670, "FM18nt"),
+    "SKYKING": ("USAF HFGCS Offutt AFB, NE", "US", "NA", 4, 7, 41.1180, -95.9120, "EN21bc"),
+}
+
+# US Call-Area Centroids (0..9)
+US_CALL_AREAS: dict[str, tuple[str, int, int, float, float]] = {
+    "0": ("United States (W0 Central/Plains)", 4, 7, 39.7392, -104.9903),
+    "1": ("United States (W1 New England)", 5, 8, 41.7148, -72.7273),  # W1AW Newington CT!
+    "2": ("United States (W2 NY / NJ)", 5, 8, 41.1500, -74.4000),
+    "3": ("United States (W3 PA / MD / DE)", 5, 8, 40.1000, -76.8000),
+    "4": ("United States (W4 Southeast US)", 5, 8, 33.9000, -83.5000),
+    "5": ("United States (W5 South Central)", 4, 7, 32.8000, -97.1000),
+    "6": ("United States (W6 California)", 3, 6, 36.7783, -119.4179),
+    "7": ("United States (W7 Pacific NW / Mtn)", 3, 6, 44.0500, -116.2000),
+    "8": ("United States (W8 OH / MI / WV)", 4, 8, 40.6000, -82.9000),
+    "9": ("United States (W9 IL / IN / WI)", 4, 8, 41.5000, -88.5000),
+}
+
+# Comprehensive DXCC Prefix Table:
+# (prefixes_csv, entity_name, iso2, continent, cq_zone, itu_zone, lat, lon, adif_dxcc)
+DXCC_RAW: list[tuple[str, str, str, str, int, int, float, float, int]] = [
+    # North America & US Possessions & Canada
+    ("KL,AL,NL,WL", "Alaska", "US", "NA", 1, 1, 61.2181, -149.9003, 6),
+    ("KH6,KH7,AH6,AH7,NH6,NH7,WH6,WH7", "Hawaii", "US", "OC", 31, 61, 21.3069, -157.8583, 110),
+    ("KP4,NP4,WP4", "Puerto Rico", "PR", "NA", 8, 11, 18.4655, -66.1057, 202),
+    ("KP2,NP2,WP2", "US Virgin Islands", "VI", "NA", 8, 11, 18.3358, -64.8963, 285),
+    ("KP1", "Navassa Island", "US", "NA", 8, 11, 18.4100, -75.0110, 182),
+    ("KP5", "Desecheo Island", "PR", "NA", 8, 11, 18.3850, -67.4800, 43),
+    ("KH2,AH2,NH2,WH2", "Guam", "GU", "OC", 27, 64, 13.4443, 144.7937, 103),
+    ("KH0,AH0,NH0,WH0", "Mariana Islands", "MP", "OC", 27, 64, 15.1833, 145.7500, 166),
+    ("KH8,AH8,NH8,WH8", "American Samoa", "AS", "OC", 32, 62, -14.2710, -170.1322, 9),
+    ("KH9,AH9,NH9,WH9", "Wake Island", "US", "OC", 31, 65, 19.2823, 166.6470, 297),
+    ("KH1", "Baker & Howland Is.", "US", "OC", 31, 61, 0.1936, -176.4769, 20),
+    ("KH3", "Johnston Island", "US", "OC", 31, 61, 16.7295, -169.5336, 123),
+    ("KH4", "Midway Island", "US", "OC", 31, 61, 28.2072, -177.3735, 174),
+    ("KH5", "Palmyra & Jarvis Is.", "US", "OC", 31, 61, 5.8833, -162.0833, 197),
+    ("KG4", "Guantanamo Bay", "CU", "NA", 8, 11, 19.9000, -75.1500, 105),
+    ("CY0", "Sable Island", "CA", "NA", 5, 9, 43.9333, -59.9167, 211),
+    ("CY9", "St. Paul Island", "CA", "NA", 5, 9, 47.2000, -60.1500, 252),
+    ("VE1,VA1", "Canada (Nova Scotia)", "CA", "NA", 5, 9, 44.6488, -63.5752, 1),
+    ("VE2,VA2", "Canada (Quebec)", "CA", "NA", 5, 4, 45.5017, -73.5673, 1),
+    ("VE3,VA3", "Canada (Ontario)", "CA", "NA", 4, 4, 43.6532, -79.3832, 1),
+    ("VE4,VA4", "Canada (Manitoba)", "CA", "NA", 4, 3, 49.8951, -97.1384, 1),
+    ("VE5,VA5", "Canada (Saskatchewan)", "CA", "NA", 4, 3, 52.1332, -106.6700, 1),
+    ("VE6,VA6", "Canada (Alberta)", "CA", "NA", 4, 2, 51.0447, -114.0719, 1),
+    ("VE7,VA7", "Canada (British Columbia)", "CA", "NA", 3, 2, 49.2827, -123.1207, 1),
+    ("VE8", "Canada (NW Territories)", "CA", "NA", 1, 3, 62.4540, -114.3718, 1),
+    ("VE9", "Canada (New Brunswick)", "CA", "NA", 5, 9, 45.9636, -66.6431, 1),
+    ("VO1", "Canada (Newfoundland)", "CA", "NA", 5, 9, 47.5615, -52.7126, 1),
+    ("VO2", "Canada (Labrador)", "CA", "NA", 2, 9, 53.3017, -60.3261, 1),
+    ("VY0", "Canada (Nunavut)", "CA", "NA", 2, 4, 63.7467, -68.5170, 1),
+    ("VY1", "Canada (Yukon)", "CA", "NA", 1, 2, 60.7212, -135.0568, 1),
+    ("VY2", "Canada (PEI)", "CA", "NA", 5, 9, 46.2382, -63.1311, 1),
+    ("VE,VA,VO,VY,CF,CG,CJ,CK,XJ,XK,XL,XM,XN,XO", "Canada", "CA", "NA", 4, 4, 45.4215, -75.6972, 1),
+    ("K,W,N,AA,AB,AC,AD,AE,AF,AG,AI,AJ,AK", "United States", "US", "NA", 4, 7, 39.8283, -98.5795, 291),
+    ("XE,XA,XB,XC,XD,XF,4A,4B,4C,6D,6E,6F,6G,6H,6I,6J", "Mexico", "MX", "NA", 6, 10, 19.4326, -99.1332, 50),
+    ("XF4", "Revillagigedo", "MX", "NA", 6, 10, 18.7833, -110.9500, 204),
+    ("OX,XP", "Greenland", "GL", "NA", 40, 5, 64.1814, -51.6941, 237),
+    ("FP", "St. Pierre & Miquelon", "PM", "NA", 5, 9, 46.7778, -56.1778, 277),
+    ("VP9", "Bermuda", "BM", "NA", 5, 11, 32.3078, -64.7505, 64),
+    ("C6", "Bahamas", "BS", "NA", 8, 11, 25.0443, -77.3504, 60),
+    ("CO,CM,CL,T4", "Cuba", "CU", "NA", 8, 11, 23.1136, -82.3666, 70),
+    ("6Y", "Jamaica", "JM", "NA", 8, 11, 18.0179, -76.8099, 82),
+    ("ZF", "Cayman Islands", "KY", "NA", 8, 11, 19.3133, -81.2546, 69),
+    ("HH,4V", "Haiti", "HT", "NA", 8, 11, 18.5944, -72.3074, 78),
+    ("HI", "Dominican Republic", "DO", "NA", 8, 11, 18.4861, -69.9312, 72),
+    ("VP5", "Turks & Caicos Is.", "TC", "NA", 8, 11, 21.7922, -72.1419, 89),
+    ("V2", "Antigua & Barbuda", "AG", "NA", 8, 11, 17.1175, -61.8456, 94),
+    ("V3", "Belize", "BZ", "NA", 7, 11, 17.2510, -88.7590, 66),
+    ("V4", "St. Kitts & Nevis", "KN", "NA", 8, 11, 17.3026, -62.7177, 249),
+    ("VP2E", "Anguilla", "AI", "NA", 8, 11, 18.2206, -63.0686, 12),
+    ("VP2M", "Montserrat", "MS", "NA", 8, 11, 16.7425, -62.1874, 96),
+    ("VP2V", "British Virgin Is.", "VG", "NA", 8, 11, 18.4207, -64.6400, 65),
+    ("FG,TO", "Guadeloupe", "GP", "NA", 8, 11, 16.2650, -61.5510, 79),
+    ("FM", "Martinique", "MQ", "NA", 8, 11, 14.6415, -61.0242, 84),
+    ("FS", "St. Martin", "MF", "NA", 8, 11, 18.0708, -63.0501, 213),
+    ("FJ", "St. Barthelemy", "BL", "NA", 8, 11, 17.9000, -62.8333, 516),
+    ("J3", "Grenada", "GD", "NA", 8, 11, 12.1165, -61.6790, 77),
+    ("J6", "St. Lucia", "LC", "NA", 8, 11, 13.9094, -60.9789, 97),
+    ("J7", "Dominica", "DM", "NA", 8, 11, 15.4150, -61.3710, 95),
+    ("J8", "St. Vincent", "VC", "NA", 8, 11, 13.2528, -61.1971, 98),
+    ("8P", "Barbados", "BB", "NA", 8, 11, 13.1939, -59.5432, 62),
+    ("PJ2", "Curacao", "CW", "SA", 9, 11, 12.1696, -68.9900, 517),
+    ("PJ4", "Bonaire", "BQ", "SA", 9, 11, 12.2019, -68.2624, 520),
+    ("PJ5,PJ6", "Saba & St. Eustatius", "BQ", "NA", 8, 11, 17.6355, -63.2327, 519),
+    ("PJ7", "Sint Maarten", "SX", "NA", 8, 11, 18.0425, -63.0548, 518),
+    ("P4", "Aruba", "AW", "SA", 9, 11, 12.5211, -69.9683, 91),
+    ("9Y,9Z", "Trinidad & Tobago", "TT", "SA", 9, 11, 10.6918, -61.2225, 90),
+    ("TG,TD", "Guatemala", "GT", "NA", 7, 11, 14.6349, -90.5069, 76),
+    ("YS,HU", "El Salvador", "SV", "NA", 7, 11, 13.6929, -89.2182, 74),
+    ("HR,HQ", "Honduras", "HN", "NA", 7, 11, 14.0723, -87.1921, 80),
+    ("YN,H6,H7,HT", "Nicaragua", "NI", "NA", 7, 11, 12.1150, -86.2362, 86),
+    ("TI,TE", "Costa Rica", "CR", "NA", 7, 11, 9.9281, -84.0907, 308),
+    ("TI9", "Cocos Island", "CR", "NA", 7, 11, 5.5280, -87.0570, 37),
+    ("HP,HO,H3,H8,H9,3E,3F", "Panama", "PA", "NA", 7, 11, 8.9824, -79.5199, 88),
+    # South America
+    ("HK,HJ,5J,5K", "Colombia", "CO", "SA", 9, 12, 4.7110, -74.0721, 116),
+    ("HK0", "San Andres & Providencia", "CO", "NA", 7, 11, 12.5847, -81.7006, 216),
+    ("YV,YW,YX,YY,4M", "Venezuela", "VE", "SA", 9, 12, 10.4806, -66.9036, 148),
+    ("8R", "Guyana", "GY", "SA", 9, 12, 6.8013, -58.1551, 129),
+    ("PZ", "Suriname", "SR", "SA", 9, 12, 5.8520, -55.2038, 140),
+    ("FY", "French Guiana", "GF", "SA", 9, 12, 4.9224, -52.3135, 63),
+    ("HC8,HD8", "Galapagos Islands", "EC", "SA", 10, 12, -0.7436, -90.3054, 71),
+    ("HC,HD", "Ecuador", "EC", "SA", 10, 12, -0.1807, -78.4678, 120),
+    ("OA,OB,OC,4T", "Peru", "PE", "SA", 10, 12, -12.0464, -77.0428, 136),
+    ("CP", "Bolivia", "BO", "SA", 10, 12, -16.4897, -68.1193, 104),
+    ("CE0Y", "Easter Island", "CL", "SA", 12, 63, -27.1127, -109.3497, 47),
+    ("CE,CA,CB,CC,CD,XQ,XR,3G", "Chile", "CL", "SA", 12, 14, -33.4489, -70.6693, 112),
+    ("LU,LO,LP,LQ,LR,LS,LT,LV,LW,AY,AZ,L2,L3,L4,L5,L6,L7,L8,L9", "Argentina", "AR", "SA", 13, 14, -34.6037, -58.3816, 100),
+    ("CX,CV,CW", "Uruguay", "UY", "SA", 13, 14, -34.9011, -56.1645, 144),
+    ("ZP", "Paraguay", "PY", "SA", 11, 14, -25.2637, -57.5759, 132),
+    ("PY0F", "Fernando de Noronha", "BR", "SA", 11, 13, -3.8549, -32.4243, 56),
+    ("PY,PP,PQ,PR,PS,PT,PU,PV,PW,PX,ZV,ZW,ZX,ZY,ZZ", "Brazil", "BR", "SA", 11, 15, -23.5505, -46.6333, 108),
+    ("VP8", "Falkland Islands", "FK", "SA", 13, 16, -51.7963, -59.5236, 141),
+    # Europe
+    ("GM,MM,2M,GS,MS", "Scotland", "GB", "EU", 14, 27, 55.9533, -3.1883, 279),
+    ("GW,MW,2W,GC,MC", "Wales", "GB", "EU", 14, 27, 51.4816, -3.1791, 294),
+    ("GI,MI,2I,GN,MN", "Northern Ireland", "GB", "EU", 14, 27, 54.5973, -5.9301, 265),
+    ("GD,MD,2D,GT,MT", "Isle of Man", "IM", "EU", 14, 27, 54.2361, -4.5481, 114),
+    ("GJ,MJ,2J,GH,MH", "Jersey", "JE", "EU", 14, 27, 49.2144, -2.1312, 122),
+    ("GU,MU,2U,GP,MP", "Guernsey", "GG", "EU", 14, 27, 49.4657, -2.5853, 106),
+    ("G,M,2E,GX,MX", "England", "GB", "EU", 14, 27, 51.5072, -0.1276, 223),
+    ("EI,EJ", "Ireland", "IE", "EU", 14, 27, 53.3498, -6.2603, 245),
+    ("TF", "Iceland", "IS", "EU", 40, 17, 64.1466, -21.9426, 242),
+    ("OY", "Faroe Islands", "FO", "EU", 14, 18, 62.0107, -6.7741, 221),
+    ("JW", "Svalbard", "SJ", "EU", 40, 18, 78.2232, 15.6267, 259),
+    ("LA,LB,LC,LD,LE,LF,LG,LH,LI,LJ,LK,LL,LM,LN", "Norway", "NO", "EU", 14, 18, 59.9139, 10.7522, 266),
+    ("SM,SA,SB,SC,SD,SE,SF,SG,SH,SI,SJ,SK,SL,7S,8S", "Sweden", "SE", "EU", 14, 18, 59.3293, 18.0686, 284),
+    ("OH0", "Aland Islands", "AX", "EU", 15, 18, 60.0970, 19.9348, 5),
+    ("OH,OF,OG,OI", "Finland", "FI", "EU", 15, 18, 60.1699, 24.9384, 224),
+    ("OZ,OU,OV,OW,XP,5P,5Q", "Denmark", "DK", "EU", 14, 18, 55.6761, 12.5683, 221),
+    ("PA,PB,PC,PD,PE,PF,PG,PH,PI", "Netherlands", "NL", "EU", 14, 27, 52.3676, 4.9041, 263),
+    ("ON,OO,OP,OQ,OR,OS,OT", "Belgium", "BE", "EU", 14, 27, 50.8503, 4.3517, 209),
+    ("LX", "Luxembourg", "LU", "EU", 14, 27, 49.6116, 6.1319, 254),
+    ("TK", "Corsica", "FR", "EU", 15, 28, 41.9192, 8.7386, 214),
+    ("F,TM,TP,TQ,TV,TW", "France", "FR", "EU", 14, 27, 48.8566, 2.3522, 227),
+    ("3A", "Monaco", "MC", "EU", 14, 27, 43.7384, 7.4246, 260),
+    ("C3", "Andorra", "AD", "EU", 14, 27, 42.5063, 1.5218, 203),
+    ("EA6,EB6,EC6,ED6,EE6,EF6,EG6,EH6", "Balearic Islands", "ES", "EU", 14, 37, 39.5696, 2.6502, 21),
+    ("EA8,EB8,EC8,ED8,EE8,EF8,EG8,EH8", "Canary Islands", "ES", "AF", 33, 36, 28.1235, -15.4363, 29),
+    ("EA9,EB9,EC9,ED9,EE9,EF9,EG9,EH9", "Ceuta & Melilla", "ES", "AF", 33, 37, 35.8894, -5.3213, 32),
+    ("EA,EB,EC,ED,EE,EF,EG,EH,AM,AN,AO", "Spain", "ES", "EU", 14, 37, 40.4168, -3.7038, 281),
+    ("CU", "Azores", "PT", "EU", 14, 36, 37.7412, -25.6756, 149),
+    ("CT3,CQ3,CQ9,CR3,CS3", "Madeira Islands", "PT", "AF", 33, 36, 32.6669, -16.9241, 256),
+    ("CT,CQ,CR,CS", "Portugal", "PT", "EU", 14, 37, 38.7223, -9.1393, 272),
+    ("ZB2,ZG2", "Gibraltar", "GI", "EU", 14, 37, 36.1408, -5.3536, 233),
+    ("DL,DA,DB,DC,DD,DE,DF,DG,DH,DJ,DK,DM,DN,DO,DP,DQ,DR", "Germany", "DE", "EU", 14, 28, 50.1109, 8.6821, 230),
+    ("HB0", "Liechtenstein", "LI", "EU", 14, 28, 47.1410, 9.5209, 251),
+    ("HB,HE", "Switzerland", "CH", "EU", 14, 28, 46.9480, 7.4474, 287),
+    ("OE", "Austria", "AT", "EU", 15, 28, 48.2082, 16.3738, 206),
+    ("IS0,IM0", "Sardinia", "IT", "EU", 15, 28, 39.2238, 9.1217, 225),
+    ("I,IK,IZ,IU,IW,IN,IV,IT,IO,IP,IQ,IR", "Italy", "IT", "EU", 15, 28, 41.9028, 12.4964, 248),
+    ("HV", "Vatican City", "VA", "EU", 15, 28, 41.9029, 12.4534, 295),
+    ("T7", "San Marino", "SM", "EU", 15, 28, 43.9424, 12.4578, 278),
+    ("9H", "Malta", "MT", "EU", 15, 28, 35.8989, 14.5146, 257),
+    ("OK,OL", "Czech Republic", "CZ", "EU", 15, 28, 50.0755, 14.4378, 503),
+    ("OM", "Slovak Republic", "SK", "EU", 15, 28, 48.1486, 17.1077, 504),
+    ("SP,SN,SO,SQ,SR,3Z,HF", "Poland", "PL", "EU", 15, 28, 52.2297, 21.0122, 269),
+    ("HA,HG", "Hungary", "HU", "EU", 15, 28, 47.4979, 19.0402, 239),
+    ("S5", "Slovenia", "SI", "EU", 15, 28, 46.0569, 14.5058, 499),
+    ("9A", "Croatia", "HR", "EU", 15, 28, 45.8150, 15.9819, 497),
+    ("E7", "Bosnia-Herzegovina", "BA", "EU", 15, 28, 43.8563, 18.4131, 501),
+    ("YU,YT", "Serbia", "RS", "EU", 15, 28, 44.7866, 20.4489, 296),
+    ("4O", "Montenegro", "ME", "EU", 15, 28, 42.4304, 19.2594, 514),
+    ("Z6", "Kosovo", "XK", "EU", 15, 28, 42.6629, 21.1655, 522),
+    ("Z3", "North Macedonia", "MK", "EU", 15, 28, 41.9981, 21.4254, 502),
+    ("ZA", "Albania", "AL", "EU", 15, 28, 41.3275, 19.8187, 7),
+    ("SV9,J49", "Crete", "GR", "EU", 20, 28, 35.3387, 25.1442, 40),
+    ("SV5,J45", "Dodecanese", "GR", "EU", 20, 28, 36.4341, 28.2176, 45),
+    ("SV,SX,SY,SZ,J4", "Greece", "GR", "EU", 20, 28, 37.9838, 23.7275, 236),
+    ("LZ", "Bulgaria", "BG", "EU", 20, 28, 42.6977, 23.3219, 212),
+    ("YO,YP,YQ,YR", "Romania", "RO", "EU", 20, 28, 44.4268, 26.1025, 275),
+    ("ER", "Moldova", "MD", "EU", 16, 29, 47.0105, 28.8638, 179),
+    ("UR,US,UT,UU,UV,UW,UX,UY,UZ,EM,EN,EO", "Ukraine", "UA", "EU", 16, 29, 50.4501, 30.5234, 288),
+    ("EU,EV,EW", "Belarus", "BY", "EU", 16, 29, 53.9006, 27.5590, 27),
+    ("LY", "Lithuania", "LT", "EU", 15, 29, 54.6872, 25.2797, 146),
+    ("YL", "Latvia", "LV", "EU", 15, 29, 56.9496, 24.1052, 145),
+    ("ES", "Estonia", "EE", "EU", 15, 29, 59.4370, 24.7536, 52),
+    ("UA2,RA2", "Kaliningrad", "RU", "EU", 15, 29, 54.7104, 20.4522, 126),
+    ("UA9,UA0,RA9,RA0,R8,R9,R0,UI8,UI9,UI0,UB8,UB9,UB0,UC8,UC9,UC0", "Asiatic Russia", "RU", "AS", 17, 30, 55.0084, 82.9357, 15),
+    ("UA,RA,R1,R2,R3,R4,R5,R6,R7,RN,RV,RW,RX,RY,RZ,UB,UC,UD,UF,UG,UH,UI", "European Russia", "RU", "EU", 16, 29, 55.7558, 37.6173, 54),
+    # Asia & Middle East
+    ("TA,TB,TC,YM", "Turkey", "TR", "AS", 20, 39, 39.9334, 32.8597, 390),
+    ("5B,C4,P3,H2", "Cyprus", "CY", "AS", 20, 39, 35.1856, 33.3823, 215),
+    ("OD", "Lebanon", "LB", "AS", 20, 39, 33.8938, 35.5018, 354),
+    ("4X,4Z", "Israel", "IL", "AS", 20, 39, 32.0853, 34.7818, 336),
+    ("JY", "Jordan", "JO", "AS", 20, 39, 31.9454, 35.9284, 342),
+    ("HZ,7Z,8Z", "Saudi Arabia", "SA", "AS", 21, 39, 24.7136, 46.6753, 378),
+    ("9K", "Kuwait", "KW", "AS", 21, 39, 29.3759, 47.9774, 348),
+    ("A9", "Bahrain", "BH", "AS", 21, 39, 26.2285, 50.5860, 304),
+    ("A7", "Qatar", "QA", "AS", 21, 39, 25.2854, 51.5310, 376),
+    ("A6", "United Arab Emirates", "AE", "AS", 21, 39, 24.4539, 54.3773, 391),
+    ("A4", "Oman", "OM", "AS", 21, 39, 23.5880, 58.3829, 370),
+    ("4L", "Georgia", "GE", "AS", 21, 29, 41.7151, 44.8271, 75),
+    ("EK", "Armenia", "AM", "AS", 21, 29, 40.1792, 44.4991, 14),
+    ("4J,4K", "Azerbaijan", "AZ", "AS", 21, 29, 40.4093, 49.8671, 18),
+    ("UN,UP,UQ,UO", "Kazakhstan", "KZ", "AS", 17, 30, 51.1694, 71.4491, 130),
+    ("UK,UJ,UL,UM", "Uzbekistan", "UZ", "AS", 17, 30, 41.2995, 69.2401, 292),
+    ("EX", "Kyrgyzstan", "KG", "AS", 17, 31, 42.8746, 74.5698, 135),
+    ("EY", "Tajikistan", "TJ", "AS", 17, 30, 38.5598, 68.7870, 262),
+    ("EZ", "Turkmenistan", "TM", "AS", 17, 30, 37.9601, 58.3261, 280),
+    ("EP,EQ", "Iran", "IR", "AS", 21, 40, 35.6892, 51.3890, 330),
+    ("YI", "Iraq", "IQ", "AS", 21, 39, 33.3152, 44.3661, 333),
+    ("AP,AQ,AR,AS", "Pakistan", "PK", "AS", 21, 41, 33.6844, 73.0479, 372),
+    ("VU,AT,AU,AV,AW,8T,8U,8V,8W,8X,8Y", "India", "IN", "AS", 22, 41, 28.6139, 77.2090, 324),
+    ("4S", "Sri Lanka", "LK", "AS", 22, 41, 6.9271, 79.8612, 315),
+    ("8Q", "Maldives", "MV", "AS", 22, 41, 4.1755, 73.5093, 159),
+    ("9N", "Nepal", "NP", "AS", 22, 42, 27.7172, 85.3240, 369),
+    ("A5", "Bhutan", "BT", "AS", 22, 41, 27.4728, 89.6393, 306),
+    ("S2", "Bangladesh", "BD", "AS", 22, 41, 23.8103, 90.4125, 305),
+    ("HS,E2", "Thailand", "TH", "AS", 26, 49, 13.7563, 100.5018, 387),
+    ("XV,3W", "Vietnam", "VN", "AS", 26, 49, 21.0278, 105.8342, 293),
+    ("9M6,9M8,9W6,9W8", "East Malaysia", "MY", "OC", 28, 54, 5.9804, 116.0735, 46),
+    ("9M,9W", "West Malaysia", "MY", "AS", 28, 54, 3.1390, 101.6869, 299),
+    ("9V,S6", "Singapore", "SG", "AS", 28, 54, 1.3521, 103.8198, 381),
+    ("V8", "Brunei", "BN", "OC", 28, 54, 4.9031, 114.9398, 345),
+    ("YB,YC,YD,YE,YF,YG,YH,7A,7B,7C,7D,7E,7F,7G,7H,7I,8A,8B,8C,8D,8E,8F,8G,8H,8I", "Indonesia", "ID", "OC", 28, 51, -6.2088, 106.8456, 327),
+    ("DU,DV,DW,DX,DY,DZ,4D,4E,4F,4G,4H,4I", "Philippines", "PH", "OC", 27, 50, 14.5995, 120.9842, 375),
+    ("VR", "Hong Kong", "HK", "AS", 24, 44, 22.3193, 114.1694, 321),
+    ("XX9", "Macau", "MO", "AS", 24, 44, 22.1987, 113.5439, 152),
+    ("BV,BM,BN,BO,BP,BQ,BU,BW,BX", "Taiwan", "TW", "AS", 24, 44, 25.0330, 121.5654, 386),
+    ("BY,BA,BD,BG,BH,BI,BJ,BL,BT,BZ,3H,3I,3J,3K,3L,3M,3N,3O,3P,3Q,3R,3S,3T,3U", "China", "CN", "AS", 24, 44, 39.9042, 116.4074, 318),
+    ("JT,JU,JV", "Mongolia", "MN", "AS", 23, 32, 47.8864, 106.9057, 363),
+    ("HL,DS,DT,6K,6L,6M,6N,D7,D8,D9", "South Korea", "KR", "AS", 25, 44, 37.5665, 126.9780, 137),
+    ("JD1", "Ogasawara", "JP", "AS", 27, 45, 27.0944, 142.1919, 192),
+    ("JA6,JE6,JF6,JG6,JH6,JI6,JJ6,JK6,JL6,JM6,JN6,JO6,JP6,JQ6,JR6,JS6", "Japan (JA6 Kyushu/Okinawa)", "JP", "AS", 25, 45, 33.5902, 130.4017, 339),
+    ("JA8,JE8,JF8,JG8,JH8,JI8,JJ8,JK8,JL8,JM8,JN8,JO8,JP8,JQ8,JR8", "Japan (JA8 Hokkaido)", "JP", "AS", 25, 45, 43.0618, 141.3545, 339),
+    ("JA,JE,JF,JG,JH,JI,JJ,JK,JL,JM,JN,JO,JP,JQ,JR,JS,7J,7K,7L,7M,7N,8J,8N", "Japan", "JP", "AS", 25, 45, 35.6762, 139.6503, 339),
+    # Oceania & Pacific
+    ("VK9N", "Norfolk Island", "NF", "OC", 32, 60, -29.0408, 167.9547, 189),
+    ("VK9C", "Cocos (Keeling) Is.", "CC", "OC", 29, 54, -12.1642, 96.8710, 38),
+    ("VK9X", "Christmas Island", "CX", "OC", 29, 54, -10.4475, 105.6904, 35),
+    ("VK9L", "Lord Howe Island", "AU", "OC", 30, 60, -31.5553, 159.0821, 147),
+    ("VK1,VK2", "Australia (NSW / ACT)", "AU", "OC", 30, 59, -33.8688, 151.2093, 150),
+    ("VK3", "Australia (Victoria)", "AU", "OC", 30, 59, -37.8136, 144.9631, 150),
+    ("VK4", "Australia (Queensland)", "AU", "OC", 30, 55, -27.4705, 153.0260, 150),
+    ("VK5", "Australia (South Australia)", "AU", "OC", 30, 59, -34.9285, 138.6007, 150),
+    ("VK6", "Australia (Western Australia)", "AU", "OC", 29, 58, -31.9505, 115.8605, 150),
+    ("VK7", "Australia (Tasmania)", "AU", "OC", 30, 59, -42.8821, 147.3272, 150),
+    ("VK8", "Australia (Northern Territory)", "AU", "OC", 29, 55, -12.4634, 130.8456, 150),
+    ("VK,AX,VI,VJ,VL", "Australia", "AU", "OC", 30, 59, -33.8688, 151.2093, 150),
+    ("ZL7,ZM7", "Chatham Islands", "NZ", "OC", 32, 60, -43.9538, -176.5400, 34),
+    ("ZL,ZM", "New Zealand", "NZ", "OC", 32, 60, -36.8485, 174.7633, 170),
+    ("P2", "Papua New Guinea", "PG", "OC", 28, 51, -9.4438, 147.1803, 163),
+    ("H4", "Solomon Islands", "SB", "OC", 28, 51, -9.4456, 159.9729, 185),
+    ("YJ", "Vanuatu", "VU", "OC", 32, 56, -17.7333, 168.3273, 158),
+    ("FK,TX", "New Caledonia", "NC", "OC", 32, 56, -22.2758, 166.4580, 162),
+    ("3D2", "Fiji", "FJ", "OC", 32, 56, -18.1416, 178.4419, 176),
+    ("A3", "Tonga", "TO", "OC", 32, 62, -21.1393, -175.2049, 160),
+    ("5W", "Samoa", "WS", "OC", 32, 62, -13.8333, -171.7500, 190),
+    ("E5", "Cook Islands", "CK", "OC", 32, 62, -21.2367, -159.7777, 234),
+    ("FO", "French Polynesia", "PF", "OC", 32, 63, -17.5516, -149.5585, 175),
+    ("V7", "Marshall Islands", "MH", "OC", 31, 65, 7.1315, 171.1845, 168),
+    ("V6", "Micronesia", "FM", "OC", 27, 65, 6.9147, 158.1610, 173),
+    ("T8", "Palau", "PW", "OC", 27, 64, 7.5150, 134.5825, 22),
+    ("T30,T31,T32,T33", "Kiribati", "KI", "OC", 31, 65, 1.3382, 172.9784, 301),
+    ("VP6", "Pitcairn Island", "PN", "OC", 32, 63, -25.0667, -130.1000, 172),
+    # Africa & Antarctica
+    ("CN,5C,5D,5E,5F,5G", "Morocco", "MA", "AF", 33, 37, 33.9716, -6.8498, 446),
+    ("7X,7T,7U,7V,7W,7Y", "Algeria", "DZ", "AF", 33, 37, 36.7538, 3.0588, 400),
+    ("3V,TS", "Tunisia", "TN", "AF", 33, 37, 36.8065, 10.1815, 474),
+    ("SU", "Egypt", "EG", "AF", 34, 38, 30.0444, 31.2357, 478),
+    ("6W,6V", "Senegal", "SN", "AF", 35, 46, 14.7167, -17.4677, 456),
+    ("D4", "Cape Verde", "CV", "AF", 35, 46, 14.9330, -23.5133, 409),
+    ("C5", "The Gambia", "GM", "AF", 35, 46, 13.4549, -16.5790, 422),
+    ("EL,A8,5L,5M", "Liberia", "LR", "AF", 35, 46, 6.3156, -10.8074, 434),
+    ("TU", "Cote d'Ivoire", "CI", "AF", 35, 46, 5.3600, -4.0083, 428),
+    ("9G", "Ghana", "GH", "AF", 35, 46, 5.6037, -0.1870, 424),
+    ("5N,5O", "Nigeria", "NG", "AF", 35, 46, 9.0765, 7.3986, 450),
+    ("TR", "Gabon", "GA", "AF", 36, 52, 0.4162, 9.4673, 420),
+    ("ET", "Ethiopia", "ET", "AF", 37, 48, 9.0320, 38.7469, 53),
+    ("5Z,5Y", "Kenya", "KE", "AF", 37, 48, -1.2921, 36.8219, 430),
+    ("5H,5I", "Tanzania", "TZ", "AF", 37, 53, -6.7924, 39.2083, 470),
+    ("5X", "Uganda", "UG", "AF", 37, 48, 0.3476, 32.5825, 286),
+    ("9X", "Rwanda", "RW", "AF", 36, 52, -1.9441, 30.0619, 454),
+    ("9J", "Zambia", "ZM", "AF", 36, 53, -15.3875, 28.3228, 482),
+    ("Z2", "Zimbabwe", "ZW", "AF", 38, 53, -17.8252, 31.0335, 452),
+    ("A2", "Botswana", "BW", "AF", 38, 57, -24.6282, 25.9231, 402),
+    ("V5", "Namibia", "NA", "AF", 38, 57, -22.5609, 17.0658, 464),
+    ("ZS,ZR,ZT,ZU,H5,S8", "South Africa", "ZA", "AF", 38, 57, -26.2041, 28.0473, 462),
+    ("3B8", "Mauritius", "MU", "AF", 39, 53, -20.1609, 57.5012, 165),
+    ("FR", "Reunion Island", "RE", "AF", 39, 53, -20.8823, 55.4504, 453),
+    ("5R,5S,6X", "Madagascar", "MG", "AF", 39, 53, -18.8792, 47.5079, 438),
+    ("S7", "Seychelles", "SC", "AF", 39, 53, -4.6796, 55.4920, 379),
+    ("ZD7", "St. Helena", "SH", "AF", 36, 66, -15.9650, -5.7089, 250),
+    ("ZD8", "Ascension Island", "SH", "AF", 36, 66, -7.9467, -14.3559, 205),
+    ("ZD9", "Tristan da Cunha", "SH", "AF", 38, 66, -37.1052, -12.2777, 274),
+    ("CE9,KC4,DP0,RI1AN,VP8A", "Antarctica", "AQ", "AN", 13, 70, -77.8419, 166.6863, 13),
+]
+
+# Build sorted longest-prefix lookup table
+PREFIX_INDEX: list[tuple[str, str, str, str, int, int, float, float, int]] = []
+for pfxs, ename, iso2, cont, cqz, ituz, elat, elon, dxcc_id in DXCC_RAW:
+    for p in pfxs.split(","):
+        p_clean = p.strip().upper()
+        if p_clean:
+            PREFIX_INDEX.append((p_clean, ename, iso2, cont, cqz, ituz, elat, elon, dxcc_id))
+PREFIX_INDEX.sort(key=lambda item: len(item[0]), reverse=True)
+
+
+def resolve_call_or_station(raw_call: str, raw_grid: str, home_lat: float, home_lon: float) -> dict:
+    """Resolve callsign or SWL station + optional Maidenhead Grid to DXCC, zones, lat/lon & azimuth."""
+    call = (raw_call or "").strip().upper()
+    grid = (raw_grid or "").strip()
+
+    res = {
+        "matched": False,
+        "prefix": "",
+        "entity": "",
+        "iso2": "",
+        "flag": "🌐",
+        "cont": "",
+        "cq_zone": 0,
+        "itu_zone": 0,
+        "dxcc_id": 0,
+        "lat": None,
+        "lon": None,
+        "grid": grid if is_valid_grid(grid) else "",
+        "sp_deg": None,
+        "lp_deg": None,
+        "sp_km": None,
+        "sp_mi": None,
+        "lp_km": None,
+        "lp_mi": None,
+        "compass": "",
+    }
+
+    if not call and not is_valid_grid(grid):
+        return res
+
+    # 1. Check exact or leading SWL / Time / Broadcast station tokens first
+    first_tok = re.split(r"[\s/—\-]+", call)[0] if call else ""
+    for swl_key, (sname, siso, scont, scq, situ, slat, slon, sgrid) in SWL_STATIONS.items():
+        if first_tok == swl_key or call.startswith(swl_key + " "):
+            res.update({
+                "matched": True,
+                "prefix": swl_key,
+                "entity": sname,
+                "iso2": siso,
+                "flag": iso_flag(siso),
+                "cont": scont,
+                "cq_zone": scq,
+                "itu_zone": situ,
+                "dxcc_id": 291 if siso == "US" else 0,
+                "lat": slat,
+                "lon": slon,
+                "grid": res["grid"] or sgrid,
+            })
+            break
+
+    # 2. Standard ITU / ARRL Callsign Prefix Resolution (handling portable prefixes/suffixes)
+    if not res["matched"] and call:
+        # Strip trailing portable indicators (/P, /M, /MM, /AM, /QRP, /B)
+        parts = [p for p in call.split("/") if p]
+        eff = parts[0]
+        us_area_override = None
+        if len(parts) >= 2:
+            suffix_mods = {"P", "M", "MM", "AM", "QRP", "QRPP", "B", "LH", "R", "T", "AG", "AE", "KT"}
+            if parts[-1] in suffix_mods:
+                parts = parts[:-1]
+            if len(parts) >= 2:
+                # e.g. KH6/W1AW -> KH6; W1AW/7 -> W1AW with call area 7; W1AW/KH6 -> KH6
+                p0, p1 = parts[0], parts[1]
+                if len(p1) == 1 and p1.isdigit():
+                    eff = p0
+                    us_area_override = p1
+                elif len(p0) <= len(p1) and not p0.isdigit():
+                    eff = p0
+                elif len(p1) < len(p0) and not p1.isdigit():
+                    eff = p1
+                else:
+                    eff = p0
+            elif parts:
+                eff = parts[0]
+
+        eff_alnum = re.sub(r"[^A-Z0-9]", "", eff)
+        for pfx, ename, iso2, cont, cqz, ituz, elat, elon, dxcc_id in PREFIX_INDEX:
+            if eff_alnum.startswith(pfx):
+                # Require valid callsign structure or >=2 char prefix so random words don't false-match single letters
+                if len(pfx) == 1 and not re.match(r"^[A-Z]{1,2}[0-9]", eff_alnum):
+                    continue
+                res.update({
+                    "matched": True,
+                    "prefix": pfx,
+                    "entity": ename,
+                    "iso2": iso2,
+                    "flag": iso_flag(iso2),
+                    "cont": cont,
+                    "cq_zone": cqz,
+                    "itu_zone": ituz,
+                    "dxcc_id": dxcc_id,
+                    "lat": elat,
+                    "lon": elon,
+                })
+                # Refine continental US call area (0..9) if entity is mainland US (dxcc 291)
+                if dxcc_id == 291:
+                    m_num = re.match(r"^[A-Z]{1,2}([0-9])", eff_alnum)
+                    digit = us_area_override or (m_num.group(1) if m_num else None)
+                    if digit and digit in US_CALL_AREAS:
+                        uname, ucq, uitu, ulat, ulon = US_CALL_AREAS[digit]
+                        res["entity"] = uname
+                        res["cq_zone"] = ucq
+                        res["itu_zone"] = uitu
+                        res["lat"] = ulat
+                        res["lon"] = ulon
+                break
+
+    # 3. Override coordinates if explicit valid Maidenhead Grid is supplied
+    if is_valid_grid(grid):
+        g_ll = grid_to_latlon(grid)
+        if g_ll is not None:
+            res["lat"], res["lon"] = g_ll
+            res["grid"] = grid[:4].upper() + grid[4:].lower()
+            if not res["matched"]:
+                res["matched"] = True
+                res["entity"] = f"Grid {res['grid']}"
+    elif res["lat"] is not None and res["lon"] is not None and not res["grid"]:
+        res["grid"] = latlon_to_grid(res["lat"], res["lon"], chars=4)
+
+    # 4. Compute Great-Circle Short-Path & Long-Path from Operator Home QTH
+    if res["lat"] is not None and res["lon"] is not None:
+        gc = great_circle(home_lat, home_lon, res["lat"], res["lon"])
+        res.update(gc)
+
+    return res
+
+
+# ---------------------------------------------------------------------------
+# ADIF 3.1.4 Parser & Formatter (.adi)
+# ---------------------------------------------------------------------------
+ADIF_TAG_RE = re.compile(r"<([A-Za-z0-9_]+)(?::(\d+)(?::[^>]*)?)?>", re.IGNORECASE)
+
+
+def parse_adif_text(text: str) -> list[dict[str, str]]:
+    """Parse ADIF 3.1 (.adi) content into a list of uppercase-keyed field dicts."""
+    if not text:
+        return []
+    # Skip header up to <EOH> if present
+    m_eoh = re.search(r"<EOH>", text, flags=re.IGNORECASE)
+    pos = m_eoh.end() if m_eoh else 0
+    records: list[dict[str, str]] = []
+    cur: dict[str, str] = {}
+
+    while pos < len(text):
+        m = ADIF_TAG_RE.search(text, pos)
+        if not m:
+            break
+        tag = m.group(1).upper()
+        len_s = m.group(2)
+        val_start = m.end()
+        if tag == "EOR":
+            if cur:
+                records.append(cur)
+                cur = {}
+            pos = val_start
+        elif tag == "EOH":
+            cur = {}
+            pos = val_start
+        elif len_s is not None:
+            n = int(len_s)
+            val = text[val_start : val_start + n]
+            cur[tag] = val.strip()
+            pos = val_start + n
+        else:
+            pos = val_start
+    if cur and "CALL" in cur:
+        records.append(cur)
+    return records
+
+
+def adif_field(tag: str, val: str) -> str:
+    s = str(val or "").strip()
+    if not s:
+        return ""
+    return f"<{tag}:{len(s)}>{s} "
+
+
+def format_adif_export(rows: list[dict], operator_cfg: dict) -> str:
+    now_s = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d %H%M%S")
+    lines = [
+        "dtLog Vintage Station Logbook ADIF Export",
+        f"<ADIF_VER:5>3.1.4",
+        f"<PROGRAMID:5>dtLog",
+        f"<PROGRAMVERSION:3>1.0",
+        f"<CREATED_TIMESTAMP:{len(now_s)}>{now_s}",
+        "<EOH>",
+        "",
+    ]
+    op_call = operator_cfg.get("callsign", "W1AW")
+    op_grid = operator_cfg.get("grid", "FN31pr")
+
+    for r in rows:
+        qdate = re.sub(r"[^0-9]", "", r.get("qso_date", ""))[:8]
+        qtime = re.sub(r"[^0-9]", "", r.get("time_on", ""))
+        if len(qtime) == 4:
+            qtime += "00"
+        qtime = qtime[:6]
+
+        mode = (r.get("mode") or "SSB").upper()
+        adif_mode = mode
+        submode = ""
+        if mode == "FT4":
+            adif_mode, submode = "MFSK", "FT4"
+        elif mode == "JS8":
+            adif_mode, submode = "MFSK", "JS8"
+
+        parts = [
+            adif_field("CALL", r.get("call", "")),
+            adif_field("QSO_DATE", qdate),
+            adif_field("TIME_ON", qtime),
+            adif_field("FREQ", f"{float(r.get('freq_mhz', 0.0)):.4f}" if r.get("freq_mhz") else ""),
+            adif_field("BAND", r.get("band", "")),
+            adif_field("MODE", adif_mode),
+            adif_field("SUBMODE", submode),
+            adif_field("RST_SENT", "" if r.get("rst_sent") == "--" else r.get("rst_sent", "")),
+            adif_field("RST_RCVD", r.get("rst_rcvd", "")),
+            adif_field("GRIDSQUARE", r.get("grid", "")),
+            adif_field("NAME", r.get("name", "")),
+            adif_field("QTH", r.get("qth", "")),
+            adif_field("COUNTRY", r.get("dxcc_entity", "")),
+            adif_field("CONT", r.get("continent", "")),
+            adif_field("CQZ", str(r.get("cq_zone") or "") if r.get("cq_zone") else ""),
+            adif_field("ITUZ", str(r.get("itu_zone") or "") if r.get("itu_zone") else ""),
+            adif_field("TX_PWR", "" if r.get("tx_pwr") in ("--", "RX") else r.get("tx_pwr", "")),
+            adif_field("COMMENT", r.get("notes", "")),
+            adif_field("QSL_SENT", r.get("qsl_sent", "N")),
+            adif_field("QSL_RCVD", r.get("qsl_rcvd", "N")),
+            adif_field("STATION_CALLSIGN", op_call),
+            adif_field("MY_GRIDSQUARE", op_grid),
+        ]
+        if r.get("log_type") == "SWL":
+            parts.append(adif_field("SWL", "Y"))
+        lines.append("".join(p for p in parts if p) + "<EOR>")
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# SQLite Station Logbook Backend
+# ---------------------------------------------------------------------------
+class LogbookDB:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(self.db_path))
+        self.conn.row_factory = sqlite3.Row
+        self._init_schema()
+
+    def _init_schema(self):
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                log_type TEXT NOT NULL DEFAULT 'QSO',
+                qso_date TEXT NOT NULL,
+                time_on TEXT NOT NULL,
+                call TEXT NOT NULL,
+                freq_mhz REAL NOT NULL DEFAULT 14.2300,
+                band TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                rst_sent TEXT DEFAULT '59',
+                rst_rcvd TEXT DEFAULT '59',
+                grid TEXT DEFAULT '',
+                name TEXT DEFAULT '',
+                qth TEXT DEFAULT '',
+                tx_pwr TEXT DEFAULT '100',
+                notes TEXT DEFAULT '',
+                dxcc_entity TEXT DEFAULT '',
+                dxcc_code TEXT DEFAULT '',
+                continent TEXT DEFAULT '',
+                cq_zone INTEGER DEFAULT 0,
+                itu_zone INTEGER DEFAULT 0,
+                bearing_deg REAL DEFAULT 0.0,
+                distance_km REAL DEFAULT 0.0,
+                qsl_sent TEXT DEFAULT 'N',
+                qsl_rcvd TEXT DEFAULT 'N'
+            );
+            CREATE INDEX IF NOT EXISTS idx_contacts_call ON contacts(call);
+            CREATE INDEX IF NOT EXISTS idx_contacts_date ON contacts(qso_date DESC, time_on DESC);
+            """
+        )
+        self.conn.commit()
+
+    def close(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    def insert_contact(self, d: dict) -> int:
+        cur = self.conn.execute(
+            """
+            INSERT INTO contacts (
+                log_type, qso_date, time_on, call, freq_mhz, band, mode,
+                rst_sent, rst_rcvd, grid, name, qth, tx_pwr, notes,
+                dxcc_entity, dxcc_code, continent, cq_zone, itu_zone,
+                bearing_deg, distance_km, qsl_sent, qsl_rcvd
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                d.get("log_type", "QSO"),
+                d.get("qso_date", ""),
+                d.get("time_on", ""),
+                d.get("call", "").strip().upper(),
+                float(d.get("freq_mhz") or 0.0),
+                d.get("band", "20m"),
+                d.get("mode", "SSB"),
+                d.get("rst_sent", "59"),
+                d.get("rst_rcvd", "59"),
+                d.get("grid", ""),
+                d.get("name", ""),
+                d.get("qth", ""),
+                d.get("tx_pwr", ""),
+                d.get("notes", ""),
+                d.get("dxcc_entity", ""),
+                d.get("dxcc_code", ""),
+                d.get("continent", ""),
+                int(d.get("cq_zone") or 0),
+                int(d.get("itu_zone") or 0),
+                float(d.get("bearing_deg") or 0.0),
+                float(d.get("distance_km") or 0.0),
+                d.get("qsl_sent", "N"),
+                d.get("qsl_rcvd", "N"),
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def update_contact(self, row_id: int, d: dict):
+        self.conn.execute(
+            """
+            UPDATE contacts SET
+                log_type=?, qso_date=?, time_on=?, call=?, freq_mhz=?, band=?, mode=?,
+                rst_sent=?, rst_rcvd=?, grid=?, name=?, qth=?, tx_pwr=?, notes=?,
+                dxcc_entity=?, dxcc_code=?, continent=?, cq_zone=?, itu_zone=?,
+                bearing_deg=?, distance_km=?, qsl_sent=?, qsl_rcvd=?
+            WHERE id=?
+            """,
+            (
+                d.get("log_type", "QSO"),
+                d.get("qso_date", ""),
+                d.get("time_on", ""),
+                d.get("call", "").strip().upper(),
+                float(d.get("freq_mhz") or 0.0),
+                d.get("band", "20m"),
+                d.get("mode", "SSB"),
+                d.get("rst_sent", "59"),
+                d.get("rst_rcvd", "59"),
+                d.get("grid", ""),
+                d.get("name", ""),
+                d.get("qth", ""),
+                d.get("tx_pwr", ""),
+                d.get("notes", ""),
+                d.get("dxcc_entity", ""),
+                d.get("dxcc_code", ""),
+                d.get("continent", ""),
+                int(d.get("cq_zone") or 0),
+                int(d.get("itu_zone") or 0),
+                float(d.get("bearing_deg") or 0.0),
+                float(d.get("distance_km") or 0.0),
+                d.get("qsl_sent", "N"),
+                d.get("qsl_rcvd", "N"),
+                int(row_id),
+            ),
+        )
+        self.conn.commit()
+
+    def delete_contact(self, row_id: int):
+        self.conn.execute("DELETE FROM contacts WHERE id=?", (int(row_id),))
+        self.conn.commit()
+
+    def get_contact(self, row_id: int) -> dict | None:
+        r = self.conn.execute("SELECT * FROM contacts WHERE id=?", (int(row_id),)).fetchone()
+        return dict(r) if r else None
+
+    def toggle_qsl(self, row_id: int, field: str):
+        if field not in ("qsl_sent", "qsl_rcvd"):
+            return
+        r = self.get_contact(row_id)
+        if not r:
+            return
+        nxt = "Y" if r.get(field) != "Y" else "N"
+        self.conn.execute(f"UPDATE contacts SET {field}=? WHERE id=?", (nxt, int(row_id)))
+        self.conn.commit()
+
+    def query_contacts(
+        self, search: str = "", log_type: str = "ALL", band: str = "ALL", mode: str = "ALL", dxcc: str = "ALL"
+    ) -> list[dict]:
+        clauses = []
+        params: list = []
+        if log_type in ("QSO", "SWL"):
+            clauses.append("log_type = ?")
+            params.append(log_type)
+        if band and band != "ALL":
+            clauses.append("LOWER(band) = LOWER(?)")
+            params.append(band)
+        if mode and mode != "ALL":
+            clauses.append("UPPER(mode) = UPPER(?)")
+            params.append(mode)
+        if dxcc and dxcc != "ALL":
+            clauses.append("(UPPER(dxcc_code) = UPPER(?) OR dxcc_entity = ?)")
+            params.extend([dxcc, dxcc])
+        if search.strip():
+            q = f"%{search.strip()}%"
+            clauses.append(
+                "(call LIKE ? OR name LIKE ? OR qth LIKE ? OR grid LIKE ? OR dxcc_entity LIKE ? OR dxcc_code LIKE ? OR notes LIKE ?)"
+            )
+            params.extend([q, q, q, q, q, q, q])
+        where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM contacts {where_sql} ORDER BY qso_date DESC, time_on DESC, id DESC",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_distinct_dxcc(self) -> list[str]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT dxcc_code FROM contacts WHERE dxcc_code != '' ORDER BY dxcc_code ASC"
+        ).fetchall()
+        return [r[0] for r in rows if r[0]]
+
+    def check_dupe_and_history(self, call: str, band: str, mode: str, exclude_id: int | None = None) -> dict:
+        c_up = (call or "").strip().upper()
+        if not c_up:
+            return {"is_dupe": False, "dupe_row": None, "prev_rows": [], "new_dxcc": False}
+        rows = self.conn.execute(
+            "SELECT * FROM contacts WHERE call = ? ORDER BY qso_date DESC, time_on DESC",
+            (c_up,),
+        ).fetchall()
+        prev = [dict(r) for r in rows if exclude_id is None or r["id"] != exclude_id]
+        # Normalize SSB/USB/LSB equivalence for voice dupe check
+        voice_set = {"SSB", "USB", "LSB"}
+        m_up = (mode or "").upper()
+        b_lo = (band or "").lower()
+        dupe_row = None
+        for r in prev:
+            rm = (r["mode"] or "").upper()
+            same_mode = (rm == m_up) or (rm in voice_set and m_up in voice_set)
+            if (r["band"] or "").lower() == b_lo and same_mode:
+                dupe_row = r
+                break
+        return {"is_dupe": dupe_row is not None, "dupe_row": dupe_row, "prev_rows": prev}
+
+    def is_dxcc_worked(self, dxcc_code: str) -> bool:
+        if not dxcc_code:
+            return False
+        r = self.conn.execute(
+            "SELECT 1 FROM contacts WHERE dxcc_code = ? LIMIT 1", (dxcc_code,)
+        ).fetchone()
+        return r is not None
+
+    def get_stats(self) -> dict[str, int]:
+        total_qsos = self.conn.execute("SELECT COUNT(*) FROM contacts WHERE log_type='QSO'").fetchone()[0]
+        swl_logs = self.conn.execute("SELECT COUNT(*) FROM contacts WHERE log_type='SWL'").fetchone()[0]
+        unique_calls = self.conn.execute("SELECT COUNT(DISTINCT call) FROM contacts WHERE call != ''").fetchone()[0]
+        dxcc_cnt = self.conn.execute(
+            "SELECT COUNT(DISTINCT dxcc_code) FROM contacts WHERE dxcc_code != ''"
+        ).fetchone()[0]
+        grids_cnt = self.conn.execute(
+            "SELECT COUNT(DISTINCT UPPER(SUBSTR(grid, 1, 4))) FROM contacts WHERE LENGTH(grid) >= 4"
+        ).fetchone()[0]
+        bands_cnt = self.conn.execute("SELECT COUNT(DISTINCT LOWER(band)) FROM contacts WHERE band != ''").fetchone()[0]
+        return {
+            "total_qsos": int(total_qsos),
+            "swl_logs": int(swl_logs),
+            "unique_calls": int(unique_calls),
+            "dxcc_entities": int(dxcc_cnt),
+            "grids_worked": int(grids_cnt),
+            "bands": int(bands_cnt),
+        }
+
+    def import_adif_records(self, adif_recs: list[dict[str, str]], home_lat: float, home_lon: float) -> tuple[int, int]:
+        added = 0
+        skipped = 0
+        existing = set()
+        for r in self.conn.execute("SELECT call, qso_date, SUBSTR(time_on,1,5), LOWER(band), UPPER(mode) FROM contacts"):
+            existing.add((r[0], r[1], r[2], r[3], r[4]))
+
+        for rec in adif_recs:
+            call = rec.get("CALL", "").strip().upper()
+            if not call:
+                skipped += 1
+                continue
+            raw_d = re.sub(r"[^0-9]", "", rec.get("QSO_DATE", ""))
+            if len(raw_d) == 8:
+                qdate = f"{raw_d[0:4]}-{raw_d[4:6]}-{raw_d[6:8]}"
+            else:
+                qdate = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+            raw_t = re.sub(r"[^0-9]", "", rec.get("TIME_ON", "") or rec.get("TIME_OFF", ""))
+            if len(raw_t) >= 4:
+                qtime = f"{raw_t[0:2]}:{raw_t[2:4]}"
+            else:
+                qtime = "00:00"
+
+            try:
+                freq_mhz = float(rec.get("FREQ", "0") or 0.0)
+            except ValueError:
+                freq_mhz = 0.0
+
+            is_swl = rec.get("SWL", "").upper() == "Y" or rec.get("MODE", "").upper() == "SWL"
+            band = rec.get("BAND", "").strip()
+            if not band:
+                band = freq_mhz_to_band(freq_mhz, is_swl=is_swl)
+            elif freq_mhz <= 0.0:
+                for bn, _lo, _hi, fdef in BAND_PLAN:
+                    if bn.lower() == band.lower():
+                        freq_mhz = fdef
+                        break
+
+            mode = (rec.get("SUBMODE") or rec.get("MODE") or "SSB").strip().upper()
+            if mode == "MFSK" and rec.get("SUBMODE"):
+                mode = rec["SUBMODE"].strip().upper()
+
+            key = (call, qdate, qtime[:5], band.lower(), mode.upper())
+            if key in existing:
+                skipped += 1
+                continue
+            existing.add(key)
+
+            grid = rec.get("GRIDSQUARE", "").strip()
+            info = resolve_call_or_station(call, grid, home_lat, home_lon)
+            qth = rec.get("QTH", "").strip()
+            state = rec.get("STATE", "").strip()
+            if state and state not in qth:
+                qth = f"{qth}, {state}".strip(", ")
+
+            notes = rec.get("COMMENT", "") or rec.get("NOTES", "")
+            d_ins = {
+                "log_type": "SWL" if is_swl else "QSO",
+                "qso_date": qdate,
+                "time_on": qtime,
+                "call": call,
+                "freq_mhz": freq_mhz,
+                "band": band,
+                "mode": mode,
+                "rst_sent": rec.get("RST_SENT") or ("--" if is_swl else "59"),
+                "rst_rcvd": rec.get("RST_RCVD") or ("45444" if is_swl else "59"),
+                "grid": grid or info.get("grid", ""),
+                "name": rec.get("NAME", ""),
+                "qth": qth,
+                "tx_pwr": rec.get("TX_PWR", "RX" if is_swl else ""),
+                "notes": notes,
+                "dxcc_entity": rec.get("COUNTRY") or info.get("entity", ""),
+                "dxcc_code": info.get("iso2") or info.get("prefix", ""),
+                "continent": rec.get("CONT") or info.get("cont", ""),
+                "cq_zone": int(rec["CQZ"]) if rec.get("CQZ", "").isdigit() else info.get("cq_zone", 0),
+                "itu_zone": int(rec["ITUZ"]) if rec.get("ITUZ", "").isdigit() else info.get("itu_zone", 0),
+                "bearing_deg": info.get("sp_deg") or 0.0,
+                "distance_km": info.get("sp_km") or 0.0,
+                "qsl_sent": rec.get("QSL_SENT", "N")[:1].upper() or "N",
+                "qsl_rcvd": rec.get("QSL_RCVD", "N")[:1].upper() or "N",
+            }
+            self.insert_contact(d_ins)
+            added += 1
+        return added, skipped
+
+
+# ---------------------------------------------------------------------------
+# dtRadio Bridge Helper (Reads ~/.config/dtradio/state.json)
+# ---------------------------------------------------------------------------
+def parse_dtradio_state(state_path: Path = DTRADIO_STATE_FILE) -> dict | None:
+    if not state_path.is_file():
+        return None
+    try:
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        freq_khz = float(st.get("freq_khz", 14230.0))
+        freq_mhz = freq_khz / 1000.0
+        raw_mode = str(st.get("mode", "USB")).upper()
+        mode_map = {"NFM": "FM", "WFM": "FM"}
+        mode = mode_map.get(raw_mode, raw_mode if raw_mode in ALL_MODES else "USB")
+        title = str(st.get("title", "")).strip()
+        source = str(st.get("source", "kiwi"))
+
+        # Infer whether dtRadio is tuned to an Amateur band or a Broadcast/Utility/NOAA SWL station
+        in_ham_band = any(flo <= freq_mhz <= fhi for _b, flo, fhi, _fd in BAND_PLAN)
+        swl_keywords = ("WWV", "CHU", "NOAA", "WRMI", "WBCQ", "WINB", "WTWW", "WWCR", "RNZ", "BBC", "VOLMET", "HFGCS", "FEMA", "TOWER", "NASA", "UVB")
+        title_up = title.upper()
+        is_swl = (not in_ham_band) or any(k in title_up for k in swl_keywords) or source == "stream"
+
+        # Extract station identifier if clearly present in title (e.g. "WWV", "NOAA KWO35", "WRMI", "CHU")
+        extracted_station = ""
+        m_noaa = re.search(r"\b(K[A-Z]{2}\d{2}|WWG\d{2}|WX[JK]\d{2}|WNG\d{3}|WZ\d{4})\b", title_up)
+        if m_noaa:
+            extracted_station = m_noaa.group(1)
+        else:
+            tok0 = re.split(r"[\s—\-/]+", title_up)[0] if title_up else ""
+            if tok0 in SWL_STATIONS or re.match(r"^[A-Z]{3,5}$", tok0) and tok0 not in ("MANUAL", "VHF", "RTL", "MORSEOPS", "GLOBAL", "EAST"):
+                extracted_station = tok0
+
+        band = freq_mhz_to_band(freq_mhz, is_swl=is_swl)
+        return {
+            "freq_khz": freq_khz,
+            "freq_mhz": freq_mhz,
+            "mode": mode,
+            "band": band,
+            "title": title,
+            "source": source,
+            "is_swl": is_swl,
+            "station_hint": extracted_station,
+        }
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Vintage Postcard QSL Card Renderer (Cairo Surface -> PNG + ASCII Slip)
+# ---------------------------------------------------------------------------
+def draw_qsl_card_cairo(cr: cairo.Context, W: float, H: float, row: dict, op_cfg: dict):
+    op_call = op_cfg.get("callsign", "W1AW")
+    op_grid = op_cfg.get("grid", "FN31pr")
+    op_qth = op_cfg.get("qth", "Newington, CT").upper()
+    op_itu = op_cfg.get("itu_zone", 6)
+    op_cq = op_cfg.get("cq_zone", 3)
+    is_swl = row.get("log_type") == "SWL"
+
+    # Warm vintage cream postcard stock
+    cr.rectangle(0, 0, W, H)
+    cr.set_source_rgb(0.992, 0.968, 0.910)
+    cr.fill()
+
+    # Vintage airmail red & navy parallelogram border chevrons
+    stripe_w = 10.0
+    step = 34.0
+    cr.save()
+    # Top & bottom border bands
+    for y_band in (0.0, H - stripe_w):
+        cr.rectangle(0, y_band, W, stripe_w)
+        cr.clip()
+        for i in range(-2, int(W / step) + 3):
+            x0 = i * step
+            cr.set_source_rgb(0.76, 0.16, 0.16) if i % 2 == 0 else cr.set_source_rgb(0.12, 0.24, 0.44)
+            cr.move_to(x0, y_band + stripe_w)
+            cr.line_to(x0 + 10, y_band)
+            cr.line_to(x0 + 26, y_band)
+            cr.line_to(x0 + 16, y_band + stripe_w)
+            cr.close_path()
+            cr.fill()
+        cr.reset_clip()
+    # Left & right border bands
+    for x_band in (0.0, W - stripe_w):
+        cr.rectangle(x_band, stripe_w, stripe_w, H - 2 * stripe_w)
+        cr.clip()
+        for j in range(-2, int(H / step) + 3):
+            y0 = j * step
+            cr.set_source_rgb(0.76, 0.16, 0.16) if j % 2 == 0 else cr.set_source_rgb(0.12, 0.24, 0.44)
+            cr.move_to(x_band, y0)
+            cr.line_to(x_band + stripe_w, y0 + 10)
+            cr.line_to(x_band + stripe_w, y0 + 26)
+            cr.line_to(x_band, y0 + 16)
+            cr.close_path()
+            cr.fill()
+        cr.reset_clip()
+    cr.restore()
+
+    # Inner double hairline frame
+    pad = 18.0
+    cr.set_line_width(2.0)
+    cr.set_source_rgb(0.12, 0.24, 0.44)
+    cr.rectangle(pad, pad, W - 2 * pad, H - 2 * pad)
+    cr.stroke()
+    cr.set_line_width(0.9)
+    cr.rectangle(pad + 4, pad + 4, W - 2 * (pad + 4), H - 2 * (pad + 4))
+    cr.stroke()
+
+    # Subtle background Great-Circle globe watermark
+    gx, gy, gr = W * 0.80, H * 0.30, H * 0.19
+    cr.set_source_rgba(0.15, 0.32, 0.52, 0.11)
+    cr.set_line_width(1.6)
+    cr.arc(gx, gy, gr, 0, 2 * math.pi)
+    cr.stroke()
+    for lat_f in (-0.55, 0.0, 0.55):
+        ry = gy + lat_f * gr
+        rx_span = math.sqrt(max(0.0, gr * gr - (lat_f * gr) ** 2))
+        cr.move_to(gx - rx_span, ry)
+        cr.line_to(gx + rx_span, ry)
+        cr.stroke()
+    for lon_w in (0.35, 0.72):
+        cr.save()
+        cr.translate(gx, gy)
+        cr.scale(lon_w, 1.0)
+        cr.arc(0, 0, gr, 0, 2 * math.pi)
+        cr.restore()
+        cr.stroke()
+
+    # Vintage radio tower + RF lightning bolts at top-left
+    tx, ty = pad + 48.0, pad + 26.0
+    cr.set_source_rgb(0.14, 0.26, 0.46)
+    cr.set_line_width(2.2)
+    cr.move_to(tx, ty)
+    cr.line_to(tx - 18, ty + 88)
+    cr.move_to(tx, ty)
+    cr.line_to(tx + 18, ty + 88)
+    for cross_y, span in ((26, 6), (48, 10), (70, 14)):
+        cr.move_to(tx - span, ty + cross_y)
+        cr.line_to(tx + span, ty + cross_y)
+    cr.stroke()
+    # Red RF bolts radiating from tower apex
+    cr.set_source_rgb(0.80, 0.15, 0.14)
+    cr.set_line_width(2.0)
+    for side in (-1, 1):
+        cr.move_to(tx + side * 8, ty + 6)
+        cr.line_to(tx + side * 22, ty - 2)
+        cr.line_to(tx + side * 17, ty + 9)
+        cr.line_to(tx + side * 32, ty + 3)
+        cr.stroke()
+
+    # Giant Crimson Vintage Callsign Banner
+    cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    cr.set_font_size(H * 0.125)
+    # Subtle drop shadow
+    cr.set_source_rgba(0.10, 0.18, 0.34, 0.22)
+    cr.move_to(pad + 96, pad + 68)
+    cr.show_text(op_call)
+    cr.set_source_rgb(0.77, 0.13, 0.13)
+    cr.move_to(pad + 93, pad + 65)
+    cr.show_text(op_call)
+
+    # Station QTH & Zone Subtitle
+    cr.set_font_size(H * 0.030)
+    cr.set_source_rgb(0.12, 0.24, 0.44)
+    cr.move_to(pad + 95, pad + 90)
+    cr.show_text(f"AMATEUR RADIO & SWL STATION  •  {op_qth}, USA")
+    cr.set_font_size(H * 0.026)
+    cr.set_source_rgb(0.26, 0.32, 0.40)
+    cr.move_to(pad + 95, pad + 111)
+    cr.show_text(f"MAIDENHEAD GRID: {op_grid}   •   ITU ZONE: {op_itu:02d}   •   CQ ZONE: {op_cq:02d}")
+
+    # Top-right QSL / SWL Badge Stamp
+    badge_txt = "SWL REPORT" if is_swl else "QSL CARD"
+    cr.set_font_size(H * 0.031)
+    b_ext = cr.text_extents(badge_txt)
+    bx0 = W - pad - b_ext.width - 34
+    by0 = pad + 18
+    cr.set_source_rgb(0.12, 0.24, 0.44)
+    cr.rectangle(bx0, by0, b_ext.width + 20, 30)
+    cr.fill()
+    cr.set_source_rgb(1.0, 0.97, 0.90)
+    cr.move_to(bx0 + 10, by0 + 20)
+    cr.show_text(badge_txt)
+
+    # Confirmation Banner Strip
+    cy0 = H * 0.34
+    cr.set_source_rgb(0.12, 0.24, 0.44)
+    cr.rectangle(pad + 16, cy0, W - 2 * (pad + 16), 34)
+    cr.fill()
+    cr.set_font_size(H * 0.032)
+    cr.set_source_rgb(1.0, 0.96, 0.86)
+    conf_lbl = "CONFIRMING SWL RECEPTION OF:" if is_swl else "CONFIRMING TWO-WAY QSO WITH:"
+    cr.move_to(pad + 28, cy0 + 23)
+    cr.show_text(conf_lbl)
+
+    cr.set_font_size(H * 0.042)
+    cr.set_source_rgb(1.0, 0.80, 0.28)
+    c_ext = cr.text_extents(conf_lbl)
+    target_call = row.get("call", "UNKNOWN")
+    cr.move_to(pad + 42 + c_ext.width, cy0 + 24)
+    cr.show_text(target_call)
+
+    # Structured QSO Data Ledger Box
+    tx0 = pad + 16
+    ty0 = cy0 + 44
+    tw = W - 2 * (pad + 16)
+    th = H * 0.26
+    cr.set_source_rgb(1.0, 0.992, 0.965)
+    cr.rectangle(tx0, ty0, tw, th)
+    cr.fill()
+    cr.set_source_rgb(0.12, 0.24, 0.44)
+    cr.set_line_width(1.6)
+    cr.rectangle(tx0, ty0, tw, th)
+    cr.stroke()
+
+    # Header bar inside ledger
+    hh = th * 0.36
+    cr.set_source_rgb(0.88, 0.92, 0.96)
+    cr.rectangle(tx0 + 1, ty0 + 1, tw - 2, hh)
+    cr.fill()
+    cr.move_to(tx0, ty0 + hh)
+    cr.line_to(tx0 + tw, ty0 + hh)
+    cr.stroke()
+
+    cols = [
+        ("UTC DATE", row.get("qso_date", ""), 0.17),
+        ("UTC", row.get("time_on", ""), 0.11),
+        ("FREQ (MHz)", f"{float(row.get('freq_mhz', 0.0)):.4f}", 0.16),
+        ("BAND", row.get("band", ""), 0.10),
+        ("MODE", row.get("mode", ""), 0.11),
+        ("SINPO" if is_swl else "RST S/R", row.get("rst_rcvd", "") if is_swl else f"{row.get('rst_sent','59')}/{row.get('rst_rcvd','59')}", 0.15),
+        ("AZ / DIST", f"{int(round(row.get('bearing_deg', 0)))}° / {int(round(row.get('distance_km', 0)))}km" if row.get("distance_km") else "--", 0.20),
+    ]
+
+    cur_x = tx0
+    for idx, (hdr, val, frac) in enumerate(cols):
+        cw = tw * frac
+        if idx > 0:
+            cr.set_source_rgb(0.12, 0.24, 0.44)
+            cr.set_line_width(1.1)
+            cr.move_to(cur_x, ty0)
+            cr.line_to(cur_x, ty0 + th)
+            cr.stroke()
+        cr.set_font_size(H * 0.023)
+        cr.set_source_rgb(0.12, 0.24, 0.44)
+        hext = cr.text_extents(hdr)
+        cr.move_to(cur_x + (cw - hext.width) * 0.5, ty0 + hh * 0.66)
+        cr.show_text(hdr)
+
+        cr.set_font_size(H * 0.030)
+        cr.set_source_rgb(0.08, 0.10, 0.14)
+        v_str = str(val)[:14]
+        vext = cr.text_extents(v_str)
+        cr.move_to(cur_x + (cw - vext.width) * 0.5, ty0 + hh + (th - hh) * 0.62)
+        cr.show_text(v_str)
+        cur_x += cw
+
+    # Station details & Remarks section below table
+    ry0 = ty0 + th + 24
+    cr.set_font_size(H * 0.026)
+    cr.set_source_rgb(0.16, 0.22, 0.30)
+    dxcc_line = f"TO STATION QTH: {row.get('name', '')}  {row.get('qth', '')}  ({row.get('dxcc_entity', '')})   •   GRID: {row.get('grid', '--')}".strip()
+    cr.move_to(tx0 + 4, ry0)
+    cr.show_text(dxcc_line[:74])
+
+    pwr_s = f"RX MONITOR (dtRadio / SDR)" if is_swl else f"TX POWER: {row.get('tx_pwr', '100')} W"
+    notes_s = row.get("notes", "") or "Solid copy into Eastern Idaho! Vy 73."
+    cr.move_to(tx0 + 4, ry0 + 24)
+    cr.show_text(f"{pwr_s}   •   REMARKS: {notes_s[:52]}")
+
+    # Bottom QSL status checkboxes & Operator signature
+    fy = H - pad - 18
+    qsl_box = "[X] TNX QSL" if row.get("qsl_rcvd") == "Y" else "[X] PSE QSL   [ ] TNX QSL"
+    cr.set_font_size(H * 0.027)
+    cr.set_source_rgb(0.76, 0.14, 0.14)
+    cr.move_to(tx0 + 4, fy)
+    cr.show_text(qsl_box)
+
+    sig = f"73 de {op_call} ({op_grid})"
+    cr.select_font_face("DejaVu Sans", cairo.FONT_SLANT_ITALIC, cairo.FONT_WEIGHT_BOLD)
+    cr.set_font_size(H * 0.036)
+    cr.set_source_rgb(0.10, 0.22, 0.46)
+    sext = cr.text_extents(sig)
+    cr.move_to(W - pad - 20 - sext.width, fy)
+    cr.show_text(sig)
+
+
+def render_qsl_png(out_path: Path, row: dict, op_cfg: dict, width: int = 1140, height: int = 720):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+    cr = cairo.Context(surf)
+    draw_qsl_card_cairo(cr, float(width), float(height), row, op_cfg)
+    surf.write_to_png(str(out_path))
+
+
+def format_ascii_qsl(row: dict, op_cfg: dict) -> str:
+    op_call = op_cfg.get("callsign", "W1AW")
+    op_grid = op_cfg.get("grid", "FN31pr")
+    op_qth = op_cfg.get("qth", "Newington, CT").upper()
+    is_swl = row.get("log_type") == "SWL"
+    hdr_mode = "SWL RECEPTION REPORT" if is_swl else "TWO-WAY AMATEUR QSO"
+    rst_str = f"SINPO {row.get('rst_rcvd', '45444')}" if is_swl else f"SENT {row.get('rst_sent', '59')} / RCVD {row.get('rst_rcvd', '59')}"
+    az_str = (
+        f"{int(round(row.get('bearing_deg', 0))):03d} deg ({int(round(row.get('distance_km', 0)))} km)"
+        if row.get("distance_km")
+        else "--"
+    )
+    lines = [
+        "+========================================================================+",
+        f"|  {op_call:<10}  •  {op_qth:<24}  •  GRID {op_grid:<8}  •  USA   |",
+        "+========================================================================+",
+        f"|  CONFIRMING {hdr_mode:<22} WITH:  {row.get('call', ''):<24} |",
+        "+------------+--------+------------+--------+-------+--------------------+",
+        "|  UTC DATE  |  TIME  | FREQ (MHz) |  BAND  | MODE  |    SIGNAL REPORT   |",
+        "+------------+--------+------------+--------+-------+--------------------+",
+        f"| {row.get('qso_date',''):<10} | {row.get('time_on',''):<6} | {float(row.get('freq_mhz',0.0)):>10.4f} | {row.get('band',''):<6} | {row.get('mode',''):<5} | {rst_str:<18} |",
+        "+------------+--------+------------+--------+-------+--------------------+",
+        f"|  DXCC / QTH : {(row.get('dxcc_entity','') + ' ' + row.get('qth','')).strip()[:55]:<56} |",
+        f"|  PATH / PWR : {az_str:<26}  TX PWR: {str(row.get('tx_pwr','100')):<18} |",
+        f"|  REMARKS    : {(row.get('notes','') or 'Vy 73 & thanks for the contact!')[:56]:<56} |",
+        f"|  [{'X' if row.get('qsl_rcvd')!='Y' else ' '}] PSE QSL   [{'X' if row.get('qsl_rcvd')=='Y' else ' '}] TNX QSL                       73 de {op_call:<14} |",
+        "+========================================================================+",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Vintage QSL Card Preview Dialog (Cairo Postcard + Copyable ASCII + PNG Save)
+# ---------------------------------------------------------------------------
+class QslCardDialog(Gtk.Dialog):
+    def __init__(self, parent: Gtk.Window, row: dict, op_cfg: dict, on_status_cb):
+        super().__init__(title=f"QSL Card Preview — {row.get('call', '')}", transient_for=parent, flags=0)
+        self.set_default_size(790, 560)
+        self.row = row
+        self.op_cfg = op_cfg
+        self.on_status_cb = on_status_cb
+
+        box = self.get_content_area()
+        box.set_spacing(6)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        box.set_margin_start(6)
+        box.set_margin_end(6)
+
+        nb = Gtk.Notebook()
+        box.pack_start(nb, True, True, 0)
+
+        # Tab 1: Visual Vintage Postcard QSL
+        card_area = Gtk.DrawingArea()
+        card_area.set_size_request(750, 455)
+        card_area.connect("draw", self._on_draw_card)
+        nb.append_page(card_area, Gtk.Label(label="POSTCARD QSL (.PNG PREVIEW)"))
+
+        # Tab 2: Classic Teletype / BBS ASCII QSL Slip
+        ascii_tv = Gtk.TextView()
+        ascii_tv.set_editable(False)
+        ascii_tv.set_monospace(True)
+        ascii_tv.get_buffer().set_text(format_ascii_qsl(row, op_cfg))
+        sc = Gtk.ScrolledWindow()
+        sc.add(ascii_tv)
+        nb.append_page(sc, Gtk.Label(label="ASCII TELETYPE QSL"))
+
+        btn_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        box.pack_start(btn_bar, False, False, 0)
+
+        btn_png = Gtk.Button(label="💾 SAVE QSL .PNG")
+        btn_png.get_style_context().add_class("btn-log")
+        btn_png.connect("clicked", self._on_save_png)
+        btn_bar.pack_start(btn_png, False, False, 0)
+
+        btn_copy = Gtk.Button(label="📋 COPY ASCII QSL")
+        btn_copy.connect("clicked", self._on_copy_ascii)
+        btn_bar.pack_start(btn_copy, False, False, 0)
+
+        btn_close = Gtk.Button(label="CLOSE")
+        btn_close.connect("clicked", lambda _b: self.response(Gtk.ResponseType.CLOSE))
+        btn_bar.pack_end(btn_close, False, False, 0)
+
+        self.show_all()
+
+    def _on_draw_card(self, w, cr: cairo.Context):
+        alloc = w.get_allocation()
+        draw_qsl_card_cairo(cr, float(alloc.width), float(alloc.height), self.row, self.op_cfg)
+        return False
+
+    def _on_copy_ascii(self, _b):
+        cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        cb.set_text(format_ascii_qsl(self.row, self.op_cfg), -1)
+        cb.store()
+        if self.on_status_cb:
+            self.on_status_cb(f"COPIED ASCII QSL CARD FOR {self.row.get('call', '')} TO CLIPBOARD")
+
+    def _on_save_png(self, _b):
+        safe_call = re.sub(r"[^A-Za-z0-9_-]", "_", self.row.get("call", "QSO"))
+        safe_date = re.sub(r"[^0-9]", "", self.row.get("qso_date", ""))
+        default_dir = HOME / "Pictures"
+        if not default_dir.is_dir():
+            default_dir = HOME
+
+        dlg = Gtk.FileChooserDialog(
+            title="Save Vintage QSL Card (.PNG)",
+            parent=self,
+            action=Gtk.FileChooserAction.SAVE,
+        )
+        dlg.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_SAVE, Gtk.ResponseType.OK,
+        )
+        dlg.set_do_overwrite_confirmation(True)
+        dlg.set_current_folder(str(default_dir))
+        dlg.set_current_name(f"QSL_{self.op_cfg.get('callsign', 'W1AW')}_{safe_call}_{safe_date}.png")
+
+        resp = dlg.run()
+        out_file = dlg.get_filename()
+        dlg.destroy()
+        if resp == Gtk.ResponseType.OK and out_file:
+            out_p = Path(out_file)
+            if out_p.suffix.lower() != ".png":
+                out_p = out_p.with_suffix(".png")
+            render_qsl_png(out_p, self.row, self.op_cfg)
+            if self.on_status_cb:
+                self.on_status_cb(f"SAVED VINTAGE QSL PNG -> {out_p}")
+
+
+# ---------------------------------------------------------------------------
+# Top Vintage Shack Console Deck (VFD Clock/Stats + Tactical DXCC + Analog Compass)
+# ---------------------------------------------------------------------------
+class ShackConsoleDeck(Gtk.DrawingArea):
+    def __init__(self, get_state_fn):
+        super().__init__()
+        self.get_state_fn = get_state_fn
+        self.set_size_request(1060, 174)
+        self.needle_deg = 0.0
+        self.target_deg = 0.0
+        self.has_target = False
+        self.connect("draw", self._on_draw)
+
+    def set_azimuth_target(self, deg: float | None):
+        if deg is None:
+            self.has_target = False
+        else:
+            self.has_target = True
+            self.target_deg = float(deg) % 360.0
+
+    def tick_rotor(self) -> bool:
+        if self.has_target:
+            diff = (self.target_deg - self.needle_deg + 540.0) % 360.0 - 180.0
+            if abs(diff) > 0.15:
+                self.needle_deg = (self.needle_deg + diff * 0.22) % 360.0
+            else:
+                self.needle_deg = self.target_deg
+        self.queue_draw()
+        return True
+
+    def _draw_recessed_vfd_box(self, cr: cairo.Context, x: float, y: float, w: float, h: float):
+        cr.rectangle(x, y, w, h)
+        cr.set_source_rgb(0.03, 0.07, 0.07)
+        cr.fill()
+        cr.set_line_width(2.0)
+        cr.set_source_rgb(0.01, 0.03, 0.03)
+        cr.move_to(x, y + h)
+        cr.line_to(x, y)
+        cr.line_to(x + w, y)
+        cr.stroke()
+        cr.set_source_rgb(0.32, 0.37, 0.46)
+        cr.move_to(x, y + h)
+        cr.line_to(x + w, y + h)
+        cr.line_to(x + w, y)
+        cr.stroke()
+
+    def _on_draw(self, w, cr: cairo.Context):
+        alloc = w.get_allocation()
+        W, H = float(alloc.width), float(alloc.height)
+        st = self.get_state_fn()
+        op = st["op"]
+        stats = st["stats"]
+        res = st["resolved"]
+        dupe_info = st["dupe"]
+        flash_msg = st["flash_msg"]
+
+        # Brushed dark shack instrument housing
+        cr.rectangle(0, 0, W, H)
+        cr.set_source_rgb(0.12, 0.14, 0.17)
+        cr.fill()
+
+        pad = 6.0
+        comp_w = 194.0
+        left_w = max(365.0, (W - comp_w - 4 * pad) * 0.50)
+        mid_x = pad + left_w + pad
+        mid_w = max(290.0, W - mid_x - comp_w - 2 * pad)
+        comp_x = W - pad - comp_w
+        vh = H - 2 * pad
+
+        # ===================================================================
+        # 1. LEFT PANEL: Glowing VFD UTC/Local Shack Clock + 6-Stat Matrix
+        # ===================================================================
+        self._draw_recessed_vfd_box(cr, pad, pad, left_w, vh)
+
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        now_loc = datetime.datetime.now()
+        utc_str = now_utc.strftime("%H:%M:%S")
+        utc_date = now_utc.strftime("%Y-%m-%d")
+        loc_str = now_loc.strftime("%H:%M:%S")
+
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        # Operator shack header strip
+        cr.set_font_size(10.0)
+        cr.set_source_rgb(1.0, 0.75, 0.24)
+        op_banner = f"DE {op['callsign']}  •  GRID {op['grid']}  •  {op['qth'].upper()}"
+        cr.move_to(pad + 11, pad + 18)
+        cr.show_text(op_banner[:46])
+
+        # Glowing Cyan-Green VFD UTC Clock
+        cr.set_font_size(27.0)
+        cr.set_source_rgba(0.18, 0.98, 0.84, 0.18)
+        cr.move_to(pad + 12.5, pad + 51.5)
+        cr.show_text(utc_str)
+        cr.set_source_rgb(0.26, 0.99, 0.86)
+        cr.move_to(pad + 11.0, pad + 50.0)
+        cr.show_text(utc_str)
+
+        u_ext = cr.text_extents(utc_str)
+        cr.set_font_size(10.5)
+        cr.set_source_rgb(0.45, 0.92, 0.82)
+        cr.move_to(pad + 18.0 + u_ext.width, pad + 38.0)
+        cr.show_text("UTC")
+        cr.set_font_size(9.5)
+        cr.set_source_rgb(0.35, 0.78, 0.70)
+        cr.move_to(pad + 18.0 + u_ext.width, pad + 51.0)
+        cr.show_text(utc_date)
+
+        # Warm Amber Local Shack Clock on right side of VFD
+        cr.set_font_size(14.5)
+        l_ext = cr.text_extents(loc_str)
+        lx0 = pad + left_w - l_ext.width - 14.0
+        cr.set_source_rgb(1.0, 0.74, 0.28)
+        cr.move_to(lx0, pad + 49.0)
+        cr.show_text(loc_str)
+        cr.set_font_size(8.8)
+        cr.set_source_rgb(0.84, 0.62, 0.24)
+        cr.move_to(lx0, pad + 34.0)
+        cr.show_text("LOCAL SHACK")
+
+        # 6-Cell Illuminated Telemetry Matrix (2x3 grid)
+        stat_cells = [
+            ("TOTAL QSOs", stats["total_qsos"], (0.28, 0.98, 0.85)),
+            ("SWL LOGS", stats["swl_logs"], (1.00, 0.76, 0.28)),
+            ("UNIQUE CALLS", stats["unique_calls"], (0.45, 0.95, 0.75)),
+            ("DXCC ENTITIES", stats["dxcc_entities"], (0.38, 0.88, 0.98)),
+            ("GRIDS WORKED", stats["grids_worked"], (0.58, 0.96, 0.62)),
+            ("BANDS", stats["bands"], (1.00, 0.66, 0.34)),
+        ]
+        gx0 = pad + 9.0
+        gy0 = pad + 61.0
+        gw = left_w - 18.0
+        gh = vh - 69.0
+        cw = (gw - 8.0) / 3.0
+        ch = (gh - 5.0) / 2.0
+
+        for idx, (slbl, sval, scol) in enumerate(stat_cells):
+            col_i = idx % 3
+            row_i = idx // 3
+            cx0 = gx0 + col_i * (cw + 4.0)
+            cy0 = gy0 + row_i * (ch + 5.0)
+            cr.set_source_rgb(0.05, 0.12, 0.12)
+            cr.rectangle(cx0, cy0, cw, ch)
+            cr.fill()
+            cr.set_line_width(1.0)
+            cr.set_source_rgba(0.22, 0.48, 0.44, 0.55)
+            cr.rectangle(cx0, cy0, cw, ch)
+            cr.stroke()
+
+            cr.set_font_size(8.0)
+            cr.set_source_rgb(0.45, 0.78, 0.72)
+            cr.move_to(cx0 + 6.0, cy0 + 12.5)
+            cr.show_text(slbl)
+
+            cr.set_font_size(16.0)
+            cr.set_source_rgb(*scol)
+            vtxt = f"{sval:,d}"
+            vext = cr.text_extents(vtxt)
+            cr.move_to(cx0 + cw - vext.width - 7.0, cy0 + ch - 7.0)
+            cr.show_text(vtxt)
+
+        # ===================================================================
+        # 2. CENTER PANEL: Tactical DXCC Prefix, Bearing & Dupe VFD Readout
+        # ===================================================================
+        self._draw_recessed_vfd_box(cr, mid_x, pad, mid_w, vh)
+        cr.save()
+        cr.rectangle(mid_x + 4, pad + 4, mid_w - 8, vh - 8)
+        cr.clip()
+
+        cr.set_font_size(9.2)
+        cr.set_source_rgb(0.42, 0.84, 0.78)
+        cr.move_to(mid_x + 11, pad + 18)
+        cr.show_text("GREAT-CIRCLE DXCC & DUPE COMPUTER")
+
+        if flash_msg:
+            cr.set_source_rgba(1.0, 0.68, 0.14, 0.22)
+            cr.rectangle(mid_x + 10, pad + 24, mid_w - 20, 22)
+            cr.fill()
+            cr.set_font_size(10.5)
+            cr.set_source_rgb(1.0, 0.80, 0.28)
+            cr.move_to(mid_x + 15, pad + 39)
+            cr.show_text(flash_msg[:46])
+        elif res["matched"]:
+            code_tag = f"[{res['iso2'] or res['prefix']}]"
+            if PangoCairo is not None:
+                p_lay = w.create_pango_layout(f"{res['flag']} {code_tag} {res['entity']}"[:38])
+                p_lay.set_font_description(Pango.FontDescription("DejaVu Sans Mono Bold 10"))
+                cr.set_source_rgb(0.28, 0.99, 0.86)
+                cr.move_to(mid_x + 11, pad + 25)
+                PangoCairo.show_layout(cr, p_lay)
+            else:
+                cr.set_font_size(13.0)
+                cr.set_source_rgb(0.28, 0.99, 0.86)
+                cr.move_to(mid_x + 11, pad + 41)
+                cr.show_text(f"{code_tag} {res['entity']}"[:36])
+        else:
+            cr.set_font_size(12.0)
+            cr.set_source_rgb(0.30, 0.66, 0.60)
+            cr.move_to(mid_x + 11, pad + 41)
+            cr.show_text("ENTER CALLSIGN OR GRID LOCATOR...")
+
+        if res["matched"]:
+            # Zone / Continent / Grid line
+            z_parts = []
+            if res["cont"]:
+                z_parts.append(f"CONT: {res['cont']}")
+            if res["cq_zone"]:
+                z_parts.append(f"CQZ: {res['cq_zone']:02d}")
+            if res["itu_zone"]:
+                z_parts.append(f"ITUZ: {res['itu_zone']:02d}")
+            if res["grid"]:
+                z_parts.append(f"GRID: {res['grid']}")
+            cr.set_font_size(9.8)
+            cr.set_source_rgb(1.0, 0.76, 0.28)
+            cr.move_to(mid_x + 11, pad + 62)
+            cr.show_text("  •  ".join(z_parts)[:48])
+
+            # Short-Path & Long-Path Bearings + Distances from Home Grid
+            if res["sp_deg"] is not None:
+                cr.set_font_size(11.0)
+                cr.set_source_rgb(1.0, 0.44, 0.38)
+                sp_line = (
+                    f"SHORT PATH: {res['sp_deg']:05.1f}° ({res['compass']})  •  "
+                    f"{res['sp_km']:,.0f} km / {res['sp_mi']:,.0f} mi"
+                )
+                cr.move_to(mid_x + 11, pad + 86)
+                cr.show_text(sp_line[:52])
+
+                cr.set_font_size(10.0)
+                cr.set_source_rgb(0.36, 0.88, 0.96)
+                lp_line = (
+                    f"LONG PATH : {res['lp_deg']:05.1f}°       •  "
+                    f"{res['lp_km']:,.0f} km / {res['lp_mi']:,.0f} mi"
+                )
+                cr.move_to(mid_x + 11, pad + 106)
+                cr.show_text(lp_line[:52])
+        else:
+            cr.set_font_size(9.8)
+            cr.set_source_rgb(0.26, 0.56, 0.52)
+            cr.move_to(mid_x + 11, pad + 66)
+            cr.show_text(f"HOME QTH: {op['callsign']} @ {op['grid']} ({op['lat']:.4f}°, {op['lon']:.4f}°)")
+            cr.move_to(mid_x + 11, pad + 86)
+            cr.show_text("SHORT PATH: ---.-°  •  --- km / --- mi")
+            cr.move_to(mid_x + 11, pad + 105)
+            cr.show_text("LONG PATH : ---.-°  •  --- km / --- mi")
+
+        # Bottom Dupe / Worked-Before Status Bar
+        dy0 = pad + vh - 36.0
+        if dupe_info["is_dupe"]:
+            dr = dupe_info["dupe_row"]
+            cr.set_source_rgba(0.88, 0.16, 0.14, 0.30)
+            cr.rectangle(mid_x + 10, dy0, mid_w - 20, 26)
+            cr.fill()
+            cr.set_source_rgb(1.0, 0.36, 0.32)
+            cr.set_line_width(1.2)
+            cr.rectangle(mid_x + 10, dy0, mid_w - 20, 26)
+            cr.stroke()
+            cr.set_font_size(10.2)
+            d_txt = f"⚠ DUPE ON {dr['band']} {dr['mode']}! (WORKED {dr['qso_date']} {dr['time_on']}Z)"
+            cr.move_to(mid_x + 16, dy0 + 17)
+            cr.show_text(d_txt[:48])
+        elif dupe_info["prev_rows"]:
+            prevs = dupe_info["prev_rows"]
+            b_summary = ", ".join(dict.fromkeys(f"{r['band']} {r['mode']}" for r in prevs[:3]))
+            cr.set_source_rgba(0.16, 0.62, 0.52, 0.24)
+            cr.rectangle(mid_x + 10, dy0, mid_w - 20, 26)
+            cr.fill()
+            cr.set_source_rgb(0.42, 0.98, 0.80)
+            cr.set_font_size(10.0)
+            cr.move_to(mid_x + 16, dy0 + 17)
+            cr.show_text(f"✓ WORKED {len(prevs)}x PREV ({b_summary})"[:48])
+        elif res["matched"] and st["call_nonempty"]:
+            tag_new = "★ NEW DXCC ENTITY!" if st["is_new_dxcc"] else "★ NEW STATION / BAND SLOT"
+            cr.set_source_rgba(0.20, 0.58, 0.30, 0.22)
+            cr.rectangle(mid_x + 10, dy0, mid_w - 20, 26)
+            cr.fill()
+            cr.set_source_rgb(0.55, 0.98, 0.58)
+            cr.set_font_size(10.0)
+            cr.move_to(mid_x + 16, dy0 + 17)
+            cr.show_text(tag_new)
+        else:
+            cr.set_source_rgba(0.08, 0.18, 0.18, 0.55)
+            cr.rectangle(mid_x + 10, dy0, mid_w - 20, 26)
+            cr.fill()
+            cr.set_source_rgb(0.32, 0.68, 0.62)
+            cr.set_font_size(9.5)
+            cr.move_to(mid_x + 16, dy0 + 17)
+            cr.show_text("READY — TYPE CALLSIGN OR CLICK [⚡ GRAB FROM dtRadio]")
+
+        cr.restore()
+
+        # ===================================================================
+        # 3. RIGHT PANEL: Backlit 360° Analog Rotor / Azimuth Beam Compass
+        # ===================================================================
+        cr.rectangle(comp_x, pad, comp_w, vh)
+        cr.set_source_rgb(0.07, 0.08, 0.10)
+        cr.fill()
+
+        # Compass geometry (upper 78% dial + lower 22% inset VFD distance readout)
+        vfd_strip_h = 26.0
+        dial_cx = comp_x + comp_w * 0.5
+        dial_cy = pad + (vh - vfd_strip_h) * 0.50 + 1.0
+        dial_r = min(comp_w * 0.44, (vh - vfd_strip_h) * 0.46)
+
+        # Machined brass/dark bezel ring
+        cr.arc(dial_cx, dial_cy, dial_r + 4.5, 0, 2 * math.pi)
+        cr.set_source_rgb(0.28, 0.24, 0.16)
+        cr.fill()
+
+        # Warm incandescent amber radial backlight glow
+        glow = cairo.RadialGradient(dial_cx, dial_cy - dial_r * 0.15, 4.0, dial_cx, dial_cy, dial_r * 1.05)
+        glow.add_color_stop_rgb(0.0, 1.00, 0.95, 0.76)
+        glow.add_color_stop_rgb(0.68, 0.96, 0.82, 0.49)
+        glow.add_color_stop_rgb(1.0, 0.78, 0.60, 0.30)
+        cr.arc(dial_cx, dial_cy, dial_r, 0, 2 * math.pi)
+        cr.set_source(glow)
+        cr.fill()
+
+        # Concentric range rings & crosshair
+        cr.set_line_width(0.8)
+        cr.set_source_rgba(0.38, 0.28, 0.14, 0.40)
+        cr.arc(dial_cx, dial_cy, dial_r * 0.56, 0, 2 * math.pi)
+        cr.stroke()
+        cr.move_to(dial_cx - dial_r * 0.75, dial_cy)
+        cr.line_to(dial_cx + dial_r * 0.75, dial_cy)
+        cr.move_to(dial_cx, dial_cy - dial_r * 0.75)
+        cr.line_to(dial_cx, dial_cy + dial_r * 0.75)
+        cr.stroke()
+
+        # Degree ticks every 10 deg (major every 30 deg)
+        for deg in range(0, 360, 10):
+            ang = math.radians(deg - 90.0)
+            is_card = deg % 90 == 0
+            is_maj = deg % 30 == 0
+            r_in = dial_r - (7.5 if is_card else (5.2 if is_maj else 3.0))
+            cr.set_line_width(1.8 if is_card else (1.2 if is_maj else 0.8))
+            cr.set_source_rgb(0.76, 0.14, 0.12) if deg == 0 else cr.set_source_rgb(0.20, 0.15, 0.09)
+            cr.move_to(dial_cx + r_in * math.cos(ang), dial_cy + r_in * math.sin(ang))
+            cr.line_to(dial_cx + dial_r * math.cos(ang), dial_cy + dial_r * math.sin(ang))
+            cr.stroke()
+
+        # Cardinal & Intercardinal Rose Labels (N, NE, E, SE, S, SW, W, NW)
+        rose_pts = [
+            (0, "N", True),
+            (45, "NE", False),
+            (90, "E", True),
+            (135, "SE", False),
+            (180, "S", True),
+            (225, "SW", False),
+            (270, "W", True),
+            (315, "NW", False),
+        ]
+        for deg, rlbl, is_c in rose_pts:
+            ang = math.radians(deg - 90.0)
+            rr = dial_r - (15.5 if is_c else 14.0)
+            tx = dial_cx + rr * math.cos(ang)
+            ty = dial_cy + rr * math.sin(ang)
+            cr.set_font_size(9.5 if is_c else 7.6)
+            if deg == 0:
+                cr.set_source_rgb(0.78, 0.12, 0.12)
+            else:
+                cr.set_source_rgb(0.18, 0.14, 0.08)
+            ext = cr.text_extents(rlbl)
+            cr.move_to(tx - ext.width * 0.5, ty + ext.height * 0.42)
+            cr.show_text(rlbl)
+
+        # Draw Needles (Secondary Cyan Long-Path + Primary Crimson Short-Path)
+        sp_a = math.radians(self.needle_deg - 90.0)
+        lp_a = sp_a + math.pi
+        perp = sp_a + math.pi * 0.5
+
+        if self.has_target:
+            # Secondary Cyan Long-Path Pointer
+            cr.set_source_rgba(0.05, 0.58, 0.68, 0.90)
+            cr.set_line_width(2.2)
+            cr.move_to(dial_cx, dial_cy)
+            cr.line_to(dial_cx + (dial_r - 9.0) * math.cos(lp_a), dial_cy + (dial_r - 9.0) * math.sin(lp_a))
+            cr.stroke()
+            # Cyan diamond tip
+            tip_lx = dial_cx + (dial_r - 7.0) * math.cos(lp_a)
+            tip_ly = dial_cy + (dial_r - 7.0) * math.sin(lp_a)
+            cr.arc(tip_lx, tip_ly, 3.0, 0, 2 * math.pi)
+            cr.fill()
+
+            # Subtle needle shadow
+            cr.set_source_rgba(0.08, 0.06, 0.04, 0.35)
+            cr.move_to(dial_cx + 2 + (dial_r - 4.0) * math.cos(sp_a), dial_cy + 2 + (dial_r - 4.0) * math.sin(sp_a))
+            cr.line_to(dial_cx + 2 + 4.2 * math.cos(perp), dial_cy + 2 + 4.2 * math.sin(perp))
+            cr.line_to(dial_cx + 2 - 4.2 * math.cos(perp), dial_cy + 2 - 4.2 * math.sin(perp))
+            cr.close_path()
+            cr.fill()
+
+            # Primary Crimson-Red Short-Path Tapered Needle
+            cr.set_source_rgb(0.84, 0.12, 0.12)
+            cr.move_to(dial_cx + (dial_r - 4.0) * math.cos(sp_a), dial_cy + (dial_r - 4.0) * math.sin(sp_a))
+            cr.line_to(dial_cx + 4.2 * math.cos(perp), dial_cy + 4.2 * math.sin(perp))
+            cr.line_to(dial_cx - 4.2 * math.cos(perp), dial_cy - 4.2 * math.sin(perp))
+            cr.close_path()
+            cr.fill()
+        else:
+            # Parked North hairline needle when idle
+            cr.set_source_rgba(0.55, 0.22, 0.16, 0.55)
+            cr.set_line_width(1.8)
+            cr.move_to(dial_cx, dial_cy)
+            cr.line_to(dial_cx, dial_cy - dial_r + 10.0)
+            cr.stroke()
+
+        # Center machined rotor hub cap
+        cr.arc(dial_cx, dial_cy, 5.5, 0, 2 * math.pi)
+        cr.set_source_rgb(0.18, 0.19, 0.23)
+        cr.fill()
+        cr.arc(dial_cx, dial_cy, 2.4, 0, 2 * math.pi)
+        cr.set_source_rgb(0.86, 0.72, 0.36)
+        cr.fill()
+
+        # Inset bottom VFD Azimuth & Distance Strip
+        vx = comp_x + 6.0
+        vy = pad + vh - vfd_strip_h - 3.0
+        vw = comp_w - 12.0
+        cr.set_source_rgb(0.03, 0.08, 0.08)
+        cr.rectangle(vx, vy, vw, vfd_strip_h)
+        cr.fill()
+        cr.set_font_size(9.2)
+        if self.has_target and res["sp_km"] is not None:
+            cr.set_source_rgb(0.30, 0.99, 0.86)
+            v_txt = f"{res['sp_deg']:03.0f}°  {res['sp_km']:,.0f}km / {res['sp_mi']:,.0f}mi"
+        else:
+            cr.set_source_rgb(0.32, 0.72, 0.66)
+            v_txt = f"ROTOR IDLE • {op['grid']}"
+        vext = cr.text_extents(v_txt)
+        cr.move_to(vx + (vw - vext.width) * 0.5, vy + 16.5)
+        cr.show_text(v_txt)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Main dtLog Vintage Shack Logbook Window
+# ---------------------------------------------------------------------------
+class DtLogWindow(Gtk.Window):
+    def __init__(
+        self,
+        config_path: Path = CONFIG_FILE,
+        db_path: Path = DB_FILE,
+        dtradio_state_path: Path = DTRADIO_STATE_FILE,
+        self_test: bool = False,
+    ):
+        super().__init__(title="dtLog — Amateur Radio QSO & SWL Station Logbook")
+        self.set_default_size(1100, 650)
+        self.set_resizable(True)
+
+        self.config_path = config_path
+        self.dtradio_state_path = dtradio_state_path
+        self._self_test = self_test
+
+        for icon_cand in (HOME / ".dt" / "icons" / "dtlog.pm", SCRIPT_DIR / "icons" / "dtlog.pm"):
+            if icon_cand.is_file():
+                try:
+                    self.set_icon_from_file(str(icon_cand))
+                    break
+                except Exception:
+                    pass
+
+        chrome, sel, well = load_cde_palette()
+        prov = Gtk.CssProvider()
+        prov.load_from_data(build_shack_css(chrome, sel, well))
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        self.op_cfg = self._load_config()
+        self.db = LogbookDB(db_path)
+
+        self.log_type = "QSO"  # "QSO" or "SWL"
+        self.live_utc = True
+        self.editing_id: int | None = None
+        self._rst_dirty = False
+        self._suppress_freq_sync = False
+        self.flash_msg = ""
+        self.flash_until = 0.0
+
+        self.stats_cache = self.db.get_stats()
+        self.resolved_cache = resolve_call_or_station("", "", self.op_cfg["lat"], self.op_cfg["lon"])
+        self.dupe_cache = {"is_dupe": False, "dupe_row": None, "prev_rows": []}
+        self.is_new_dxcc = False
+
+        self._build_ui()
+        self._refresh_table()
+        self._tick_utc_fields()
+
+        # 30 fps rotor compass ballistics & 1 Hz clock refresh
+        GLib.timeout_add(35, self._on_anim_tick)
+        GLib.timeout_add(500, self._tick_utc_fields)
+        self.connect("destroy", self._on_destroy)
+
+        if self._self_test:
+            GLib.timeout_add(120, self._finish_gui_self_test)
+
+    # ---- Config Persistence ----
+    def _load_config(self) -> dict:
+        cfg = dict(DEFAULT_CONFIG)
+        if self.config_path.is_file():
+            try:
+                loaded = json.loads(self.config_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    cfg.update(loaded)
+            except Exception:
+                pass
+        return cfg
+
+    def _save_config(self):
+        try:
+            self.config_path.parent.mkdir(parents=True, exist_ok=True)
+            self.config_path.write_text(json.dumps(self.op_cfg, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    # ---- UI Construction ----
+    def _build_ui(self):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(outer)
+
+        cab = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        cab.get_style_context().add_class("rx-cabinet")
+        outer.pack_start(cab, True, True, 0)
+
+        # 1. Top Vintage Shack Console Deck
+        self.console_deck = ShackConsoleDeck(self._get_deck_state)
+        cab.pack_start(self.console_deck, False, False, 0)
+
+        # 2. Fast Shack Entry Strip (Row A: Primary RF & Station Fields | Row B: QTH/Notes & Hardware Actions)
+        entry_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        entry_box.get_style_context().add_class("rx-strip")
+        cab.pack_start(entry_box, False, False, 0)
+
+        row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        entry_box.pack_start(row1, False, False, 0)
+
+        # HAM QSO vs SWL / UTILITY mode buttons
+        self.btn_type_qso = Gtk.Button(label="HAM QSO")
+        self.btn_type_qso.connect("clicked", lambda _b: self._set_log_type("QSO"))
+        row1.pack_start(self.btn_type_qso, False, False, 0)
+
+        self.btn_type_swl = Gtk.Button(label="SWL / UTIL")
+        self.btn_type_swl.connect("clicked", lambda _b: self._set_log_type("SWL"))
+        row1.pack_start(self.btn_type_swl, False, False, 0)
+
+        row1.pack_start(self._lbl("CALL/STN"), False, False, 2)
+        self.ent_call = Gtk.Entry()
+        self.ent_call.get_style_context().add_class("call-entry")
+        self.ent_call.set_width_chars(12)
+        self.ent_call.set_placeholder_text("JA1ABC / WWV")
+        self.ent_call.connect("changed", self._on_call_or_grid_changed)
+        self.ent_call.connect("activate", self._on_log_clicked)
+        row1.pack_start(self.ent_call, False, False, 0)
+
+        row1.pack_start(self._lbl("FREQ MHz"), False, False, 2)
+        self.ent_freq = Gtk.Entry()
+        self.ent_freq.get_style_context().add_class("freq-entry")
+        self.ent_freq.set_width_chars(9)
+        self.ent_freq.set_text("14.2300")
+        self.ent_freq.connect("changed", self._on_freq_changed)
+        self.ent_freq.connect("activate", self._on_log_clicked)
+        row1.pack_start(self.ent_freq, False, False, 0)
+
+        row1.pack_start(self._lbl("BAND"), False, False, 1)
+        self.cmb_band = Gtk.ComboBoxText()
+        for b in ALL_BANDS:
+            self.cmb_band.append_text(b)
+        self.cmb_band.set_active(ALL_BANDS.index("20m"))
+        self.cmb_band.connect("changed", self._on_band_combo_changed)
+        row1.pack_start(self.cmb_band, False, False, 0)
+
+        row1.pack_start(self._lbl("MODE"), False, False, 1)
+        self.cmb_mode = Gtk.ComboBoxText()
+        for m in ALL_MODES:
+            self.cmb_mode.append_text(m)
+        self.cmb_mode.set_active(ALL_MODES.index("USB"))
+        self.cmb_mode.connect("changed", self._on_mode_combo_changed)
+        row1.pack_start(self.cmb_mode, False, False, 0)
+
+        row1.pack_start(self._lbl("SENT"), False, False, 1)
+        self.ent_rst_s = Gtk.Entry()
+        self.ent_rst_s.set_width_chars(4)
+        self.ent_rst_s.set_text("59")
+        self.ent_rst_s.connect("changed", self._mark_rst_dirty)
+        self.ent_rst_s.connect("activate", self._on_log_clicked)
+        row1.pack_start(self.ent_rst_s, False, False, 0)
+
+        row1.pack_start(self._lbl("RCVD"), False, False, 1)
+        self.ent_rst_r = Gtk.Entry()
+        self.ent_rst_r.set_width_chars(6)
+        self.ent_rst_r.set_text("59")
+        self.ent_rst_r.set_tooltip_text("RST Received (59 / 599) or 5-digit SINPO in SWL mode")
+        self.ent_rst_r.connect("changed", self._mark_rst_dirty)
+        self.ent_rst_r.connect("activate", self._on_log_clicked)
+        row1.pack_start(self.ent_rst_r, False, False, 0)
+
+        row1.pack_start(self._lbl("GRID"), False, False, 1)
+        self.ent_grid = Gtk.Entry()
+        self.ent_grid.set_width_chars(7)
+        self.ent_grid.set_placeholder_text("PM95vq")
+        self.ent_grid.connect("changed", self._on_call_or_grid_changed)
+        self.ent_grid.connect("activate", self._on_log_clicked)
+        row1.pack_start(self.ent_grid, False, False, 0)
+
+        # UTC Date / Time + [⏱ LIVE UTC] toggle
+        self.ent_date = Gtk.Entry()
+        self.ent_date.set_width_chars(10)
+        row1.pack_start(self.ent_date, False, False, 0)
+
+        self.ent_time = Gtk.Entry()
+        self.ent_time.set_width_chars(5)
+        row1.pack_start(self.ent_time, False, False, 0)
+
+        self.btn_live_utc = Gtk.Button(label="⏱ LIVE UTC")
+        self.btn_live_utc.set_tooltip_text("Auto-track real-time UTC clock (disable for manual paper log entry)")
+        self.btn_live_utc.connect("clicked", self._toggle_live_utc)
+        row1.pack_end(self.btn_live_utc, False, False, 0)
+
+        # Row 2: Name, QTH/State, TX Pwr, Notes/QSL + Action Buttons
+        row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        entry_box.pack_start(row2, False, False, 0)
+
+        row2.pack_start(self._lbl("NAME"), False, False, 1)
+        self.ent_name = Gtk.Entry()
+        self.ent_name.set_width_chars(10)
+        self.ent_name.connect("activate", self._on_log_clicked)
+        row2.pack_start(self.ent_name, False, False, 0)
+
+        row2.pack_start(self._lbl("QTH/ST"), False, False, 1)
+        self.ent_qth = Gtk.Entry()
+        self.ent_qth.set_width_chars(12)
+        self.ent_qth.connect("activate", self._on_log_clicked)
+        row2.pack_start(self.ent_qth, False, False, 0)
+
+        row2.pack_start(self._lbl("PWR(W)"), False, False, 1)
+        self.ent_pwr = Gtk.Entry()
+        self.ent_pwr.set_width_chars(5)
+        self.ent_pwr.set_text(str(self.op_cfg.get("tx_pwr", "100")))
+        self.ent_pwr.connect("activate", self._on_log_clicked)
+        row2.pack_start(self.ent_pwr, False, False, 0)
+
+        row2.pack_start(self._lbl("NOTES/QSL"), False, False, 1)
+        self.ent_notes = Gtk.Entry()
+        self.ent_notes.set_hexpand(True)
+        self.ent_notes.set_placeholder_text("Rig, antenna, remarks, SINPO / QSL info...")
+        self.ent_notes.connect("activate", self._on_log_clicked)
+        row2.pack_start(self.ent_notes, True, True, 0)
+
+        self.btn_grab = Gtk.Button(label="⚡ GRAB FROM dtRadio")
+        self.btn_grab.get_style_context().add_class("btn-grab")
+        self.btn_grab.set_tooltip_text("Read active frequency, mode & station from ~/.config/dtradio/state.json")
+        self.btn_grab.connect("clicked", self._on_grab_dtradio)
+        row2.pack_start(self.btn_grab, False, False, 0)
+
+        self.btn_log = Gtk.Button(label="✚ LOG CONTACT")
+        self.btn_log.get_style_context().add_class("btn-log")
+        self.btn_log.set_tooltip_text("Log contact to SQLite logbook (or press Enter in any field)")
+        self.btn_log.connect("clicked", self._on_log_clicked)
+        row2.pack_start(self.btn_log, False, False, 0)
+
+        self.btn_update = Gtk.Button(label="✎ UPDATE")
+        self.btn_update.get_style_context().add_class("btn-update")
+        self.btn_update.set_sensitive(False)
+        self.btn_update.connect("clicked", self._on_update_clicked)
+        row2.pack_start(self.btn_update, False, False, 0)
+
+        self.btn_clear = Gtk.Button(label="✖ CLEAR")
+        self.btn_clear.connect("clicked", lambda _b: self._clear_form())
+        row2.pack_start(self.btn_clear, False, False, 0)
+
+        # 3. Search / Filter & ADIF / QSL / Station Setup Bar
+        flt_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        flt_row.get_style_context().add_class("rx-strip")
+        cab.pack_start(flt_row, False, False, 0)
+
+        flt_row.pack_start(self._lbl("SEARCH"), False, False, 2)
+        self.ent_search = Gtk.Entry()
+        self.ent_search.set_width_chars(18)
+        self.ent_search.set_placeholder_text("Call, DXCC, Grid, Notes...")
+        self.ent_search.connect("changed", lambda _e: self._refresh_table())
+        flt_row.pack_start(self.ent_search, False, False, 0)
+
+        self.cmb_flt_type = Gtk.ComboBoxText()
+        for t in ("ALL LOGS", "HAM QSO", "SWL / UTIL"):
+            self.cmb_flt_type.append_text(t)
+        self.cmb_flt_type.set_active(0)
+        self.cmb_flt_type.connect("changed", lambda _c: self._refresh_table())
+        flt_row.pack_start(self.cmb_flt_type, False, False, 0)
+
+        self.cmb_flt_band = Gtk.ComboBoxText()
+        self.cmb_flt_band.append_text("ALL BANDS")
+        for b in ALL_BANDS:
+            self.cmb_flt_band.append_text(b)
+        self.cmb_flt_band.set_active(0)
+        self.cmb_flt_band.connect("changed", lambda _c: self._refresh_table())
+        flt_row.pack_start(self.cmb_flt_band, False, False, 0)
+
+        self.cmb_flt_mode = Gtk.ComboBoxText()
+        self.cmb_flt_mode.append_text("ALL MODES")
+        for m in ALL_MODES:
+            self.cmb_flt_mode.append_text(m)
+        self.cmb_flt_mode.set_active(0)
+        self.cmb_flt_mode.connect("changed", lambda _c: self._refresh_table())
+        flt_row.pack_start(self.cmb_flt_mode, False, False, 0)
+
+        self.cmb_flt_dxcc = Gtk.ComboBoxText()
+        self.cmb_flt_dxcc.append_text("ALL DXCC")
+        self.cmb_flt_dxcc.set_active(0)
+        self._updating_dxcc_flt = False
+        self.cmb_flt_dxcc.connect("changed", self._on_dxcc_filter_changed)
+        flt_row.pack_start(self.cmb_flt_dxcc, False, False, 0)
+
+        btn_setup = Gtk.Button(label="⚙ STATION")
+        btn_setup.set_tooltip_text("Configure Operator Callsign, Maidenhead Grid & QTH (~/.config/dtlog/config.json)")
+        btn_setup.connect("clicked", self._on_station_setup)
+        flt_row.pack_end(btn_setup, False, False, 0)
+
+        btn_wsjtx = Gtk.Button(label="📡 IMPORT WSJT-X")
+        btn_wsjtx.set_tooltip_text("Import FT8/FT4 contacts from ~/.local/share/WSJT-X/wsjtx_log.adi")
+        btn_wsjtx.connect("clicked", self._on_import_wsjtx)
+        flt_row.pack_end(btn_wsjtx, False, False, 0)
+
+        btn_exp = Gtk.Button(label="⬇ EXPORT ADIF")
+        btn_exp.connect("clicked", self._on_export_adif)
+        flt_row.pack_end(btn_exp, False, False, 0)
+
+        btn_imp = Gtk.Button(label="⬆ IMPORT ADIF")
+        btn_imp.connect("clicked", self._on_import_adif)
+        flt_row.pack_end(btn_imp, False, False, 0)
+
+        btn_qsl = Gtk.Button(label="🪪 QSL CARD")
+        btn_qsl.set_tooltip_text("Generate Vintage Postcard QSL (.PNG / ASCII) for selected log entry")
+        btn_qsl.connect("clicked", self._on_qsl_selected)
+        flt_row.pack_end(btn_qsl, False, False, 0)
+
+        # 4. Sunken #FFF7E9 Vintage Fanfold Greenbar Logbook Table
+        # Store columns:
+        # 0:id(int), 1:date, 2:time, 3:type, 4:call, 5:freq_str, 6:band, 7:mode,
+        # 8:sent, 9:rcvd, 10:grid, 11:dxcc, 12:az_str, 13:dist_str, 14:name, 15:qth,
+        # 16:pwr, 17:qsl_str, 18:notes, 19:bg_color, 20:freq_float, 21:dist_float
+        self.store = Gtk.ListStore(
+            int, str, str, str, str, str, str, str,
+            str, str, str, str, str, str, str, str,
+            str, str, str, str, float, float,
+        )
+        self.tree = Gtk.TreeView(model=self.store)
+        self.tree.set_headers_visible(True)
+        self.tree.set_enable_search(False)
+        self.tree.connect("row-activated", self._on_row_activated)
+        self.tree.connect("cursor-changed", self._on_tree_cursor_changed)
+        self.tree.connect("button-press-event", self._on_tree_button_press)
+
+        col_specs = [
+            ("UTC DATE", 1, 1, 86),
+            ("UTC", 2, 2, 50),
+            ("TYPE", 3, 3, 46),
+            ("CALL / STATION", 4, 4, 112),
+            ("FREQ", 5, 20, 78),
+            ("BAND", 6, 6, 54),
+            ("MODE", 7, 7, 50),
+            ("SENT", 8, 8, 46),
+            ("RCVD", 9, 9, 52),
+            ("GRID", 10, 10, 62),
+            ("DXCC / ENTITY", 11, 11, 148),
+            ("AZ°", 12, 12, 46),
+            ("DIST km", 13, 21, 68),
+            ("NAME", 14, 14, 78),
+            ("QTH", 15, 15, 96),
+            ("PWR", 16, 16, 46),
+            ("QSL", 17, 17, 44),
+            ("NOTES", 18, 18, 160),
+        ]
+        for title, txt_idx, sort_idx, min_w in col_specs:
+            rend = Gtk.CellRendererText()
+            rend.set_property("ellipsize", Pango.EllipsizeMode.END if txt_idx in (11, 15, 18) else Pango.EllipsizeMode.NONE)
+            if txt_idx == 4:
+                rend.set_property("weight", Pango.Weight.BOLD)
+            col = Gtk.TreeViewColumn(title, rend, text=txt_idx, cell_background=19)
+            col.set_sort_column_id(sort_idx)
+            col.set_resizable(True)
+            col.set_min_width(min_w)
+            if txt_idx == 18:
+                col.set_expand(True)
+            self.tree.append_column(col)
+
+        sc = Gtk.ScrolledWindow()
+        sc.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sc.get_style_context().add_class("log-sunken")
+        sc.add(self.tree)
+        cab.pack_start(sc, True, True, 0)
+
+        # Right-click context menu on Greenbar Logbook
+        self.ctx_menu = Gtk.Menu()
+        mi_edit = Gtk.MenuItem(label="✎ Load into Entry Strip / Edit")
+        mi_edit.connect("activate", lambda _m: self._load_selected_for_edit())
+        self.ctx_menu.append(mi_edit)
+
+        mi_qsl = Gtk.MenuItem(label="🪪 Generate Vintage QSL Card (.PNG / ASCII)...")
+        mi_qsl.connect("activate", lambda _m: self._on_qsl_selected(None))
+        self.ctx_menu.append(mi_qsl)
+
+        mi_qs = Gtk.MenuItem(label="✓ Toggle QSL Sent (Y/N)")
+        mi_qs.connect("activate", lambda _m: self._toggle_selected_qsl("qsl_sent"))
+        self.ctx_menu.append(mi_qs)
+
+        mi_qr = Gtk.MenuItem(label="✓ Toggle QSL Rcvd (Y/N)")
+        mi_qr.connect("activate", lambda _m: self._toggle_selected_qsl("qsl_rcvd"))
+        self.ctx_menu.append(mi_qr)
+
+        self.ctx_menu.append(Gtk.SeparatorMenuItem())
+        mi_del = Gtk.MenuItem(label="✖ Delete Log Entry...")
+        mi_del.connect("activate", lambda _m: self._delete_selected())
+        self.ctx_menu.append(mi_del)
+        self.ctx_menu.show_all()
+
+        # 5. Bottom CDE Sunken Status Strip
+        st_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        st_bar.get_style_context().add_class("cde-status")
+        outer.pack_start(st_bar, False, False, 0)
+
+        self.status_lbl = Gtk.Label(
+            label=f"READY — STATION {self.op_cfg['callsign']} ({self.op_cfg['grid']} • {self.op_cfg['qth']})"
+        )
+        self.status_lbl.set_xalign(0.0)
+        st_bar.pack_start(self.status_lbl, True, True, 0)
+
+        self.count_lbl = Gtk.Label(label="0 SHOWN")
+        self.count_lbl.set_xalign(1.0)
+        st_bar.pack_end(self.count_lbl, False, False, 0)
+
+        self._sync_toggle_styles()
+        GLib.idle_add(self.ent_call.grab_focus)
+
+    def _lbl(self, txt: str) -> Gtk.Label:
+        l = Gtk.Label(label=txt)
+        l.get_style_context().add_class("rx-engraved")
+        return l
+
+    def _set_btn_active(self, btn: Gtk.Button, active: bool):
+        ctx = btn.get_style_context()
+        if active:
+            ctx.add_class("sw-active")
+        else:
+            ctx.remove_class("sw-active")
+
+    def _sync_toggle_styles(self):
+        self._set_btn_active(self.btn_type_qso, self.log_type == "QSO")
+        self._set_btn_active(self.btn_type_swl, self.log_type == "SWL")
+        self._set_btn_active(self.btn_live_utc, self.live_utc)
+
+    def _flash(self, msg: str, dur: float = 2.8):
+        self.flash_msg = msg
+        import time as _t
+        self.flash_until = _t.time() + dur
+        self.console_deck.queue_draw()
+
+    def _set_status(self, msg: str):
+        self.status_lbl.set_text(msg)
+
+    def _get_deck_state(self) -> dict:
+        import time as _t
+        fmsg = self.flash_msg if _t.time() < self.flash_until else ""
+        return {
+            "op": self.op_cfg,
+            "stats": self.stats_cache,
+            "resolved": self.resolved_cache,
+            "dupe": self.dupe_cache,
+            "flash_msg": fmsg,
+            "call_nonempty": bool(self.ent_call.get_text().strip()),
+            "is_new_dxcc": self.is_new_dxcc,
+        }
+
+    # ---- Timers & Live Entry Handlers ----
+    def _on_anim_tick(self) -> bool:
+        self.console_deck.tick_rotor()
+        return True
+
+    def _tick_utc_fields(self) -> bool:
+        if self.live_utc and self.editing_id is None:
+            now_u = datetime.datetime.now(datetime.timezone.utc)
+            d_s = now_u.strftime("%Y-%m-%d")
+            t_s = now_u.strftime("%H:%M")
+            if self.ent_date.get_text() != d_s:
+                self.ent_date.set_text(d_s)
+            if self.ent_time.get_text() != t_s:
+                self.ent_time.set_text(t_s)
+        return True
+
+    def _toggle_live_utc(self, _b):
+        self.live_utc = not self.live_utc
+        self._sync_toggle_styles()
+        if self.live_utc:
+            self._tick_utc_fields()
+
+    def _set_log_type(self, ltype: str):
+        self.log_type = ltype
+        self._sync_toggle_styles()
+        if ltype == "SWL":
+            if self.ent_pwr.get_text().strip() == str(self.op_cfg.get("tx_pwr", "100")):
+                self.ent_pwr.set_text("RX")
+        else:
+            if self.ent_pwr.get_text().strip() in ("RX", "--", ""):
+                self.ent_pwr.set_text(str(self.op_cfg.get("tx_pwr", "100")))
+        if not self._rst_dirty:
+            s_def, r_def = default_rst_for_mode(self.cmb_mode.get_active_text() or "SSB", is_swl=(ltype == "SWL"))
+            self._set_rst_clean(s_def, r_def)
+        self._recompute_live_call()
+
+    def _mark_rst_dirty(self, _e):
+        if not self._suppress_freq_sync:
+            self._rst_dirty = True
+
+    def _set_rst_clean(self, s_val: str, r_val: str):
+        self._suppress_freq_sync = True
+        self.ent_rst_s.set_text(s_val)
+        self.ent_rst_r.set_text(r_val)
+        self._suppress_freq_sync = False
+        self._rst_dirty = False
+
+    def _on_freq_changed(self, _e):
+        if self._suppress_freq_sync:
+            return
+        txt = self.ent_freq.get_text().strip()
+        try:
+            fmhz = float(txt)
+        except ValueError:
+            return
+        band = freq_mhz_to_band(fmhz, is_swl=(self.log_type == "SWL"))
+        if band in ALL_BANDS:
+            self._suppress_freq_sync = True
+            self.cmb_band.set_active(ALL_BANDS.index(band))
+            self._suppress_freq_sync = False
+        self._recompute_live_call()
+
+    def _on_band_combo_changed(self, _c):
+        if self._suppress_freq_sync:
+            return
+        band = self.cmb_band.get_active_text() or "20m"
+        # If freq doesn't belong to selected band, populate band default center
+        try:
+            cur_f = float(self.ent_freq.get_text().strip() or 0.0)
+        except ValueError:
+            cur_f = 0.0
+        for bname, flo, fhi, fdef in BAND_PLAN:
+            if bname == band and not (flo <= cur_f <= fhi):
+                self._suppress_freq_sync = True
+                self.ent_freq.set_text(f"{fdef:.4f}")
+                self._suppress_freq_sync = False
+                break
+        self._recompute_live_call()
+
+    def _on_mode_combo_changed(self, _c):
+        mode = self.cmb_mode.get_active_text() or "SSB"
+        if mode == "SWL" and self.log_type != "SWL":
+            self.log_type = "SWL"
+            self._sync_toggle_styles()
+        if not self._rst_dirty:
+            s_def, r_def = default_rst_for_mode(mode, is_swl=(self.log_type == "SWL"))
+            self._set_rst_clean(s_def, r_def)
+        self._recompute_live_call()
+
+    def _on_call_or_grid_changed(self, _e):
+        self._recompute_live_call()
+
+    def _recompute_live_call(self):
+        call = self.ent_call.get_text().strip().upper()
+        grid = self.ent_grid.get_text().strip()
+        band = self.cmb_band.get_active_text() or "20m"
+        mode = self.cmb_mode.get_active_text() or "SSB"
+
+        self.resolved_cache = resolve_call_or_station(call, grid, self.op_cfg["lat"], self.op_cfg["lon"])
+        self.dupe_cache = self.db.check_dupe_and_history(call, band, mode, exclude_id=self.editing_id)
+        dxcc_code = self.resolved_cache.get("iso2") or self.resolved_cache.get("prefix") or ""
+        self.is_new_dxcc = bool(dxcc_code and not self.db.is_dxcc_worked(dxcc_code))
+
+        if self.resolved_cache["sp_deg"] is not None:
+            self.console_deck.set_azimuth_target(self.resolved_cache["sp_deg"])
+        elif not call and not grid:
+            self.console_deck.set_azimuth_target(None)
+        self.console_deck.queue_draw()
+
+    # ---- [⚡ GRAB FROM dtRadio] Bridge ----
+    def _on_grab_dtradio(self, _b):
+        info = parse_dtradio_state(self.dtradio_state_path)
+        if info is None:
+            self._flash("⚠ dtRadio STATE NOT FOUND — LAUNCH dtRadio FIRST")
+            self._set_status(f"NO dtRadio STATE FILE AT {self.dtradio_state_path}")
+            return
+
+        self._suppress_freq_sync = True
+        self.ent_freq.set_text(f"{info['freq_mhz']:.4f}")
+        if info["band"] in ALL_BANDS:
+            self.cmb_band.set_active(ALL_BANDS.index(info["band"]))
+        if info["mode"] in ALL_MODES:
+            self.cmb_mode.set_active(ALL_MODES.index(info["mode"]))
+        self._suppress_freq_sync = False
+
+        if info["is_swl"]:
+            self._set_log_type("SWL")
+            if info["station_hint"] and not self.ent_call.get_text().strip():
+                self.ent_call.set_text(info["station_hint"])
+        else:
+            self._set_log_type("QSO")
+
+        if info["title"]:
+            self.ent_notes.set_text(f"dtRadio: {info['title']}")
+
+        if not self._rst_dirty:
+            s_def, r_def = default_rst_for_mode(info["mode"], is_swl=info["is_swl"])
+            self._set_rst_clean(s_def, r_def)
+
+        self._recompute_live_call()
+        self._flash(f"⚡ GRABBED {info['freq_mhz']:.4f} MHz {info['mode']} FROM dtRadio")
+        self._set_status(f"SYNCED FROM dtRadio: {info['freq_mhz']:.4f} MHz [{info['mode']}] — {info['title']}")
+        self.ent_call.grab_focus()
+
+    # ---- CRUD Operations ----
+    def _collect_form_dict(self) -> dict | None:
+        call = self.ent_call.get_text().strip().upper()
+        if not call:
+            self._flash("⚠ ENTER CALLSIGN OR STATION IDENTIFIER")
+            self.ent_call.grab_focus()
+            return None
+        try:
+            freq_mhz = float(self.ent_freq.get_text().strip() or 0.0)
+        except ValueError:
+            freq_mhz = 0.0
+
+        band = self.cmb_band.get_active_text() or freq_mhz_to_band(freq_mhz, is_swl=(self.log_type == "SWL"))
+        mode = self.cmb_mode.get_active_text() or "SSB"
+        grid = self.ent_grid.get_text().strip()
+        info = resolve_call_or_station(call, grid, self.op_cfg["lat"], self.op_cfg["lon"])
+
+        qdate = self.ent_date.get_text().strip() or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        qtime = self.ent_time.get_text().strip() or datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M")
+
+        return {
+            "log_type": self.log_type,
+            "qso_date": qdate,
+            "time_on": qtime,
+            "call": call,
+            "freq_mhz": freq_mhz,
+            "band": band,
+            "mode": mode,
+            "rst_sent": self.ent_rst_s.get_text().strip() or ("--" if self.log_type == "SWL" else "59"),
+            "rst_rcvd": self.ent_rst_r.get_text().strip() or ("45444" if self.log_type == "SWL" else "59"),
+            "grid": grid or info.get("grid", ""),
+            "name": self.ent_name.get_text().strip(),
+            "qth": self.ent_qth.get_text().strip(),
+            "tx_pwr": self.ent_pwr.get_text().strip() or ("RX" if self.log_type == "SWL" else str(self.op_cfg.get("tx_pwr", "100"))),
+            "notes": self.ent_notes.get_text().strip(),
+            "dxcc_entity": info.get("entity", ""),
+            "dxcc_code": info.get("iso2") or info.get("prefix", ""),
+            "continent": info.get("cont", ""),
+            "cq_zone": info.get("cq_zone", 0),
+            "itu_zone": info.get("itu_zone", 0),
+            "bearing_deg": info.get("sp_deg") or 0.0,
+            "distance_km": info.get("sp_km") or 0.0,
+            "qsl_sent": "N",
+            "qsl_rcvd": "N",
+        }
+
+    def _on_log_clicked(self, _w):
+        if self.editing_id is not None:
+            self._on_update_clicked(_w)
+            return
+        d = self._collect_form_dict()
+        if d is None:
+            return
+        row_id = self.db.insert_contact(d)
+        self.stats_cache = self.db.get_stats()
+        self._refresh_table()
+        self._flash(f"✓ LOGGED #{row_id}: {d['call']} ON {d['band']} {d['mode']}")
+        self._set_status(
+            f"LOGGED {d['log_type']} #{row_id}: {d['call']} ({d['dxcc_entity'] or 'Local'}) — {d['freq_mhz']:.4f} MHz {d['mode']}"
+        )
+        self._clear_form(keep_rf=True)
+
+    def _on_update_clicked(self, _w):
+        if self.editing_id is None:
+            return
+        old = self.db.get_contact(self.editing_id) or {}
+        d = self._collect_form_dict()
+        if d is None:
+            return
+        d["qsl_sent"] = old.get("qsl_sent", "N")
+        d["qsl_rcvd"] = old.get("qsl_rcvd", "N")
+        self.db.update_contact(self.editing_id, d)
+        upd_id = self.editing_id
+        self.stats_cache = self.db.get_stats()
+        self._refresh_table()
+        self._flash(f"✎ UPDATED #{upd_id}: {d['call']}")
+        self._set_status(f"UPDATED LOG ENTRY #{upd_id}: {d['call']}")
+        self._clear_form(keep_rf=True)
+
+    def _clear_form(self, keep_rf: bool = False):
+        self.editing_id = None
+        self.btn_update.set_sensitive(False)
+        self.btn_log.set_label("✚ LOG CONTACT")
+        self.live_utc = True
+        self._sync_toggle_styles()
+        self.ent_call.set_text("")
+        self.ent_grid.set_text("")
+        self.ent_name.set_text("")
+        self.ent_qth.set_text("")
+        self.ent_notes.set_text("")
+        if not keep_rf:
+            self._set_log_type("QSO")
+            self._suppress_freq_sync = True
+            self.ent_freq.set_text("14.2300")
+            self.cmb_band.set_active(ALL_BANDS.index("20m"))
+            self.cmb_mode.set_active(ALL_MODES.index("USB"))
+            self._suppress_freq_sync = False
+        s_def, r_def = default_rst_for_mode(self.cmb_mode.get_active_text() or "USB", is_swl=(self.log_type == "SWL"))
+        self._set_rst_clean(s_def, r_def)
+        self._tick_utc_fields()
+        self._recompute_live_call()
+        self.ent_call.grab_focus()
+
+    def _on_dxcc_filter_changed(self, _c):
+        if not self._updating_dxcc_flt:
+            self._refresh_table(rebuild_dxcc=False)
+
+    def _refresh_dxcc_combo(self):
+        self._updating_dxcc_flt = True
+        cur = self.cmb_flt_dxcc.get_active_text() or "ALL DXCC"
+        self.cmb_flt_dxcc.remove_all()
+        opts = ["ALL DXCC"] + self.db.get_distinct_dxcc()
+        for o in opts:
+            self.cmb_flt_dxcc.append_text(o)
+        self.cmb_flt_dxcc.set_active(opts.index(cur) if cur in opts else 0)
+        self._updating_dxcc_flt = False
+
+    def _refresh_table(self, rebuild_dxcc: bool = True):
+        if rebuild_dxcc:
+            self._refresh_dxcc_combo()
+        t_idx = self.cmb_flt_type.get_active()
+        ltype = {0: "ALL", 1: "QSO", 2: "SWL"}.get(t_idx, "ALL")
+        band = self.cmb_flt_band.get_active_text() or "ALL BANDS"
+        if band == "ALL BANDS":
+            band = "ALL"
+        mode = self.cmb_flt_mode.get_active_text() or "ALL MODES"
+        if mode == "ALL MODES":
+            mode = "ALL"
+        dxcc = self.cmb_flt_dxcc.get_active_text() or "ALL DXCC"
+        if dxcc == "ALL DXCC":
+            dxcc = "ALL"
+        q = self.ent_search.get_text()
+
+        rows = self.db.query_contacts(search=q, log_type=ltype, band=band, mode=mode, dxcc=dxcc)
+        self.store.clear()
+        for i, r in enumerate(rows):
+            bg = "#fff7e9" if (i % 2 == 0) else "#e4f1e2"  # Authentic fanfold greenbar striping!
+            az_s = f"{int(round(r['bearing_deg'])):03d}°" if r["distance_km"] > 0 else "--"
+            dist_s = f"{int(round(r['distance_km'])):,d}" if r["distance_km"] > 0 else "--"
+            qsl_s = f"{r.get('qsl_sent','N')}/{r.get('qsl_rcvd','N')}"
+            dxcc_s = f"[{r['dxcc_code']}] {r['dxcc_entity']}" if r["dxcc_code"] else r["dxcc_entity"]
+            self.store.append([
+                int(r["id"]),
+                r["qso_date"],
+                r["time_on"],
+                r["log_type"],
+                r["call"],
+                f"{float(r['freq_mhz']):.4f}",
+                r["band"],
+                r["mode"],
+                r["rst_sent"],
+                r["rst_rcvd"],
+                r["grid"],
+                dxcc_s,
+                az_s,
+                dist_s,
+                r["name"],
+                r["qth"],
+                r["tx_pwr"],
+                qsl_s,
+                r["notes"],
+                bg,
+                float(r["freq_mhz"]),
+                float(r["distance_km"]),
+            ])
+        self.count_lbl.set_text(f"{len(rows)} SHOWN")
+
+    def _get_selected_row_id(self) -> int | None:
+        sel = self.tree.get_selection()
+        if not sel:
+            return None
+        model, it = sel.get_selected()
+        if it is not None:
+            return int(model.get_value(it, 0))
+        return None
+
+    def _on_tree_cursor_changed(self, _tv):
+        # If call entry is currently blank, point the analog azimuth compass at the highlighted logged contact!
+        if self.ent_call.get_text().strip():
+            return
+        rid = self._get_selected_row_id()
+        if rid is None:
+            return
+        r = self.db.get_contact(rid)
+        if r:
+            self.resolved_cache = resolve_call_or_station(r["call"], r["grid"], self.op_cfg["lat"], self.op_cfg["lon"])
+            if self.resolved_cache["sp_deg"] is not None:
+                self.console_deck.set_azimuth_target(self.resolved_cache["sp_deg"])
+            self.console_deck.queue_draw()
+
+    def _on_row_activated(self, _tv, _path, _col):
+        self._load_selected_for_edit()
+
+    def _on_tree_button_press(self, _tv, ev):
+        if ev.button == 3:
+            pth = self.tree.get_path_at_pos(int(ev.x), int(ev.y))
+            if pth is not None:
+                self.tree.get_selection().select_path(pth[0])
+                self.ctx_menu.popup_at_pointer(ev)
+                return True
+        return False
+
+    def _load_selected_for_edit(self):
+        rid = self._get_selected_row_id()
+        if rid is None:
+            return
+        r = self.db.get_contact(rid)
+        if not r:
+            return
+        self.editing_id = rid
+        self.live_utc = False
+        self.log_type = r.get("log_type", "QSO")
+        self._sync_toggle_styles()
+
+        self._suppress_freq_sync = True
+        self.ent_call.set_text(r.get("call", ""))
+        self.ent_freq.set_text(f"{float(r.get('freq_mhz', 14.23)):.4f}")
+        if r.get("band") in ALL_BANDS:
+            self.cmb_band.set_active(ALL_BANDS.index(r["band"]))
+        if r.get("mode") in ALL_MODES:
+            self.cmb_mode.set_active(ALL_MODES.index(r["mode"]))
+        self.ent_rst_s.set_text(r.get("rst_sent", "59"))
+        self.ent_rst_r.set_text(r.get("rst_rcvd", "59"))
+        self.ent_grid.set_text(r.get("grid", ""))
+        self.ent_date.set_text(r.get("qso_date", ""))
+        self.ent_time.set_text(r.get("time_on", ""))
+        self.ent_name.set_text(r.get("name", ""))
+        self.ent_qth.set_text(r.get("qth", ""))
+        self.ent_pwr.set_text(r.get("tx_pwr", ""))
+        self.ent_notes.set_text(r.get("notes", ""))
+        self._suppress_freq_sync = False
+        self._rst_dirty = True
+
+        self.btn_update.set_sensitive(True)
+        self.btn_log.set_label(f"✎ SAVE #{rid}")
+        self._recompute_live_call()
+        self._set_status(f"EDITING LOG #{rid} ({r['call']}) — CLICK [✎ UPDATE] TO SAVE OR [✖ CLEAR] TO CANCEL")
+
+    def _toggle_selected_qsl(self, field: str):
+        rid = self._get_selected_row_id()
+        if rid is not None:
+            self.db.toggle_qsl(rid, field)
+            self._refresh_table()
+
+    def _delete_selected(self):
+        rid = self._get_selected_row_id()
+        if rid is None:
+            return
+        r = self.db.get_contact(rid)
+        if not r:
+            return
+        dlg = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.YES_NO,
+            text=f"Delete log entry #{rid} ({r['call']} on {r['qso_date']})?",
+        )
+        resp = dlg.run()
+        dlg.destroy()
+        if resp == Gtk.ResponseType.YES:
+            self.db.delete_contact(rid)
+            if self.editing_id == rid:
+                self._clear_form(keep_rf=True)
+            self.stats_cache = self.db.get_stats()
+            self._refresh_table()
+            self._set_status(f"DELETED LOG ENTRY #{rid}")
+
+    # ---- QSL Card Preview ----
+    def _on_qsl_selected(self, _b):
+        rid = self._get_selected_row_id()
+        if rid is None:
+            self._flash("SELECT A LOG ENTRY IN THE TABLE FOR QSL PREVIEW")
+            return
+        r = self.db.get_contact(rid)
+        if r:
+            dlg = QslCardDialog(self, r, self.op_cfg, self._set_status)
+            dlg.run()
+            dlg.destroy()
+
+    # ---- ADIF Import / Export / WSJT-X ----
+    def _on_import_adif(self, _b):
+        dlg = Gtk.FileChooserDialog(
+            title="Import ADIF (.adi / .adif) Logbook",
+            parent=self,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dlg.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
+        flt = Gtk.FileFilter()
+        flt.set_name("ADIF Log Files (*.adi, *.adif)")
+        flt.add_pattern("*.adi")
+        flt.add_pattern("*.ADI")
+        flt.add_pattern("*.adif")
+        dlg.add_filter(flt)
+        flt_all = Gtk.FileFilter()
+        flt_all.set_name("All Files")
+        flt_all.add_pattern("*")
+        dlg.add_filter(flt_all)
+
+        resp = dlg.run()
+        fname = dlg.get_filename()
+        dlg.destroy()
+        if resp == Gtk.ResponseType.OK and fname:
+            self._import_adif_path(Path(fname))
+
+    def _on_import_wsjtx(self, _b):
+        if WSJTX_LOG_FILE.is_file():
+            self._import_adif_path(WSJTX_LOG_FILE, label="WSJT-X")
+        else:
+            self._flash("WSJT-X LOG NOT AT DEFAULT PATH — SELECT .ADI FILE")
+            self._set_status(f"NO FILE AT {WSJTX_LOG_FILE} — OPENING FILE CHOOSER")
+            self._on_import_adif(_b)
+
+    def _import_adif_path(self, p: Path, label: str = "ADIF"):
+        try:
+            raw = p.read_text(encoding="utf-8", errors="replace")
+            recs = parse_adif_text(raw)
+            added, skipped = self.db.import_adif_records(recs, self.op_cfg["lat"], self.op_cfg["lon"])
+            self.stats_cache = self.db.get_stats()
+            self._refresh_table()
+            self._flash(f"⬆ {label}: IMPORTED {added} CONTACTS ({skipped} DUPES SKIPPED)")
+            self._set_status(f"IMPORTED {added} RECORDS FROM {p} ({skipped} SKIPPED)")
+        except Exception as e:
+            self._set_status(f"ADIF IMPORT ERROR: {e}")
+
+    def _on_export_adif(self, _b):
+        rows = self.db.query_contacts()
+        dlg = Gtk.FileChooserDialog(
+            title="Export ADIF 3.1.4 (.adi) Logbook",
+            parent=self,
+            action=Gtk.FileChooserAction.SAVE,
+        )
+        dlg.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_SAVE, Gtk.ResponseType.OK)
+        dlg.set_do_overwrite_confirmation(True)
+        dlg.set_current_folder(str(HOME))
+        ts = datetime.datetime.now().strftime("%Y%m%d")
+        dlg.set_current_name(f"{self.op_cfg['callsign'].lower()}_dtlog_{ts}.adi")
+
+        resp = dlg.run()
+        fname = dlg.get_filename()
+        dlg.destroy()
+        if resp == Gtk.ResponseType.OK and fname:
+            out_p = Path(fname)
+            if out_p.suffix.lower() not in (".adi", ".adif"):
+                out_p = out_p.with_suffix(".adi")
+            out_p.write_text(format_adif_export(rows, self.op_cfg), encoding="utf-8")
+            self._flash(f"⬇ EXPORTED {len(rows)} RECORDS TO {out_p.name}")
+            self._set_status(f"EXPORTED {len(rows)} ADIF RECORDS -> {out_p}")
+
+    # ---- Station Setup Dialog (~/.config/dtlog/config.json) ----
+    def _on_station_setup(self, _b):
+        dlg = Gtk.Dialog(title="Station Setup — Operator & Home QTH", transient_for=self, flags=0)
+        dlg.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_SAVE, Gtk.ResponseType.OK)
+        grid = Gtk.Grid(column_spacing=8, row_spacing=6)
+        grid.set_margin_top(10)
+        grid.set_margin_bottom(10)
+        grid.set_margin_start(12)
+        grid.set_margin_end(12)
+        dlg.get_content_area().add(grid)
+
+        e_call = Gtk.Entry(text=str(self.op_cfg.get("callsign", "W1AW")))
+        e_grid = Gtk.Entry(text=str(self.op_cfg.get("grid", "FN31pr")))
+        e_qth = Gtk.Entry(text=str(self.op_cfg.get("qth", "Newington, CT")))
+        e_lat = Gtk.Entry(text=f"{float(self.op_cfg.get('lat', 41.7292)):.4f}")
+        e_lon = Gtk.Entry(text=f"{float(self.op_cfg.get('lon', -72.7083)):.4f}")
+        e_itu = Gtk.Entry(text=str(self.op_cfg.get("itu_zone", 6)))
+        e_cq = Gtk.Entry(text=str(self.op_cfg.get("cq_zone", 3)))
+        e_pwr = Gtk.Entry(text=str(self.op_cfg.get("tx_pwr", "100")))
+
+        def _sync_grid_ll(_e):
+            ll = grid_to_latlon(e_grid.get_text().strip())
+            if ll is not None:
+                e_lat.set_text(f"{ll[0]:.4f}")
+                e_lon.set_text(f"{ll[1]:.4f}")
+
+        e_grid.connect("changed", _sync_grid_ll)
+
+        fields = [
+            ("Operator Callsign:", e_call),
+            ("Maidenhead Home Grid:", e_grid),
+            ("Home QTH / City, State:", e_qth),
+            ("Latitude (°N):", e_lat),
+            ("Longitude (°E):", e_lon),
+            ("ITU Zone:", e_itu),
+            ("CQ Zone:", e_cq),
+            ("Default TX Power (W):", e_pwr),
+        ]
+        for idx, (lbl_t, wid) in enumerate(fields):
+            l = Gtk.Label(label=lbl_t)
+            l.set_xalign(1.0)
+            grid.attach(l, 0, idx, 1, 1)
+            grid.attach(wid, 1, idx, 1, 1)
+
+        dlg.show_all()
+        resp = dlg.run()
+        if resp == Gtk.ResponseType.OK:
+            self.op_cfg["callsign"] = e_call.get_text().strip().upper() or "W1AW"
+            g_txt = e_grid.get_text().strip() or "FN31pr"
+            self.op_cfg["grid"] = g_txt[:4].upper() + g_txt[4:].lower()
+            self.op_cfg["qth"] = e_qth.get_text().strip() or "Newington, CT"
+            try:
+                self.op_cfg["lat"] = float(e_lat.get_text().strip())
+                self.op_cfg["lon"] = float(e_lon.get_text().strip())
+            except ValueError:
+                ll = grid_to_latlon(self.op_cfg["grid"])
+                if ll:
+                    self.op_cfg["lat"], self.op_cfg["lon"] = ll
+            self.op_cfg["itu_zone"] = int(e_itu.get_text().strip() or 6) if e_itu.get_text().strip().isdigit() else 6
+            self.op_cfg["cq_zone"] = int(e_cq.get_text().strip() or 3) if e_cq.get_text().strip().isdigit() else 3
+            self.op_cfg["tx_pwr"] = e_pwr.get_text().strip() or "100"
+            self._save_config()
+            self._recompute_live_call()
+            self._set_status(
+                f"SAVED STATION CONFIG: {self.op_cfg['callsign']} @ {self.op_cfg['grid']} ({self.op_cfg['qth']})"
+            )
+        dlg.destroy()
+
+    def _finish_gui_self_test(self):
+        # Exercise offscreen Cairo rendering of the full ShackConsoleDeck (VFD + DXCC + Compass)
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1100, 174)
+        cr = cairo.Context(surf)
+        self.console_deck._on_draw(self.console_deck, cr)
+        print("DTLOG_SELF_TEST_OK")
+        sys.stdout.flush()
+        self.destroy()
+        return False
+
+    def _on_destroy(self, _w):
+        self.db.close()
+        Gtk.main_quit()
+
+
+# ---------------------------------------------------------------------------
+# Comprehensive Automated Self-Test Suite (--self-test)
+# ---------------------------------------------------------------------------
+def run_self_test():
+    with tempfile.TemporaryDirectory(prefix="dtlog_test_") as tmp:
+        tdir = Path(tmp)
+        cfg_p = tdir / "config.json"
+        db_p = tdir / "logbook.sqlite"
+        dtradio_p = tdir / "dtradio_state.json"
+        adi_p = tdir / "roundtrip.adi"
+        qsl_p = tdir / "qsl_w1aw.png"
+
+        # 1. Verify FN31pr Maidenhead & Great-Circle Geodesic Math
+        ll = grid_to_latlon("FN31pr")
+        assert ll is not None, "FN31pr failed to parse"
+        assert abs(ll[0] - 41.7292) < 0.01 and abs(ll[1] - (-72.7083)) < 0.01, f"Unexpected FN31pr latlon: {ll}"
+        assert latlon_to_grid(41.7292, -72.7083, 6) == "FN31pr"
+
+        # 2. Verify Offline DXCC Prefix & US/VE Call-Area Resolver + Azimuth Bearings from Newington, CT
+        ja = resolve_call_or_station("JA1ABC", "", 41.7292, -72.7083)
+        assert ja["matched"] and "Japan" in ja["entity"] and 325.0 <= ja["sp_deg"] <= 350.0 and ja["sp_km"] > 10000
+
+        w6 = resolve_call_or_station("W6ABC", "CM87wk", 41.7292, -72.7083)
+        assert w6["matched"] and "W6" in w6["entity"] and 275.0 <= w6["sp_deg"] <= 295.0 and 3800 <= w6["sp_km"] <= 4400
+
+        vk = resolve_call_or_station("VK2XYZ", "", 41.7292, -72.7083)
+        assert vk["matched"] and "Australia" in vk["entity"] and 250.0 <= vk["sp_deg"] <= 295.0 and vk["sp_km"] > 14500
+
+        uk = resolve_call_or_station("G4ICD/P", "", 41.7292, -72.7083)
+        assert uk["matched"] and uk["entity"] == "England" and 45.0 <= uk["sp_deg"] <= 62.0
+
+        zl = resolve_call_or_station("ZL1AN", "", 41.7292, -72.7083)
+        assert zl["matched"] and zl["entity"] == "New Zealand" and 235.0 <= zl["sp_deg"] <= 268.0
+
+        py = resolve_call_or_station("PY2AA", "", 41.7292, -72.7083)
+        assert py["matched"] and py["entity"] == "Brazil" and 140.0 <= py["sp_deg"] <= 168.0
+
+        kh6 = resolve_call_or_station("KH6/W1AW", "", 41.7292, -72.7083)
+        assert kh6["matched"] and kh6["entity"] == "Hawaii"
+
+        # 3. Verify dtRadio state.json Bridge
+        dtradio_p.write_text(
+            json.dumps({"freq_khz": 14230.0, "mode": "USB", "source": "kiwi", "title": "20m International SSTV Calling"}),
+            encoding="utf-8",
+        )
+        grab = parse_dtradio_state(dtradio_p)
+        assert grab is not None and abs(grab["freq_mhz"] - 14.2300) < 1e-6 and grab["band"] == "20m" and grab["mode"] == "USB"
+
+        # 4. Verify SQLite CRUD, Stats & Dupe Engine
+        db = LogbookDB(db_p)
+        id1 = db.insert_contact({
+            "log_type": "QSO",
+            "qso_date": "2026-11-27",
+            "time_on": "01:15",
+            "call": "JA1ABC",
+            "freq_mhz": 14.2450,
+            "band": "20m",
+            "mode": "USB",
+            "rst_sent": "59",
+            "rst_rcvd": "58",
+            "grid": "PM95vq",
+            "name": "Kenji",
+            "qth": "Tokyo",
+            "tx_pwr": "100",
+            "notes": "FB DX over pole",
+            "dxcc_entity": ja["entity"],
+            "dxcc_code": ja["iso2"],
+            "continent": ja["cont"],
+            "cq_zone": ja["cq_zone"],
+            "itu_zone": ja["itu_zone"],
+            "bearing_deg": ja["sp_deg"],
+            "distance_km": ja["sp_km"],
+        })
+        id2 = db.insert_contact({
+            "log_type": "SWL",
+            "qso_date": "2026-11-27",
+            "time_on": "01:22",
+            "call": "WWV",
+            "freq_mhz": 10.0000,
+            "band": "SWL/HF",
+            "mode": "AM",
+            "rst_sent": "--",
+            "rst_rcvd": "55555",
+            "grid": "DN70jq",
+            "name": "NIST",
+            "qth": "Ft. Collins, CO",
+            "tx_pwr": "RX",
+            "notes": "Atomic time tick",
+            "dxcc_entity": "NIST WWV Ft. Collins, CO",
+            "dxcc_code": "US",
+            "continent": "NA",
+            "cq_zone": 4,
+            "itu_zone": 7,
+            "bearing_deg": 110.0,
+            "distance_km": 650.0,
+        })
+        assert id1 > 0 and id2 > 0
+        dupe_chk = db.check_dupe_and_history("JA1ABC", "20m", "SSB")
+        assert dupe_chk["is_dupe"] is True
+        non_dupe = db.check_dupe_and_history("JA1ABC", "15m", "FT8")
+        assert non_dupe["is_dupe"] is False and len(non_dupe["prev_rows"]) == 1
+
+        st = db.get_stats()
+        assert st["total_qsos"] == 1 and st["swl_logs"] == 1 and st["unique_calls"] == 2
+
+        # 5. Verify ADIF 3.1.4 Export & Import Roundtrip
+        exported = format_adif_export(db.query_contacts(), DEFAULT_CONFIG)
+        adi_p.write_text(exported, encoding="utf-8")
+        parsed = parse_adif_text(adi_p.read_text(encoding="utf-8"))
+        assert len(parsed) == 2
+
+        db2 = LogbookDB(tdir / "roundtrip.sqlite")
+        added, skipped = db2.import_adif_records(parsed, 41.7292, -72.7083)
+        assert added == 2 and skipped == 0
+        added_again, skipped_again = db2.import_adif_records(parsed, 41.7292, -72.7083)
+        assert added_again == 0 and skipped_again == 2
+        db2.close()
+
+        # 6. Verify Vintage QSL Card PNG & ASCII Renderer
+        row1 = db.get_contact(id1)
+        assert row1 is not None
+        render_qsl_png(qsl_p, row1, DEFAULT_CONFIG)
+        assert qsl_p.is_file() and qsl_p.stat().st_size > 8000
+        assert qsl_p.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+        ascii_card = format_ascii_qsl(row1, DEFAULT_CONFIG)
+        assert "W1AW" in ascii_card and "FN31pr" in ascii_card and "JA1ABC" in ascii_card
+        db.close()
+
+        # 7. Verify GUI + Cairo Compass Dial Rendering (if X11 DISPLAY available, run live GTK window; else headless Cairo verify)
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            win = DtLogWindow(config_path=cfg_p, db_path=db_p, dtradio_state_path=dtradio_p, self_test=True)
+            win.ent_call.set_text("JA1ABC")
+            win._on_grab_dtradio(win.btn_grab)
+            win.show_all()
+            Gtk.main()
+        else:
+            # Headless Cairo compass & QSL verification fallback
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1100, 174)
+            cr = cairo.Context(surf)
+            draw_qsl_card_cairo(cr, 1100.0, 174.0, row1, DEFAULT_CONFIG)
+            print("DTLOG_SELF_TEST_OK")
+
+
+def main():
+    if "--self-test" in sys.argv[1:]:
+        run_self_test()
+        return
+    win = DtLogWindow()
+    win.show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,4445 @@
+#!/usr/bin/env python3
+"""
+dtDecoder — Vintage HF Digital, CW/Morse, RTTY, SAME/EAS, WEFAX & SSTV Multimode Decoder for CDE
+
+Features:
+  - Authentic 1980s/1990s communications terminal unit & facsimile faceplate (HAL ST-8000 /
+    Kantronics KAM / Alden Marine Weatherfax inspired) styled for CDE (OSF/Motif 3D bevels)
+  - Live Audio Input Router @ 12,000 Hz S16LE:
+      * DESKTOP MONITOR (auto-discovers PulseAudio/PipeWire default sink .monitor via pactl
+        so whatever plays in dtRadio feeds dtDecoder automatically!)
+      * MIC / LINE-IN (live transceiver / soundcard audio input)
+      * LOAD .WAV AIRCHECK (defaults to ~/Music/dtRadio, supports arbitrary WAV sample rates)
+      * BUILT-IN LIVE TEST SIGNAL TRANSMITTER ([▶ SEND TEST SIGNAL] for all 5 modes!)
+  - Top Instrument Deck:
+      * Warm incandescent backlit ballistic Analog Signal / SNR Meter
+      * High-contrast 200-3000 Hz Phosphor Waterfall + FFT Spectrum with clickable/draggable
+        Tone & Mark/Space Passband Cursors
+      * Authentic HAL ST-6 / Tektronix Crossed-Ellipse X-Y Mark/Space Tuning Scope
+      * Glowing cyan-green Vacuum Fluorescent Display (VFD) + hardware Sync/Mark/Space/Alert LEDs
+  - 5 Real Working DSP Demodulators:
+      1. CW / MORSE: Quadrature envelope detector (400-1200 Hz, [SNAP PEAK]), adaptive WPM (5-45 WPM),
+         printing live onto a perforated #FFF7E9 tractor-feed teletype paper roll
+      2. RTTY (BAUDOT): 45.45 / 50 / 75 baud, 170 / 425 / 850 Hz shift, matched ATC discriminator,
+         ITA2 LTRS/FIGS + USOS decoder, and live 5-bit punched paper-tape visualizer
+      3. SAME / EAS (NOAA/FEMA): 520.83 baud AFSK (2083.3 / 1562.5 Hz) ZCZC emergency header decoder
+         with plain-English event/FIPS county translation & illuminated alert lamp
+      4. HF WEFAX (IOC 576 / 120 LPM): Complex analytic Hilbert FM discriminator (1500-2300 Hz +
+         phasing auto-align) rendering scanline-by-scanline onto an Alden Thermal Drum Canvas
+      5. SSTV (ROBOT 36 / MARTIN M1): 1200 Hz sync + VIS auto-detection rendering live 320x240 /
+         320x256 color Slow-Scan TV frames
+"""
+
+import collections
+import datetime
+import json
+import math
+import os
+import queue
+import subprocess
+import sys
+import threading
+import time
+import wave
+from pathlib import Path
+
+import cairo
+import gi
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("Pango", "1.0")
+gi.require_version("Gst", "1.0")
+from gi.repository import Gdk, GLib, Gst, Gtk, Pango
+
+Gst.init(None)
+
+HOME = Path.home()
+CONFIG_DIR = HOME / ".config" / "dtdecoder"
+STATE_FILE = CONFIG_DIR / "state.json"
+AIRCHECK_DIR = HOME / "Music" / "dtRadio"
+CAPTURE_DIR = HOME / "Pictures" / "dtDecoder"
+
+DSP_RATE = 12000
+FFT_SIZE = 2048
+WF_MIN_HZ = 200.0
+WF_MAX_HZ = 3000.0
+WF_W = 432
+WF_H = 112
+XY_TRACE_LEN = 420
+
+MODES = ("CW", "RTTY", "SAME", "WEFAX", "SSTV")
+MODE_TITLES = {
+    "CW": "CW / MORSE",
+    "RTTY": "RTTY BAUDOT",
+    "SAME": "SAME / EAS",
+    "WEFAX": "HF WEFAX",
+    "SSTV": "SSTV COLOR",
+}
+
+
+# ---------------------------------------------------------------------------
+# Protocol Tables: ITU Morse, ITA2 Baudot, NOAA/FEMA SAME Codes & FIPS
+# ---------------------------------------------------------------------------
+CHAR_TO_MORSE: dict[str, str] = {
+    "A": ".-", "B": "-...", "C": "-.-.", "D": "-..", "E": ".", "F": "..-.",
+    "G": "--.", "H": "....", "I": "..", "J": ".---", "K": "-.-", "L": ".-..",
+    "M": "--", "N": "-.", "O": "---", "P": ".--.", "Q": "--.-", "R": ".-.",
+    "S": "...", "T": "-", "U": "..-", "V": "...-", "W": ".--", "X": "-..-",
+    "Y": "-.--", "Z": "--..",
+    "0": "-----", "1": ".----", "2": "..---", "3": "...--", "4": "....-",
+    "5": ".....", "6": "-....", "7": "--...", "8": "---..", "9": "----.",
+    "/": "-..-.", "?": "..--..", ".": ".-.-.-", ",": "--..--", "=": "-...-",
+    "+": ".-.-.", "-": "-....-", "@": ".--.-.", ":": "---...", ";": "-.-.-.",
+}
+MORSE_TO_CHAR: dict[str, str] = {v: k for k, v in CHAR_TO_MORSE.items()}
+MORSE_TO_CHAR.update({
+    "...-.-": "<SK>",
+    ".-.-.": "<AR>",
+    "-...-": "=",
+    "-...-.-": "<BK>",
+})
+
+# Standard USTTY / ITA2 5-bit Baudot Code (index 0..31, LSB-first b0..b4)
+ITA2_LTRS: list[str] = [
+    "", "E", "\n", "A", " ", "S", "I", "U",
+    "\r", "D", "R", "J", "N", "F", "C", "K",
+    "T", "Z", "L", "W", "H", "Y", "P", "Q",
+    "O", "B", "G", "<FIGS>", "M", "X", "V", "<LTRS>",
+]
+ITA2_FIGS: list[str] = [
+    "", "3", "\n", "-", " ", "'", "8", "7",
+    "\r", "$", "4", "\a", ",", "!", ":", "(",
+    "5", "\"", ")", "2", "#", "6", "0", "1",
+    "9", "?", "&", "<FIGS>", ".", "/", ";", "<LTRS>",
+]
+ITA2_CODE_LTRS = 0x1F
+ITA2_CODE_FIGS = 0x1B
+
+CHAR_TO_ITA2_LTRS: dict[str, int] = {}
+CHAR_TO_ITA2_FIGS: dict[str, int] = {}
+for _code in range(32):
+    _cl = ITA2_LTRS[_code]
+    _cf = ITA2_FIGS[_code]
+    if len(_cl) == 1 and _cl not in CHAR_TO_ITA2_LTRS:
+        CHAR_TO_ITA2_LTRS[_cl] = _code
+    if len(_cf) == 1 and _cf not in CHAR_TO_ITA2_FIGS:
+        CHAR_TO_ITA2_FIGS[_cf] = _code
+
+SAME_ORIGINATORS: dict[str, str] = {
+    "WXR": "National Weather Service (NOAA/NWS)",
+    "CIV": "Civil Authorities / Emergency Mgmt",
+    "PEP": "Primary Entry Point (National FEMA)",
+    "EAS": "Broadcast / Cable EAS Participant",
+}
+
+SAME_EVENTS: dict[str, tuple[str, str]] = {
+    "RWT": ("Required Weekly Test", "TEST"),
+    "RMT": ("Required Monthly Test", "TEST"),
+    "NPT": ("National Periodic Test", "TEST"),
+    "DMO": ("Practice / Demo Warning", "TEST"),
+    "ADR": ("Administrative Message", "ADVISORY"),
+    "SPS": ("Special Weather Statement", "ADVISORY"),
+    "FFA": ("Flash Flood Watch", "WATCH"),
+    "FLA": ("Flood Watch", "WATCH"),
+    "SVA": ("Severe Thunderstorm Watch", "WATCH"),
+    "TOA": ("Tornado Watch", "WATCH"),
+    "WSA": ("Winter Storm Watch", "WATCH"),
+    "HWA": ("High Wind Watch", "WATCH"),
+    "FWA": ("Fire Weather Watch", "WATCH"),
+    "TOR": ("Tornado Warning", "WARNING"),
+    "SVR": ("Severe Thunderstorm Warning", "WARNING"),
+    "FFW": ("Flash Flood Warning", "WARNING"),
+    "FLW": ("Flood Warning", "WARNING"),
+    "WSW": ("Winter Storm Warning", "WARNING"),
+    "BZW": ("Blizzard Warning", "WARNING"),
+    "HWW": ("High Wind Warning", "WARNING"),
+    "SMW": ("Special Marine Warning", "WARNING"),
+    "HUW": ("Hurricane Warning", "WARNING"),
+    "TRW": ("Tropical Storm Warning", "WARNING"),
+    "TSW": ("Tsunami Warning", "WARNING"),
+    "EQW": ("Earthquake Warning", "WARNING"),
+    "FRW": ("Fire Warning", "WARNING"),
+    "SQW": ("Snow Squall Warning", "WARNING"),
+    "DSW": ("Dust Storm Warning", "WARNING"),
+    "EWW": ("Extreme Wind Warning", "WARNING"),
+    "EAN": ("Emergency Action Notification", "WARNING"),
+    "CAE": ("Child Abduction Emergency (AMBER)", "WARNING"),
+    "CDW": ("Civil Danger Warning", "WARNING"),
+    "CEM": ("Civil Emergency Message", "WARNING"),
+    "LAE": ("Local Area Emergency", "WARNING"),
+    "SPW": ("Shelter In Place Warning", "WARNING"),
+    "EVI": ("Immediate Evacuation Warning", "WARNING"),
+}
+
+FIPS_STATES: dict[str, str] = {
+    "01": "AL", "02": "AK", "04": "AZ", "05": "AR", "06": "CA", "08": "CO",
+    "09": "CT", "10": "DE", "11": "DC", "12": "FL", "13": "GA", "15": "HI",
+    "16": "ID", "17": "IL", "18": "IN", "19": "IA", "20": "KS", "21": "KY",
+    "22": "LA", "23": "ME", "24": "MD", "25": "MA", "26": "MI", "27": "MN",
+    "28": "MS", "29": "MO", "30": "MT", "31": "NE", "32": "NV", "33": "NH",
+    "34": "NJ", "35": "NM", "36": "NY", "37": "NC", "38": "ND", "39": "OH",
+    "40": "OK", "41": "OR", "42": "PA", "44": "RI", "45": "SC", "46": "SD",
+    "47": "TN", "48": "TX", "49": "UT", "50": "VT", "51": "VA", "53": "WA",
+    "54": "WV", "55": "WI", "56": "WY", "72": "PR", "00": "US",
+}
+
+FIPS_COUNTIES: dict[str, str] = {
+    "09003": "Hartford County, CT",
+    "09009": "New Haven County, CT",
+    "25013": "Hampden County, MA",
+    "16019": "Bonneville County, ID",
+    "16029": "Caribou County, ID",
+    "16071": "Oneida County, ID",
+    "16001": "Ada County, ID",
+    "49035": "Salt Lake County, UT",
+    "49003": "Box Elder County, UT",
+    "56039": "Teton County, WY",
+    "06037": "Los Angeles County, CA",
+    "06075": "San Francisco County, CA",
+    "53033": "King County, WA",
+    "41051": "Multnomah County, OR",
+    "08031": "Denver County, CO",
+    "36061": "New York County, NY",
+}
+
+SAME_SUBDIV: dict[str, str] = {
+    "1": "NW ", "2": "N ", "3": "NE ", "4": "W ", "5": "Central ",
+    "6": "E ", "7": "SW ", "8": "S ", "9": "SE ",
+}
+
+SAME_TEST_PRESETS: list[tuple[str, str]] = [
+    ("RWT — Hartford County CT (009003)", "ZCZC-WXR-RWT-009003+0030-3311830-KBOX/NWS-"),
+    ("DMO — Southern New England Demo", "ZCZC-WXR-DMO-009003-009009-025013+0045-3311835-KBOX/NWS-"),
+    ("SMW — Pacific High Seas Demo", "ZCZC-WXR-SMW-006075+0100-3311840-KMTR/NWS-"),
+]
+
+
+def format_same_location(pssccc: str) -> str:
+    if len(pssccc) != 6 or not pssccc.isdigit():
+        return pssccc
+    sub = SAME_SUBDIV.get(pssccc[0], "")
+    ss = pssccc[1:3]
+    ccc = pssccc[3:6]
+    st_ccc = pssccc[1:6]
+    if st_ccc in FIPS_COUNTIES:
+        return f"{sub}{FIPS_COUNTIES[st_ccc]} ({pssccc})"
+    st = FIPS_STATES.get(ss, f"State {ss}")
+    if ccc == "000":
+        return f"All of {st} ({pssccc})"
+    return f"{sub}County FIPS {ccc}, {st} ({pssccc})"
+
+
+def parse_same_header(raw_header: str) -> dict:
+    """Parse ZCZC-ORG-EEE-PSSCCC+TTTT-JJJHHMM-LLLLLLLL- into structured fields."""
+    hdr = raw_header.strip()
+    info = {
+        "raw": hdr,
+        "valid": False,
+        "org": "---",
+        "org_desc": "Unknown Originator",
+        "event": "---",
+        "event_desc": "Unknown Event",
+        "severity": "ADVISORY",
+        "locations": [],
+        "location_names": [],
+        "purge_hhmm": "0030",
+        "purge_desc": "00h 30m",
+        "jjjhhmm": "-------",
+        "issued_desc": "UTC",
+        "sender": "UNKNOWN",
+        "summary": hdr,
+    }
+    if not hdr.startswith("ZCZC-"):
+        return info
+
+    body = hdr[5:].rstrip("-")
+    if "+" not in body:
+        return info
+    left, right = body.split("+", 1)
+    lparts = left.split("-")
+    rparts = right.split("-")
+    if len(lparts) < 3 or len(rparts) < 3:
+        return info
+
+    org = lparts[0][:3]
+    ev = lparts[1][:3]
+    locs = [p for p in lparts[2:] if p]
+    tttt = rparts[0][:4]
+    jjjhhmm = rparts[1][:7]
+    sender = "-".join(rparts[2:])[:16].strip()
+
+    org_desc = SAME_ORIGINATORS.get(org, f"Originator {org}")
+    ev_desc, sev = SAME_EVENTS.get(ev, (f"EAS Event ({ev})", "ADVISORY"))
+    loc_names = [format_same_location(c) for c in locs]
+
+    if len(tttt) == 4 and tttt.isdigit():
+        purge_desc = f"{int(tttt[:2]):02d}h {int(tttt[2:]):02d}m"
+    else:
+        purge_desc = tttt
+
+    issued_desc = jjjhhmm
+    if len(jjjhhmm) == 7 and jjjhhmm.isdigit():
+        jday = max(1, min(366, int(jjjhhmm[:3])))
+        hh = int(jjjhhmm[3:5])
+        mm = int(jjjhhmm[5:7])
+        yr = datetime.datetime.now(datetime.timezone.utc).year
+        dt0 = datetime.datetime(yr, 1, 1, tzinfo=datetime.timezone.utc) + datetime.timedelta(
+            days=jday - 1, hours=hh, minutes=mm
+        )
+        issued_desc = dt0.strftime("%b %d %H:%M UTC")
+
+    loc_joined = "; ".join(loc_names[:4])
+    if len(loc_names) > 4:
+        loc_joined += f" (+{len(loc_names) - 4} more)"
+
+    summary = (
+        f"{ev_desc} issued by {org_desc} ({sender}) for {loc_joined}. "
+        f"Effective {issued_desc}, valid {purge_desc}."
+    )
+    info.update({
+        "valid": True,
+        "org": org,
+        "org_desc": org_desc,
+        "event": ev,
+        "event_desc": ev_desc,
+        "severity": sev,
+        "locations": locs,
+        "location_names": loc_names,
+        "purge_hhmm": tttt,
+        "purge_desc": purge_desc,
+        "jjjhhmm": jjjhhmm,
+        "issued_desc": issued_desc,
+        "sender": sender,
+        "summary": summary,
+    })
+    return info
+
+
+# ---------------------------------------------------------------------------
+# Waterfall Color LUT (BGRA little-endian for Cairo FORMAT_ARGB32)
+# ---------------------------------------------------------------------------
+def _build_waterfall_lut() -> np.ndarray:
+    lut = np.zeros((256, 4), dtype=np.uint8)
+    stops = [
+        (0.00, (8, 14, 24)),
+        (0.24, (12, 42, 62)),
+        (0.48, (22, 128, 118)),
+        (0.70, (66, 232, 182)),
+        (0.86, (245, 198, 66)),
+        (1.00, (255, 250, 228)),
+    ]
+    for i in range(256):
+        t = i / 255.0
+        for k in range(len(stops) - 1):
+            t0, c0 = stops[k]
+            t1, c1 = stops[k + 1]
+            if t <= t1 or k == len(stops) - 2:
+                u = 0.0 if t1 <= t0 else max(0.0, min(1.0, (t - t0) / (t1 - t0)))
+                r = int(c0[0] + u * (c1[0] - c0[0]))
+                g = int(c0[1] + u * (c1[1] - c0[1]))
+                b = int(c0[2] + u * (c1[2] - c0[2]))
+                lut[i] = (b, g, r, 255)  # BGRA for little-endian Cairo ARGB32
+                break
+    return lut
+
+
+WF_LUT_BGRA = _build_waterfall_lut()
+
+
+# ---------------------------------------------------------------------------
+# CDE Palette Loader & Vintage HAL ST-8000 / Alden Motif CSS
+# ---------------------------------------------------------------------------
+def load_cde_palette() -> tuple[str, str, str]:
+    chrome, sel, well = "#aeb2c3", "#2c567e", "#fff7e9"
+    try:
+        out = subprocess.check_output(
+            ["xrdb", "-query"], text=True, stderr=subprocess.DEVNULL, timeout=1.5
+        )
+        pal_name = "Crimson.dp"
+        for ln in out.splitlines():
+            if "ColorPalette:" in ln:
+                pal_name = ln.split(":", 1)[1].strip()
+                break
+        for pdir in (HOME / ".dt/palettes", Path("/usr/dt/palettes")):
+            pf = pdir / pal_name
+            if pf.is_file():
+                hexes = [l.strip() for l in pf.read_text().splitlines() if l.strip().startswith("#")]
+                if len(hexes) >= 4:
+                    def norm16(h: str) -> str:
+                        h = h.lstrip("#")
+                        return f"#{h[0:2]}{h[4:6]}{h[8:10]}" if len(h) == 12 else "#" + h[:6]
+                    chrome, sel, well = norm16(hexes[1]), norm16(hexes[2]), norm16(hexes[3])
+                break
+    except Exception:
+        pass
+    return chrome, sel, well
+
+
+def build_decoder_css(chrome: str, sel: str, _well: str) -> bytes:
+    css = f"""
+    window, dialog, .background {{
+        background-color: {chrome};
+        color: #101216;
+        font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+        font-size: 8.5pt;
+    }}
+    .rx-cabinet {{
+        background-color: #2f343f;
+        border-top: 2px solid #596173;
+        border-left: 2px solid #596173;
+        border-right: 2px solid #171a20;
+        border-bottom: 2px solid #171a20;
+        padding: 5px;
+    }}
+    .rx-strip {{
+        background-color: #383e4b;
+        border-top: 2px solid #575f70;
+        border-left: 2px solid #575f70;
+        border-right: 2px solid #1c2028;
+        border-bottom: 2px solid #1c2028;
+        padding: 3px 6px;
+    }}
+    .sunken-bezel {{
+        background-color: #181c23;
+        border-top: 2px solid #0f1217;
+        border-left: 2px solid #0f1217;
+        border-right: 2px solid #576074;
+        border-bottom: 2px solid #576074;
+        padding: 2px;
+    }}
+    .tty-roll-frame {{
+        background-color: #fff7e9;
+        border-top: 2px solid #1c1914;
+        border-left: 2px solid #1c1914;
+        border-right: 2px solid #6b6357;
+        border-bottom: 2px solid #6b6357;
+    }}
+    textview.tty-paper, textview.tty-paper text {{
+        background-color: #fff7e9;
+        color: #1a1d24;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 9.8pt;
+    }}
+    .rx-engraved {{
+        color: #d7deeb;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8pt;
+    }}
+    .rx-badge {{
+        color: #68f7c4;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8pt;
+    }}
+    button {{
+        background-image: none;
+        background-color: #464d5c;
+        color: #edf2f7;
+        border-top: 2px solid #757f94;
+        border-left: 2px solid #757f94;
+        border-right: 2px solid #1d2129;
+        border-bottom: 2px solid #1d2129;
+        border-radius: 0px;
+        padding: 2px 7px;
+        min-height: 0px;
+        min-width: 0px;
+        box-shadow: none;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8pt;
+    }}
+    button label {{
+        color: #edf2f7;
+    }}
+    button:hover {{
+        background-color: #525a6b;
+    }}
+    button:active, button:checked {{
+        background-color: #282d37;
+        border-top: 2px solid #191c22;
+        border-left: 2px solid #191c22;
+        border-right: 2px solid #6d768a;
+        border-bottom: 2px solid #6d768a;
+    }}
+    button.sw-active {{
+        background-color: #214e3f;
+        color: #6afcc6;
+        border-top: 2px solid #122b23;
+        border-left: 2px solid #122b23;
+        border-right: 2px solid #4fa688;
+        border-bottom: 2px solid #4fa688;
+    }}
+    button.sw-active label {{
+        color: #6afcc6;
+    }}
+    button.btn-tx {{
+        background-color: #c85219;
+        color: #ffffff;
+        border-top: 2px solid #ff9966;
+        border-left: 2px solid #ff9966;
+        border-right: 2px solid #592006;
+        border-bottom: 2px solid #592006;
+        padding: 3px 10px;
+    }}
+    button.btn-tx:hover {{
+        background-color: #dc5e21;
+    }}
+    button.btn-tx label {{
+        color: #ffffff;
+        font-weight: bold;
+    }}
+    button.btn-tx-on {{
+        background-color: #9e1c1c;
+        color: #fff2f2;
+        border-top: 2px solid #470a0a;
+        border-left: 2px solid #470a0a;
+        border-right: 2px solid #ef7373;
+        border-bottom: 2px solid #ef7373;
+        padding: 3px 10px;
+    }}
+    button.btn-tx-on label {{
+        color: #ffffff;
+        font-weight: bold;
+    }}
+    entry {{
+        background-color: #141c1d;
+        color: #62fce0;
+        border-top: 2px solid #0b1011;
+        border-left: 2px solid #0b1011;
+        border-right: 2px solid #566074;
+        border-bottom: 2px solid #566074;
+        border-radius: 0px;
+        padding: 1px 5px;
+        min-height: 21px;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8.3pt;
+    }}
+    combobox button.combo {{
+        background-color: #222731;
+        color: #d8f8ee;
+        border-top: 2px solid #14171d;
+        border-left: 2px solid #14171d;
+        border-right: 2px solid #626b7f;
+        border-bottom: 2px solid #626b7f;
+        padding: 2px 5px;
+    }}
+    combobox button.combo label, combobox cellview {{
+        color: #d8f8ee;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8pt;
+    }}
+    menu {{
+        background-color: #2b303b;
+        color: #edf2f7;
+        border: 1px solid #6c758a;
+    }}
+    menuitem {{
+        color: #edf2f7;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8pt;
+        padding: 2px 8px;
+    }}
+    menuitem:hover {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    .cde-status {{
+        background-color: {chrome};
+        color: #101216;
+        padding: 2px 8px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8pt;
+    }}
+    """
+    return css.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Spun-Aluminum Machined Rotary Knob Widget
+# ---------------------------------------------------------------------------
+class RotaryKnob(Gtk.DrawingArea):
+    def __init__(
+        self,
+        label: str,
+        init_val: float,
+        default_val: float,
+        on_change,
+        fmt_fn=None,
+        accent_rgb: tuple[float, float, float] = (1.0, 0.46, 0.18),
+    ):
+        super().__init__()
+        self.label = label
+        self.value = max(0.0, min(1.0, init_val))
+        self.default_val = default_val
+        self.on_change = on_change
+        self.fmt_fn = fmt_fn
+        self.accent_rgb = accent_rgb
+        self._drag_y = None
+        self._drag_start_val = self.value
+
+        self.set_size_request(92, 72)
+        self.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+            | Gdk.EventMask.SCROLL_MASK
+        )
+        self.connect("draw", self._on_draw)
+        self.connect("button-press-event", self._on_press)
+        self.connect("button-release-event", self._on_release)
+        self.connect("motion-notify-event", self._on_motion)
+        self.connect("scroll-event", self._on_scroll)
+
+    def set_value(self, v: float, notify: bool = False):
+        self.value = max(0.0, min(1.0, v))
+        self.queue_draw()
+        if notify and self.on_change:
+            self.on_change(self.value)
+
+    def _on_press(self, _w, ev):
+        if ev.type == Gdk.EventType._2BUTTON_PRESS:
+            self.set_value(self.default_val, notify=True)
+            return True
+        if ev.button == 1:
+            self._drag_y = ev.y
+            self._drag_start_val = self.value
+            return True
+        return False
+
+    def _on_release(self, _w, _ev):
+        self._drag_y = None
+        return True
+
+    def _on_motion(self, _w, ev):
+        if self._drag_y is not None:
+            dy = self._drag_y - ev.y
+            self.set_value(self._drag_start_val + dy / 115.0, notify=True)
+            return True
+        return False
+
+    def _on_scroll(self, _w, ev):
+        step = 0.025
+        if ev.direction == Gdk.ScrollDirection.UP:
+            self.set_value(self.value + step, notify=True)
+        elif ev.direction == Gdk.ScrollDirection.DOWN:
+            self.set_value(self.value - step, notify=True)
+        elif ev.direction == Gdk.ScrollDirection.SMOOTH:
+            _, _dx, dy = ev.get_scroll_deltas()
+            self.set_value(self.value - dy * 0.02, notify=True)
+        return True
+
+    def _on_draw(self, w, cr: cairo.Context):
+        alloc = w.get_allocation()
+        cx = alloc.width * 0.5
+        cy = 27.5
+        r = 18.0
+
+        a_start = math.radians(135.0)
+        a_span = math.radians(270.0)
+        for i in range(11):
+            frac = i / 10.0
+            ang = a_start + frac * a_span
+            r0 = r + 2.8
+            r1 = r + (6.0 if i in (0, 5, 10) else 4.4)
+            cr.set_line_width(1.4 if i in (0, 5, 10) else 1.0)
+            if frac <= self.value + 0.001:
+                cr.set_source_rgb(0.34, 0.95, 0.82)
+            else:
+                cr.set_source_rgb(0.58, 0.63, 0.72)
+            cr.move_to(cx + r0 * math.cos(ang), cy + r0 * math.sin(ang))
+            cr.line_to(cx + r1 * math.cos(ang), cy + r1 * math.sin(ang))
+            cr.stroke()
+
+        # Drop shadow
+        cr.arc(cx + 1.4, cy + 2.0, r + 1.0, 0, 2 * math.pi)
+        cr.set_source_rgba(0.04, 0.05, 0.07, 0.78)
+        cr.fill()
+
+        # Knurled skirt
+        cr.arc(cx, cy, r, 0, 2 * math.pi)
+        cr.set_source_rgb(0.16, 0.18, 0.22)
+        cr.fill()
+
+        cr.set_line_width(1.0)
+        cr.set_source_rgba(0.45, 0.50, 0.60, 0.55)
+        for k in range(16):
+            ka = k * (2.0 * math.pi / 16.0)
+            cr.move_to(cx + (r - 2.3) * math.cos(ka), cy + (r - 2.3) * math.sin(ka))
+            cr.line_to(cx + r * math.cos(ka), cy + r * math.sin(ka))
+            cr.stroke()
+
+        # Brushed spun-aluminum cap
+        pat = cairo.LinearGradient(cx - r, cy - r, cx + r, cy + r)
+        pat.add_color_stop_rgb(0.0, 0.85, 0.88, 0.93)
+        pat.add_color_stop_rgb(0.5, 0.54, 0.58, 0.66)
+        pat.add_color_stop_rgb(1.0, 0.28, 0.32, 0.38)
+        cr.arc(cx, cy, r - 3.0, 0, 2 * math.pi)
+        cr.set_source(pat)
+        cr.fill()
+
+        # Pointer indicator
+        val_ang = a_start + self.value * a_span
+        cr.set_line_width(2.3)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_source_rgb(*self.accent_rgb)
+        cr.move_to(cx + 3.4 * math.cos(val_ang), cy + 3.4 * math.sin(val_ang))
+        cr.line_to(cx + (r - 4.2) * math.cos(val_ang), cy + (r - 4.2) * math.sin(val_ang))
+        cr.stroke()
+
+        # Engraved label + glowing value readout
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(8.2)
+        ext = cr.text_extents(self.label)
+        cr.set_source_rgb(0.86, 0.90, 0.96)
+        cr.move_to(cx - ext.width * 0.5, 58.5)
+        cr.show_text(self.label)
+
+        if self.fmt_fn:
+            sub = self.fmt_fn(self.value)
+            cr.set_font_size(7.9)
+            ext2 = cr.text_extents(sub)
+            cr.set_source_rgb(0.42, 0.96, 0.84)
+            cr.move_to(cx - ext2.width * 0.5, 69.0)
+            cr.show_text(sub)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# DSP Primitives: Resonant Quadrature Biquad & Complex Analytic FM Discriminator
+# ---------------------------------------------------------------------------
+class QuadratureBandpass:
+    """2nd-order constant-0dB-peak IIR bandpass filter with exact 90-deg quadrature output."""
+
+    def __init__(self, f0_hz: float, bw_hz: float, fs: float = DSP_RATE):
+        self.fs = fs
+        self.f0_hz = 0.0
+        self.bw_hz = 0.0
+        self.b0 = 0.0
+        self.a1 = 0.0
+        self.a2 = 0.0
+        self.cos_w0 = 0.0
+        self.inv_sin_w0 = 1.0
+        self.x1 = 0.0
+        self.x2 = 0.0
+        self.y1 = 0.0
+        self.y2 = 0.0
+        self.configure(f0_hz, bw_hz)
+
+    def configure(self, f0_hz: float, bw_hz: float):
+        f0 = max(120.0, min(self.fs * 0.46, float(f0_hz)))
+        bw = max(18.0, min(1600.0, float(bw_hz)))
+        if abs(f0 - self.f0_hz) < 0.25 and abs(bw - self.bw_hz) < 0.25:
+            return
+        self.f0_hz = f0
+        self.bw_hz = bw
+        w0 = 2.0 * math.pi * f0 / self.fs
+        q = max(0.7, f0 / bw)
+        alpha = math.sin(w0) / (2.0 * q)
+        inv_a0 = 1.0 / (1.0 + alpha)
+        self.b0 = alpha * inv_a0
+        self.a1 = (-2.0 * math.cos(w0)) * inv_a0
+        self.a2 = (1.0 - alpha) * inv_a0
+        self.cos_w0 = math.cos(w0)
+        self.inv_sin_w0 = 1.0 / max(1e-4, math.sin(w0))
+
+    def process(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (in_phase, quadrature, envelope) arrays for block x."""
+        n = len(x)
+        if n == 0:
+            z = np.zeros(0, dtype=np.float32)
+            return z, z, z
+        out_i = np.empty(n, dtype=np.float32)
+        b0 = self.b0
+        a1 = self.a1
+        a2 = self.a2
+        x1, x2, y1, y2 = self.x1, self.x2, self.y1, self.y2
+        # Tight scalar IIR loop on 12 kHz blocks (600 samples = ~0.12 ms in Python)
+        x_list = x.tolist()
+        y_list = [0.0] * n
+        for k in range(n):
+            xk = x_list[k]
+            yk = b0 * (xk - x2) - a1 * y1 - a2 * y2
+            x2 = x1
+            x1 = xk
+            y2 = y1
+            y1 = yk
+            y_list[k] = yk
+        prev_y0 = self.y1 if n == 0 else (self.y2 if n == 1 else 0.0)
+        out_i[:] = y_list
+        # Exact narrowband quadrature: q[n] = (cos(w0)*i[n] - i[n-1]) / sin(w0)
+        i_prev = np.empty(n, dtype=np.float32)
+        i_prev[0] = float(self.y1 if n == 0 else (y_list[0] * self.cos_w0))
+        if n > 0:
+            # Before loop self.y1 was y[-1]; capture cleanly:
+            pass
+        self.x1, self.x2, self.y1, self.y2 = x1, x2, y1, y2
+        return out_i, out_i, out_i
+
+    def process_iq(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        n = len(x)
+        if n == 0:
+            z = np.zeros(0, dtype=np.float32)
+            return z, z, z
+        prev_last_y = self.y1
+        b0, a1, a2 = self.b0, self.a1, self.a2
+        x1, x2, y1, y2 = self.x1, self.x2, self.y1, self.y2
+        x_list = x.tolist()
+        y_list = [0.0] * n
+        for k in range(n):
+            xk = x_list[k]
+            yk = b0 * (xk - x2) - a1 * y1 - a2 * y2
+            x2 = x1
+            x1 = xk
+            y2 = y1
+            y1 = yk
+            y_list[k] = yk
+        self.x1, self.x2, self.y1, self.y2 = x1, x2, y1, y2
+
+        out_i = np.array(y_list, dtype=np.float32)
+        i_prev = np.empty(n, dtype=np.float32)
+        i_prev[0] = prev_last_y
+        if n > 1:
+            i_prev[1:] = out_i[:-1]
+        out_q = ((self.cos_w0 * out_i - i_prev) * self.inv_sin_w0).astype(np.float32)
+        env = np.hypot(out_i, out_q)
+        return out_i, out_q, env
+
+
+class AnalyticFmDiscriminator:
+    """
+    65-tap Hamming complex analytic bandpass FIR filter (950..2650 Hz) + instantaneous
+    frequency discriminator for WEFAX (1500..2300 Hz) and SSTV (1100..2300 Hz).
+    """
+
+    def __init__(self, fs: float = DSP_RATE, smooth_taps: int = 7):
+        self.fs = fs
+        ntaps = 65
+        half = ntaps // 2
+        k = np.arange(ntaps, dtype=np.float64) - half
+        # Lowpass prototype at +-850 Hz shifted to +1800 Hz -> analytic passband 950..2650 Hz
+        fc = 850.0 / fs
+        h_lp = 2.0 * fc * np.sinc(2.0 * fc * k) * np.hamming(ntaps)
+        h_lp /= np.sum(h_lp)
+        self.h_complex = (h_lp * np.exp(2j * np.pi * 1800.0 * k / fs)).astype(np.complex64)
+        self.ntaps = ntaps
+        self._hist = np.zeros(ntaps - 1, dtype=np.float32)
+        self._prev_z = np.complex64(1.0 + 0.0j)
+        self.smooth_taps = max(1, smooth_taps)
+        self._f_hist = np.full(self.smooth_taps - 1, 1900.0, dtype=np.float32)
+
+    def reset(self):
+        self._hist.fill(0.0)
+        self._prev_z = np.complex64(1.0 + 0.0j)
+        self._f_hist.fill(1900.0)
+
+    def process(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return (inst_freq_hz, inst_amp) for input float32 block x."""
+        if len(x) == 0:
+            z = np.zeros(0, dtype=np.float32)
+            return z, z
+        x_pad = np.concatenate((self._hist, x))
+        self._hist[:] = x_pad[-(self.ntaps - 1):]
+        z = np.convolve(x_pad, self.h_complex, mode="valid")
+        amp = np.abs(z).astype(np.float32)
+
+        z_prev = np.empty_like(z)
+        z_prev[0] = self._prev_z
+        if len(z) > 1:
+            z_prev[1:] = z[:-1]
+        self._prev_z = z[-1]
+
+        dphi = np.angle(z * np.conj(z_prev))
+        f_raw = (dphi * (self.fs / (2.0 * math.pi))).astype(np.float32)
+        f_raw = np.clip(f_raw, 800.0, 2700.0)
+
+        if self.smooth_taps > 1:
+            f_pad = np.concatenate((self._f_hist, f_raw))
+            self._f_hist[:] = f_pad[-(self.smooth_taps - 1):]
+            kernel = np.ones(self.smooth_taps, dtype=np.float32) / float(self.smooth_taps)
+            f_smooth = np.convolve(f_pad, kernel, mode="valid").astype(np.float32)
+        else:
+            f_smooth = f_raw
+        return f_smooth, amp
+
+
+# ---------------------------------------------------------------------------
+# 1. CW / MORSE Decoder (Adaptive Dit/Dah & WPM Tracker)
+# ---------------------------------------------------------------------------
+class CwMorseDecoder:
+    def __init__(self, fs: float = DSP_RATE):
+        self.fs = fs
+        self.pitch_hz = 700.0
+        self.bp = QuadratureBandpass(self.pitch_hz, 110.0, fs)
+        self.decim = 12  # 12000 / 12 = 1000 Hz envelope rate (1.0 ms resolution)
+        self.env_rate = fs / self.decim
+        self._rem = np.zeros(0, dtype=np.float32)
+        self.reset()
+
+    def reset(self):
+        self._rem = np.zeros(0, dtype=np.float32)
+        self.peak_env = 0.02
+        self.floor_env = 0.001
+        self.key_down = False
+        self.state_dur = 0.0
+        self.t_dit = 1.2 / 20.0  # 60 ms (20 WPM initial estimate)
+        self.wpm = 20.0
+        self.pulse_hist: collections.deque[float] = collections.deque(maxlen=18)
+        self.char_pulses: list[float] = []
+        self.current_pattern = ""
+        self.space_sent = True
+        self.decoded_text = ""
+        self.last_env = 0.0
+        self.last_thresh = 0.01
+        self.sync_locked = False
+
+    def set_pitch(self, hz: float):
+        self.pitch_hz = max(350.0, min(2500.0, float(hz)))
+        self.bp.configure(self.pitch_hz, 110.0)
+
+    def _update_dit_estimate(self, dur: float):
+        if dur < 0.018 or dur > 0.85:
+            return
+        self.pulse_hist.append(dur)
+        if len(self.pulse_hist) >= 2:
+            pmin = min(self.pulse_hist)
+            pmax = max(self.pulse_hist)
+            if pmax / max(1e-4, pmin) > 2.05:
+                split = 0.52 * (pmin + pmax)
+                dits = [p for p in self.pulse_hist if p < split]
+                dahs = [p for p in self.pulse_hist if p >= split]
+                est = float(np.median(dits)) if dits else (float(np.median(dahs)) / 3.0)
+                self.t_dit = max(0.026, min(0.240, 0.35 * self.t_dit + 0.65 * est))
+                self.wpm = 1.2 / self.t_dit
+                return
+        # Single-cluster fallback
+        if dur < 1.85 * self.t_dit:
+            self.t_dit = max(0.026, min(0.240, 0.80 * self.t_dit + 0.20 * dur))
+        elif 2.0 * self.t_dit <= dur <= 5.0 * self.t_dit:
+            self.t_dit = max(0.026, min(0.240, 0.82 * self.t_dit + 0.18 * (dur / 3.0)))
+        self.wpm = 1.2 / self.t_dit
+
+    def _flush_char(self) -> str:
+        if not self.char_pulses:
+            return ""
+        thresh_dah = 2.0 * self.t_dit
+        pat = "".join("." if p < thresh_dah else "-" for p in self.char_pulses)
+        self.current_pattern = pat
+        self.char_pulses.clear()
+        ch = MORSE_TO_CHAR.get(pat, "")
+        if not ch and len(pat) <= 6:
+            ch = "·"
+        return ch
+
+    def process(self, x: np.ndarray, noise_gate: float = 0.05, squelch: float = 0.0) -> str:
+        _, _, env = self.bp.process_iq(x)
+        if len(self._rem) > 0:
+            env = np.concatenate((self._rem, env))
+        n_steps = len(env) // self.decim
+        if n_steps == 0:
+            self._rem = env
+            return ""
+        self._rem = env[n_steps * self.decim:]
+        env_ds = env[: n_steps * self.decim].reshape(n_steps, self.decim).mean(axis=1)
+
+        dt = 1.0 / self.env_rate
+        min_gate = 0.004 + 0.08 * noise_gate + 0.10 * squelch
+        emitted: list[str] = []
+
+        for e_val in env_ds.tolist():
+            if e_val > self.peak_env:
+                self.peak_env = 0.65 * self.peak_env + 0.35 * e_val
+            else:
+                self.peak_env = max(0.006, 0.9985 * self.peak_env + 0.0015 * e_val)
+
+            if e_val < self.floor_env:
+                self.floor_env = 0.85 * self.floor_env + 0.15 * e_val
+            else:
+                self.floor_env = min(self.peak_env * 0.5, 0.9992 * self.floor_env + 0.0008 * e_val)
+
+            span = max(0.0, self.peak_env - self.floor_env)
+            th_hi = max(min_gate, self.floor_env + 0.44 * span)
+            th_lo = max(min_gate * 0.78, self.floor_env + 0.30 * span)
+            self.last_env = e_val
+            self.last_thresh = th_hi
+
+            want_down = (e_val >= th_hi) if not self.key_down else (e_val >= th_lo)
+            if want_down == self.key_down:
+                self.state_dur += dt
+                if not self.key_down:
+                    if self.char_pulses and self.state_dur >= 2.25 * self.t_dit:
+                        ch = self._flush_char()
+                        if ch:
+                            emitted.append(ch)
+                            self.space_sent = False
+                    if not self.space_sent and self.state_dur >= 5.3 * self.t_dit:
+                        emitted.append(" ")
+                        self.space_sent = True
+            else:
+                if self.key_down:
+                    # Tone just ended
+                    if self.state_dur >= 0.016:
+                        self._update_dit_estimate(self.state_dur)
+                        self.char_pulses.append(self.state_dur)
+                        thresh_dah = 2.0 * self.t_dit
+                        self.current_pattern = "".join(
+                            "." if p < thresh_dah else "-" for p in self.char_pulses
+                        )
+                        self.sync_locked = True
+                self.key_down = want_down
+                self.state_dur = dt
+
+        if not self.key_down and self.state_dur > 1.5:
+            self.sync_locked = False
+
+        out = "".join(emitted)
+        if out:
+            self.decoded_text = (self.decoded_text + out)[-8000:]
+        return out
+
+
+# ---------------------------------------------------------------------------
+# 2. RTTY (BAUDOT / ITA2) Decoder (45.45 / 50 / 75 Bd, 170 / 425 / 850 Hz)
+# ---------------------------------------------------------------------------
+class RttyBaudotDecoder:
+    def __init__(self, fs: float = DSP_RATE):
+        self.fs = fs
+        self.baud = 45.45
+        self.mark_hz = 2125.0
+        self.shift_hz = 170.0
+        self.reverse = False
+        self.usos = True
+        bw = max(52.0, self.baud * 1.25)
+        self.bp_mark = QuadratureBandpass(self.mark_hz, bw, fs)
+        self.bp_space = QuadratureBandpass(self.mark_hz + self.shift_hz, bw, fs)
+        self.decim = 4  # 3000 Hz UART oversampling (~66x oversampling at 45.45 baud)
+        self.uart_rate = fs / self.decim
+        self.reset()
+
+    def reset(self):
+        self._rem_m = np.zeros(0, dtype=np.float32)
+        self._rem_s = np.zeros(0, dtype=np.float32)
+        self.uart_state = "WAIT_MARK"  # WAIT_MARK | IDLE | START | DATA | STOP
+        self.timer = 0.0
+        self.bit_idx = 0
+        self.code_acc = 0
+        self.last_bits = [0, 0, 0, 0, 0]
+        self.figs_shift = False
+        self.sync_locked = False
+        self.mark_level = 0.0
+        self.space_level = 0.0
+        self.decoded_text = ""
+
+    def configure(
+        self,
+        baud: float | None = None,
+        mark_hz: float | None = None,
+        shift_hz: float | None = None,
+        reverse: bool | None = None,
+        usos: bool | None = None,
+    ):
+        if baud is not None:
+            self.baud = float(baud)
+        if mark_hz is not None:
+            self.mark_hz = max(400.0, min(2600.0, float(mark_hz)))
+        if shift_hz is not None:
+            self.shift_hz = float(shift_hz)
+        if reverse is not None:
+            self.reverse = bool(reverse)
+        if usos is not None:
+            self.usos = bool(usos)
+        bw = max(52.0, min(self.shift_hz * 0.68, self.baud * 1.35))
+        space_f = min(self.fs * 0.46, self.mark_hz + self.shift_hz)
+        self.bp_mark.configure(self.mark_hz, bw)
+        self.bp_space.configure(space_f, bw)
+
+    def _decode_ita2(self, code: int) -> str:
+        code &= 0x1F
+        if code == 0x00:
+            return ""
+        if code == ITA2_CODE_LTRS:
+            self.figs_shift = False
+            return ""
+        if code == ITA2_CODE_FIGS:
+            self.figs_shift = True
+            return ""
+        if code == 0x04:  # SPACE
+            if self.usos:
+                self.figs_shift = False
+            return " "
+        ch = ITA2_FIGS[code] if self.figs_shift else ITA2_LTRS[code]
+        if ch in ("\r", "\a"):
+            return ""
+        return ch
+
+    def process(self, x: np.ndarray, noise_gate: float = 0.05, squelch: float = 0.0) -> str:
+        _, _, env_m = self.bp_mark.process_iq(x)
+        _, _, env_s = self.bp_space.process_iq(x)
+        if len(self._rem_m) > 0:
+            env_m = np.concatenate((self._rem_m, env_m))
+            env_s = np.concatenate((self._rem_s, env_s))
+        n_steps = len(env_m) // self.decim
+        if n_steps == 0:
+            self._rem_m = env_m
+            self._rem_s = env_s
+            return ""
+        self._rem_m = env_m[n_steps * self.decim:]
+        self._rem_s = env_s[n_steps * self.decim:]
+
+        em = env_m[: n_steps * self.decim].reshape(n_steps, self.decim).mean(axis=1)
+        es = env_s[: n_steps * self.decim].reshape(n_steps, self.decim).mean(axis=1)
+
+        self.mark_level = float(np.mean(em))
+        self.space_level = float(np.mean(es))
+
+        tot = em + es
+        disc = (em - es) / (tot + 1e-5)
+        if self.reverse:
+            disc = -disc
+
+        min_carrier = 0.005 + 0.07 * noise_gate + 0.10 * squelch
+        t_bit = self.uart_rate / self.baud
+        emitted: list[str] = []
+
+        for d_val, c_lvl in zip(disc.tolist(), tot.tolist()):
+            if c_lvl < min_carrier:
+                self.uart_state = "WAIT_MARK"
+                self.sync_locked = False
+                continue
+
+            st = self.uart_state
+            if st == "WAIT_MARK":
+                if d_val > 0.18:
+                    self.timer += 1.0
+                    if self.timer >= 0.35 * t_bit:
+                        self.uart_state = "IDLE"
+                else:
+                    self.timer = 0.0
+            elif st == "IDLE":
+                if d_val < -0.10:
+                    self.uart_state = "START"
+                    self.timer = 0.5 * t_bit
+            elif st == "START":
+                self.timer -= 1.0
+                if self.timer <= 0.0:
+                    if d_val < -0.05:
+                        self.uart_state = "DATA"
+                        self.bit_idx = 0
+                        self.code_acc = 0
+                        self.timer = t_bit
+                    else:
+                        self.uart_state = "IDLE"
+            elif st == "DATA":
+                self.timer -= 1.0
+                if self.timer <= 0.0:
+                    bit = 1 if d_val >= 0.0 else 0
+                    self.code_acc |= (bit << self.bit_idx)
+                    self.last_bits[self.bit_idx] = bit
+                    self.bit_idx += 1
+                    if self.bit_idx >= 5:
+                        self.uart_state = "STOP"
+                        self.timer = 0.85 * t_bit
+                    else:
+                        self.timer += t_bit
+            elif st == "STOP":
+                self.timer -= 1.0
+                if self.timer <= 0.0:
+                    if d_val > -0.12:
+                        self.sync_locked = True
+                        ch = self._decode_ita2(self.code_acc)
+                        if ch:
+                            emitted.append(ch)
+                        self.uart_state = "IDLE"
+                    else:
+                        self.uart_state = "WAIT_MARK"
+                        self.timer = 0.0
+
+        out = "".join(emitted)
+        if out:
+            self.decoded_text = (self.decoded_text + out)[-8000:]
+        return out
+
+
+# ---------------------------------------------------------------------------
+# 3. SAME / EAS (NOAA / FEMA) 520.83 Baud AFSK Decoder
+# ---------------------------------------------------------------------------
+class SameEasDecoder:
+    """
+    Decodes 520.8333 baud AFSK (Mark=2083.33 Hz, Space=1562.5 Hz) NOAA/FEMA SAME bursts:
+      Preamble: 16x 0xAB (LSB-first) + "ZCZC-ORG-EEE-PSSCCC+TTTT-JJJHHMM-LLLLLLLL-"
+      EOM:      16x 0xAB + "NNNN"
+    """
+
+    BAUD = 1000.0 / 1.92  # 520.833333... baud
+    MARK_HZ = 2083.333333
+    SPACE_HZ = 1562.5
+    SYNC_ZCZC = 0x435A435AABAB  # [0xAB, 0xAB, 'Z', 'C', 'Z', 'C'] in 48-bit LSB-in shift reg
+    SYNC_NNNN = 0x4E4E4E4EABAB  # [0xAB, 0xAB, 'N', 'N', 'N', 'N']
+
+    def __init__(self, fs: float = DSP_RATE):
+        self.fs = fs
+        ntaps = 23  # 1 bit period @ 12,000 Hz = 23.04 samples -> exact orthogonal 3 vs 4 cycles
+        k = np.arange(ntaps, dtype=np.float64)
+        self.h_mark = (np.exp(-2j * np.pi * self.MARK_HZ * k / fs) / ntaps).astype(np.complex64)
+        self.h_space = (np.exp(-2j * np.pi * self.SPACE_HZ * k / fs) / ntaps).astype(np.complex64)
+        self.ntaps = ntaps
+        self.alerts: list[dict] = []
+        self.last_alert: dict | None = None
+        self.alert_lamp_active = False
+        self.eom_received = False
+        self.reset_stream()
+
+    def reset_stream(self):
+        self._hist = np.zeros(self.ntaps - 1, dtype=np.float32)
+        self.phase = 0.0
+        self.prev_disc = 0.0
+        self.sync_reg = 0
+        self.rx_mode = "SEARCH"  # SEARCH | HEADER
+        self.bit_cnt = 0
+        self.byte_acc = 0
+        self.header_chars: list[str] = []
+        self.dash_after_plus = 0
+        self.seen_plus = False
+        self.sync_locked = False
+        self._last_hdr_str = ""
+        self._last_hdr_ts = 0.0
+
+    def clear_alerts(self):
+        self.alerts.clear()
+        self.last_alert = None
+        self.alert_lamp_active = False
+        self.eom_received = False
+
+    def _finalize_header(self) -> dict | None:
+        raw = "ZCZC" + "".join(self.header_chars)
+        self.rx_mode = "SEARCH"
+        self.header_chars.clear()
+        parsed = parse_same_header(raw)
+        if not parsed["valid"]:
+            return None
+        now = time.monotonic()
+        if raw == self._last_hdr_str and (now - self._last_hdr_ts) < 12.0 and self.last_alert is not None:
+            self.last_alert["burst_count"] = self.last_alert.get("burst_count", 1) + 1
+            self._last_hdr_ts = now
+            return self.last_alert
+        self._last_hdr_str = raw
+        self._last_hdr_ts = now
+        parsed["burst_count"] = 1
+        parsed["rx_utc"] = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S UTC")
+        self.last_alert = parsed
+        self.alerts.append(parsed)
+        self.alert_lamp_active = True
+        self.eom_received = False
+        return parsed
+
+    def process(self, x: np.ndarray, noise_gate: float = 0.05, squelch: float = 0.0) -> list[dict]:
+        if len(x) == 0:
+            return []
+        x_pad = np.concatenate((self._hist, x))
+        self._hist[:] = x_pad[-(self.ntaps - 1):]
+
+        em = np.abs(np.convolve(x_pad, self.h_mark, mode="valid"))
+        es = np.abs(np.convolve(x_pad, self.h_space, mode="valid"))
+        tot = em + es
+        disc = (em - es) / (tot + 1e-5)
+
+        min_lvl = 0.004 + 0.05 * noise_gate + 0.08 * squelch
+        step = self.BAUD / self.fs
+        mask48 = (1 << 48) - 1
+        new_alerts: list[dict] = []
+
+        ph = self.phase
+        p_disc = self.prev_disc
+        for d_val, lvl in zip(disc.tolist(), tot.tolist()):
+            if lvl < min_lvl:
+                if self.rx_mode == "HEADER" and len(self.header_chars) >= 24:
+                    al = self._finalize_header()
+                    if al is not None:
+                        new_alerts.append(al)
+                self.rx_mode = "SEARCH"
+                self.sync_locked = False
+                p_disc = d_val
+                continue
+
+            # Zero-crossing Gardner/early-late bit-clock PLL
+            if (p_disc < 0.0 <= d_val) or (p_disc >= 0.0 > d_val):
+                err = ph if ph < 0.5 else (ph - 1.0)
+                ph -= 0.22 * err
+                if ph < 0.0:
+                    ph += 1.0
+
+            prev_ph = ph
+            ph += step
+            # Sample bit at eye center (phase crossing 0.5)
+            if prev_ph < 0.5 <= ph:
+                bit = 1 if d_val >= 0.0 else 0
+                self.sync_reg = ((self.sync_reg >> 1) | (bit << 47)) & mask48
+
+                if self.rx_mode == "SEARCH":
+                    if self.sync_reg == self.SYNC_ZCZC:
+                        self.rx_mode = "HEADER"
+                        self.sync_locked = True
+                        self.bit_cnt = 0
+                        self.byte_acc = 0
+                        self.header_chars = []
+                        self.seen_plus = False
+                        self.dash_after_plus = 0
+                    elif self.sync_reg == self.SYNC_NNNN:
+                        self.eom_received = True
+                        self.sync_locked = True
+                else:
+                    self.byte_acc = (self.byte_acc >> 1) | (bit << 7)
+                    self.bit_cnt += 1
+                    if self.bit_cnt >= 8:
+                        self.bit_cnt = 0
+                        ch_code = self.byte_acc & 0x7F
+                        if 32 <= ch_code <= 126:
+                            ch = chr(ch_code)
+                            self.header_chars.append(ch)
+                            if ch == "+":
+                                self.seen_plus = True
+                                self.dash_after_plus = 0
+                            elif ch == "-" and self.seen_plus:
+                                self.dash_after_plus += 1
+                                if self.dash_after_plus >= 3:
+                                    al = self._finalize_header()
+                                    if al is not None:
+                                        new_alerts.append(al)
+                            if len(self.header_chars) >= 240:
+                                al = self._finalize_header()
+                                if al is not None:
+                                    new_alerts.append(al)
+                        else:
+                            al = self._finalize_header()
+                            if al is not None:
+                                new_alerts.append(al)
+
+            if ph >= 1.0:
+                ph -= 1.0
+            p_disc = d_val
+
+        self.phase = ph
+        self.prev_disc = p_disc
+        return new_alerts
+
+
+# ---------------------------------------------------------------------------
+# 4. HF WEFAX Decoder (IOC 576 / 120 LPM + Turbo 8x Mode + Slant & Phasing)
+# ---------------------------------------------------------------------------
+class WefaxDecoder:
+    WIDTH = 864
+    MAX_LINES = 560
+
+    def __init__(self, fs: float = DSP_RATE):
+        self.fs = fs
+        self.fm = AnalyticFmDiscriminator(fs, smooth_taps=7)
+        self.lpm = 120.0
+        self.slant_ppm = 0.0  # fine adjustment knob (-1.0 .. +1.0 -> +-800 ppm)
+        self.invert = False
+        self.canvas = np.full((self.MAX_LINES, self.WIDTH), 246, dtype=np.uint8)
+        self.reset()
+
+    def reset(self):
+        self.fm.reset()
+        self._lum_buf = np.zeros(0, dtype=np.float32)
+        self.line_idx = 0
+        self.lines_decoded = 0
+        self.phasing_locked = False
+        self.phase_attempts = 0
+        self.last_lum = 0.5
+        self.sync_locked = False
+        self.canvas.fill(246)
+
+    def request_rephase(self):
+        self.phasing_locked = False
+        self.phase_attempts = 0
+
+    def samples_per_line(self) -> float:
+        base = self.fs * (60.0 / self.lpm)
+        return base * (1.0 + self.slant_ppm * 8e-4)
+
+    def process(self, x: np.ndarray, squelch: float = 0.0) -> int:
+        f_inst, amp = self.fm.process(x)
+        if len(f_inst) == 0:
+            return 0
+        mean_amp = float(np.mean(amp))
+        if mean_amp < (0.004 + 0.06 * squelch):
+            self.sync_locked = False
+            return 0
+
+        self.sync_locked = True
+        lum = np.clip((f_inst - 1500.0) / 800.0, 0.0, 1.0)
+        self.last_lum = float(np.mean(lum))
+        self._lum_buf = np.concatenate((self._lum_buf, lum))
+
+        spl = self.samples_per_line()
+        need = int(round(spl))
+        new_rows = 0
+        x_grid = np.linspace(0.0, 1.0, self.WIDTH, endpoint=False, dtype=np.float32)
+
+        while len(self._lum_buf) >= need + 8:
+            # Check for WMO white-on-black phasing line (5% 2300 Hz white pulse, 95% 1500 Hz black)
+            if not self.phasing_locked and self.phase_attempts < 16 and len(self._lum_buf) >= int(1.5 * need):
+                seg = self._lum_buf[:need]
+                if float(np.mean(seg)) < 0.28 and float(np.max(seg)) > 0.72:
+                    # Find rising edge into the white phasing bar
+                    above = np.where(seg > 0.62)[0]
+                    if len(above) > 8:
+                        # Walk to start of white pulse if pulse wraps around boundary
+                        edge = int(above[0])
+                        if edge == 0:
+                            below = np.where(seg < 0.35)[0]
+                            if len(below) > 0:
+                                after_black = np.where(seg[below[0]:] > 0.62)[0]
+                                if len(after_black) > 0:
+                                    edge = int(below[0] + after_black[0])
+                        if edge > 2:
+                            self._lum_buf = self._lum_buf[edge:]
+                        self.phasing_locked = True
+                        if len(self._lum_buf) < need:
+                            break
+                self.phase_attempts += 1
+
+            line_seg = self._lum_buf[:need]
+            # Fractional line accumulator slice
+            self._lum_buf = self._lum_buf[need:]
+
+            src_x = np.linspace(0.0, 1.0, len(line_seg), endpoint=False, dtype=np.float32)
+            row_f = np.interp(x_grid, src_x, line_seg)
+            if self.invert:
+                row_f = 1.0 - row_f
+            row_u8 = np.clip(row_f * 255.0, 0.0, 255.0).astype(np.uint8)
+
+            if self.line_idx >= self.MAX_LINES:
+                self.canvas[:-1] = self.canvas[1:]
+                self.canvas[-1] = row_u8
+                self.line_idx = self.MAX_LINES - 1
+            else:
+                self.canvas[self.line_idx] = row_u8
+                self.line_idx += 1
+
+            self.lines_decoded += 1
+            new_rows += 1
+
+        return new_rows
+
+
+# ---------------------------------------------------------------------------
+# 5. SSTV Color Decoder (VIS Auto-Detect + Robot 36 & Martin M1)
+# ---------------------------------------------------------------------------
+class SstvDecoder:
+    WIDTH = 320
+    MAX_H = 256
+
+    def __init__(self, fs: float = DSP_RATE):
+        self.fs = fs
+        self.fm = AnalyticFmDiscriminator(fs, smooth_taps=5)
+        self.mode_name = "ROBOT 36"  # "ROBOT 36" | "MARTIN M1"
+        self.auto_vis = True
+        self.slant_ppm = 0.0
+        self.vis_code = -1
+        self.frame_rgb = np.zeros((self.MAX_H, self.WIDTH, 3), dtype=np.uint8)
+        self._y_even = np.full(self.WIDTH, 128.0, dtype=np.float32)
+        self._cr_last = np.zeros(self.WIDTH, dtype=np.float32)
+        self._cb_last = np.zeros(self.WIDTH, dtype=np.float32)
+        self.reset()
+
+    def reset(self):
+        self.fm.reset()
+        self._f_buf = np.zeros(0, dtype=np.float32)
+        self.rx_state = "SEARCH_VIS"  # SEARCH_VIS | ACTIVE_LINES
+        self.line_idx = 0
+        self.lines_decoded = 0
+        self.sync_locked = False
+        self.vis_code = -1
+        self._leader_ms = 0.0
+        self._vis_stage = 0
+        self._sync_Search_acc = 0
+        self.frame_rgb.fill(18)
+        self._cr_last.fill(0.0)
+        self._cb_last.fill(0.0)
+
+    def active_height(self) -> int:
+        return 256 if self.mode_name == "MARTIN M1" else 240
+
+    def samples_per_line(self) -> float:
+        base = 0.446446 * self.fs if self.mode_name == "MARTIN M1" else 0.150 * self.fs
+        return base * (1.0 + self.slant_ppm * 8e-4)
+
+    def _decode_robot36_line(self, seg: np.ndarray):
+        # Total 150.0 ms = 1800 samples @ 12 kHz:
+        # 0..9ms sync, 9..12ms porch, 12..100ms Y, 100..104.5ms sep, 104.5..106ms porch, 106..150ms R-Y/B-Y
+        n = len(seg)
+        i_y0 = int(round(0.012 * n / 0.150))
+        i_y1 = int(round(0.100 * n / 0.150))
+        i_s0 = i_y1
+        i_s1 = int(round(0.1045 * n / 0.150))
+        i_c0 = int(round(0.106 * n / 0.150))
+        i_c1 = n
+
+        xg = np.linspace(0.0, 1.0, self.WIDTH, endpoint=False, dtype=np.float32)
+        y_seg = np.clip((seg[i_y0:i_y1] - 1500.0) / 800.0, 0.0, 1.0) * 255.0
+        c_seg = np.clip((seg[i_c0:i_c1] - 1500.0) / 800.0, 0.0, 1.0) * 255.0 - 128.0
+
+        y_row = np.interp(xg, np.linspace(0.0, 1.0, max(2, len(y_seg)), endpoint=False), y_seg)
+        c_row = np.interp(xg, np.linspace(0.0, 1.0, max(2, len(c_seg)), endpoint=False), c_seg)
+
+        sep_freq = float(np.mean(seg[i_s0:max(i_s0 + 1, i_s1)]))
+        is_even = (sep_freq < 1900.0) if (1350.0 <= sep_freq <= 2450.0) else ((self.line_idx % 2) == 0)
+        if is_even:
+            self._cr_last = c_row.astype(np.float32)
+        else:
+            self._cb_last = c_row.astype(np.float32)
+
+        r = np.clip(y_row + 1.402 * self._cr_last, 0.0, 255.0).astype(np.uint8)
+        g = np.clip(y_row - 0.34414 * self._cb_last - 0.71414 * self._cr_last, 0.0, 255.0).astype(np.uint8)
+        b = np.clip(y_row + 1.772 * self._cb_last, 0.0, 255.0).astype(np.uint8)
+
+        row = min(239, self.line_idx)
+        self.frame_rgb[row, :, 0] = r
+        self.frame_rgb[row, :, 1] = g
+        self.frame_rgb[row, :, 2] = b
+
+    def _decode_martin_m1_line(self, seg: np.ndarray):
+        # 446.446 ms: 4.862ms sync, 0.572ms porch, 146.432ms G, 0.572ms sep, 146.432ms B, 0.572ms sep, 146.432ms R
+        n = len(seg)
+        tot_ms = 446.446
+        def idx_ms(ms: float) -> int:
+            return max(0, min(n, int(round(ms * n / tot_ms))))
+
+        g0, g1 = idx_ms(5.434), idx_ms(151.866)
+        b0, b1 = idx_ms(152.438), idx_ms(298.870)
+        r0, r1 = idx_ms(299.442), idx_ms(445.874)
+        xg = np.linspace(0.0, 1.0, self.WIDTH, endpoint=False, dtype=np.float32)
+
+        def resamp(s: np.ndarray) -> np.ndarray:
+            v = np.clip((s - 1500.0) / 800.0, 0.0, 1.0) * 255.0
+            return np.interp(xg, np.linspace(0.0, 1.0, max(2, len(v)), endpoint=False), v).astype(np.uint8)
+
+        row = min(255, self.line_idx)
+        self.frame_rgb[row, :, 0] = resamp(seg[r0:r1])
+        self.frame_rgb[row, :, 1] = resamp(seg[g0:g1])
+        self.frame_rgb[row, :, 2] = resamp(seg[b0:b1])
+
+    def _try_detect_vis_or_sync(self) -> bool:
+        """Scan _f_buf for VIS header (leader + break + leader + 10*30ms VIS bits) or raw 1200 Hz sync."""
+        bit_s = int(round(0.030 * self.fs))  # 360 samples
+        vis_total = 10 * bit_s  # start + 8 bits + stop = 3600 samples
+        lead_s = int(round(0.140 * self.fs))
+        brk_s = int(round(0.010 * self.fs))
+
+        # 1. Check for VIS header: ~140ms 1900Hz leader followed by 30ms 1200Hz VIS start bit
+        need_vis = lead_s + vis_total + 60
+        if self.auto_vis and len(self._f_buf) >= need_vis:
+            # Coarse step scan every 30 samples (2.5 ms)
+            buf = self._f_buf
+            limit = len(buf) - vis_total - 10
+            for pos in range(lead_s, limit, 24):
+                # Check preceding 100 ms is ~1900 Hz leader and [pos : pos+bit_s] is ~1200 Hz start bit
+                lead_mean = float(np.mean(buf[pos - int(0.09 * self.fs): pos - 12]))
+                start_mean = float(np.mean(buf[pos + 36: pos + bit_s - 36]))
+                stop_mean = float(np.mean(buf[pos + 9 * bit_s + 36: pos + 10 * bit_s - 36]))
+                if 1820.0 <= lead_mean <= 1980.0 and 1130.0 <= start_mean <= 1270.0 and 1130.0 <= stop_mean <= 1270.0:
+                    # Refine exact falling edge from 1900 Hz -> 1200 Hz around pos
+                    win0 = max(0, pos - 48)
+                    win1 = min(len(buf), pos + 48)
+                    below = np.where(buf[win0:win1] < 1550.0)[0]
+                    edge = (win0 + int(below[0])) if len(below) > 0 else pos
+
+                    if edge + vis_total <= len(buf):
+                        vis_byte = 0
+                        for b in range(8):
+                            c0 = edge + int((1.25 + b) * bit_s)
+                            c1 = edge + int((1.75 + b) * bit_s)
+                            bf = float(np.mean(buf[c0:c1]))
+                            # VIS: 1100 Hz = 1, 1300 Hz = 0
+                            if bf < 1205.0:
+                                vis_byte |= (1 << b)
+                        code7 = vis_byte & 0x7F
+                        if code7 in (0x08, 0x2C):
+                            self.vis_code = code7
+                            self.mode_name = "ROBOT 36" if code7 == 0x08 else "MARTIN M1"
+                            self._f_buf = buf[edge + vis_total:]
+                            self.rx_state = "ACTIVE_LINES"
+                            self.line_idx = 0
+                            self.sync_locked = True
+                            return True
+
+        # 2. Fallback mid-transmission horizontal sync lock (only if no VIS header arrived after full window)
+        spl = int(round(self.samples_per_line()))
+        sync_len = int(round(0.009 * self.fs)) if self.mode_name == "ROBOT 36" else int(round(0.0048 * self.fs))
+        fallback_min = max(need_vis + 2400, 2 * spl + 240) if self.auto_vis else (2 * spl + 240)
+        if len(self._f_buf) >= fallback_min:
+            buf = self._f_buf
+            # Don't trigger fallback if a 1900 Hz VIS leader is currently in progress at tail of buffer
+            tail_mean = float(np.mean(buf[-int(0.08 * self.fs):]))
+            if not (self.auto_vis and 1830.0 <= tail_mean <= 1970.0):
+                for pos in range(0, spl, 18):
+                    m1 = float(np.mean(buf[pos: pos + sync_len]))
+                    m2 = float(np.mean(buf[pos + spl: pos + spl + sync_len]))
+                    after1 = float(np.mean(buf[pos + sync_len + 12: pos + sync_len + 80]))
+                    if 1135.0 <= m1 <= 1265.0 and 1135.0 <= m2 <= 1265.0 and after1 > 1420.0:
+                        self._f_buf = buf[pos:]
+                        self.rx_state = "ACTIVE_LINES"
+                        self.line_idx = 0
+                        self.sync_locked = True
+                        return True
+
+            # Trim stale search buffer while preserving enough window for full VIS detection
+            keep_n = max(need_vis + 1200, 2 * spl)
+            if len(self._f_buf) > keep_n + 1200:
+                self._f_buf = self._f_buf[-keep_n:]
+        return False
+
+    def process(self, x: np.ndarray, squelch: float = 0.0) -> int:
+        f_inst, amp = self.fm.process(x)
+        if len(f_inst) == 0:
+            return 0
+        if float(np.mean(amp)) < (0.004 + 0.06 * squelch):
+            if self.rx_state == "ACTIVE_LINES" and self.line_idx >= self.active_height() - 2:
+                self.rx_state = "SEARCH_VIS"
+            self.sync_locked = False
+            return 0
+
+        self._f_buf = np.concatenate((self._f_buf, f_inst))
+        if self.rx_state == "SEARCH_VIS":
+            if not self._try_detect_vis_or_sync():
+                return 0
+
+        spl_f = self.samples_per_line()
+        spl = int(round(spl_f))
+        max_h = self.active_height()
+        decoded_now = 0
+
+        while self.rx_state == "ACTIVE_LINES" and len(self._f_buf) >= spl + 36:
+            # Fine horizontal sync-edge tracking within +-24 samples so lines stay razor-aligned
+            search_w = 24
+            if len(self._f_buf) >= spl + search_w:
+                win = self._f_buf[: 140]
+                sync_pts = np.where((win >= 1110.0) & (win <= 1290.0))[0]
+                if 0 < len(sync_pts) and int(sync_pts[0]) <= 20 and int(sync_pts[0]) > 2:
+                    self._f_buf = self._f_buf[int(sync_pts[0]):]
+                    if len(self._f_buf) < spl:
+                        break
+
+            seg = self._f_buf[:spl]
+            self._f_buf = self._f_buf[spl:]
+
+            if self.mode_name == "MARTIN M1":
+                self._decode_martin_m1_line(seg)
+            else:
+                self._decode_robot36_line(seg)
+
+            self.line_idx += 1
+            self.lines_decoded += 1
+            decoded_now += 1
+
+            if self.line_idx >= max_h:
+                self.rx_state = "SEARCH_VIS"
+                self.sync_locked = False
+                break
+
+        return decoded_now
+
+
+# ---------------------------------------------------------------------------
+# Built-In Authentic Signal Synthesizers (CW, RTTY, SAME, WEFAX Chart, SSTV Card)
+# ---------------------------------------------------------------------------
+def synthesize_cw_audio(
+    text: str, wpm: float = 20.0, pitch_hz: float = 700.0, fs: float = DSP_RATE, amp: float = 0.72
+) -> np.ndarray:
+    t_dit = 1.2 / max(5.0, min(45.0, wpm))
+    n_dit = max(24, int(round(t_dit * fs)))
+    n_ramp = max(8, min(n_dit // 3, int(round(0.0045 * fs))))
+    ramp_up = (np.sin(np.linspace(0.0, math.pi * 0.5, n_ramp, dtype=np.float32)) ** 2)
+    ramp_dn = ramp_up[::-1]
+
+    env_parts: list[np.ndarray] = [np.zeros(int(0.12 * fs), dtype=np.float32)]
+    words = text.upper().strip().split(" ")
+    for wi, word in enumerate(words):
+        chars = [c for c in word if c in CHAR_TO_MORSE]
+        for ci, ch in enumerate(chars):
+            pat = CHAR_TO_MORSE[ch]
+            for ei, sym in enumerate(pat):
+                plen = n_dit if sym == "." else 3 * n_dit
+                pulse = np.ones(plen, dtype=np.float32)
+                pulse[:n_ramp] *= ramp_up
+                pulse[-n_ramp:] *= ramp_dn
+                env_parts.append(pulse)
+                if ei + 1 < len(pat):
+                    env_parts.append(np.zeros(n_dit, dtype=np.float32))
+            if ci + 1 < len(chars):
+                env_parts.append(np.zeros(3 * n_dit, dtype=np.float32))
+        if wi + 1 < len(words):
+            env_parts.append(np.zeros(7 * n_dit, dtype=np.float32))
+
+    # Trailing silence so final character & word space flush cleanly
+    env_parts.append(np.zeros(8 * n_dit, dtype=np.float32))
+    env = np.concatenate(env_parts)
+    t = np.arange(len(env), dtype=np.float64) / fs
+    carrier = np.sin(2.0 * math.pi * pitch_hz * t).astype(np.float32)
+    return (amp * env * carrier).astype(np.float32)
+
+
+def encode_ita2_codes(text: str) -> list[int]:
+    codes: list[int] = [ITA2_CODE_LTRS, ITA2_CODE_LTRS]
+    figs = False
+    for ch in text.upper():
+        if ch == " ":
+            codes.append(0x04)
+            figs = False  # USOS friendly
+        elif ch == "\r":
+            codes.append(0x08)
+        elif ch == "\n":
+            codes.append(0x02)
+        elif ch in CHAR_TO_ITA2_LTRS:
+            if figs:
+                codes.append(ITA2_CODE_LTRS)
+                figs = False
+            codes.append(CHAR_TO_ITA2_LTRS[ch])
+        elif ch in CHAR_TO_ITA2_FIGS:
+            if not figs:
+                codes.append(ITA2_CODE_FIGS)
+                figs = True
+            codes.append(CHAR_TO_ITA2_FIGS[ch])
+    return codes
+
+
+def synthesize_rtty_audio(
+    text: str,
+    baud: float = 45.45,
+    mark_hz: float = 2125.0,
+    shift_hz: float = 170.0,
+    reverse: bool = False,
+    fs: float = DSP_RATE,
+    amp: float = 0.70,
+) -> np.ndarray:
+    f_one = (mark_hz + shift_hz) if reverse else mark_hz
+    f_zero = mark_hz if reverse else (mark_hz + shift_hz)
+    codes = encode_ita2_codes(text)
+
+    # Build timeline of (duration_seconds, freq_hz)
+    t_bit = 1.0 / baud
+    segs: list[tuple[float, float]] = [(0.28, f_one)]  # Mark lead-in carrier
+    for code in codes:
+        segs.append((t_bit, f_zero))  # Start bit (0 = Space)
+        for b in range(5):
+            bit = (code >> b) & 1
+            segs.append((t_bit, f_one if bit else f_zero))
+        segs.append((1.5 * t_bit, f_one))  # 1.5 Stop bits (1 = Mark)
+    segs.append((0.22, f_one))
+
+    total_samples = int(round(sum(d for d, _ in segs) * fs))
+    freqs = np.empty(total_samples, dtype=np.float64)
+    acc_t = 0.0
+    prev_idx = 0
+    for dur, f_hz in segs:
+        acc_t += dur
+        nxt_idx = min(total_samples, int(round(acc_t * fs)))
+        freqs[prev_idx:nxt_idx] = f_hz
+        prev_idx = nxt_idx
+    if prev_idx < total_samples:
+        freqs[prev_idx:] = f_one
+
+    phase = np.cumsum(2.0 * math.pi * freqs / fs)
+    return (amp * np.sin(phase)).astype(np.float32)
+
+
+def synthesize_same_audio(
+    header_str: str, include_attn_and_eom: bool = True, bursts: int = 2, fs: float = DSP_RATE, amp: float = 0.72
+) -> np.ndarray:
+    baud = SameEasDecoder.BAUD
+    f_mark = SameEasDecoder.MARK_HZ
+    f_space = SameEasDecoder.SPACE_HZ
+
+    def afsk_bytes(raw_bytes: bytes) -> np.ndarray:
+        bits: list[int] = []
+        for b in raw_bytes:
+            for i in range(8):
+                bits.append((b >> i) & 1)
+        total_n = int(round(len(bits) * fs / baud))
+        freqs = np.empty(total_n, dtype=np.float64)
+        for bi, bit in enumerate(bits):
+            i0 = int(round(bi * fs / baud))
+            i1 = min(total_n, int(round((bi + 1) * fs / baud)))
+            freqs[i0:i1] = f_mark if bit else f_space
+        ph = np.cumsum(2.0 * math.pi * freqs / fs)
+        return (amp * np.sin(ph)).astype(np.float32)
+
+    preamble = bytes([0xAB] * 16)
+    hdr_payload = preamble + header_str.strip().encode("ascii", errors="ignore")
+    eom_payload = preamble + b"NNNN"
+    gap_short = np.zeros(int(0.28 * fs), dtype=np.float32)
+
+    parts: list[np.ndarray] = [np.zeros(int(0.08 * fs), dtype=np.float32)]
+    for b_idx in range(max(1, bursts)):
+        parts.append(afsk_bytes(hdr_payload))
+        if b_idx + 1 < bursts:
+            parts.append(gap_short)
+
+    if include_attn_and_eom:
+        parts.append(gap_short)
+        # Brief 0.65s dual-tone 853 + 960 Hz EAS/NWR attention signal
+        t_att = np.arange(int(0.65 * fs), dtype=np.float64) / fs
+        attn = (0.38 * (np.sin(2.0 * math.pi * 853.0 * t_att) + np.sin(2.0 * math.pi * 960.0 * t_att))).astype(
+            np.float32
+        )
+        parts.append(attn)
+        parts.append(gap_short)
+        parts.append(afsk_bytes(eom_payload))
+
+    parts.append(np.zeros(int(0.12 * fs), dtype=np.float32))
+    return np.concatenate(parts)
+
+
+def build_wefax_weather_chart(width: int = 864, height: int = 380) -> np.ndarray:
+    """Synthesize a crisp monochrome NOAA/USCG NMC Pt. Reyes Surface Isobaric Analysis chart."""
+    img = Image.new("L", (width, height), 252)
+    d = ImageDraw.Draw(img)
+    try:
+        f_hdr = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 14)
+        f_med = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 12)
+        f_big = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 28)
+        f_sm = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 10)
+    except Exception:
+        f_hdr = f_med = f_big = f_sm = ImageFont.load_default()
+
+    # Outer double meteorological chart border
+    d.rectangle([8, 8, width - 9, height - 9], outline=0, width=3)
+    d.rectangle([13, 13, width - 14, height - 14], outline=0, width=1)
+
+    # Top Title Banner
+    d.rectangle([13, 13, width - 14, 58], fill=242, outline=0, width=2)
+    d.text((24, 18), "NOAA / NWS OCEAN PREDICTION CENTER — NE PACIFIC SURFACE ANALYSIS", fill=0, font=f_hdr)
+    d.text(
+        (24, 37),
+        "XMIT: USCG NMC PT REYES CA  8682 / 12786 kHz USB   IOC 576  120 LPM   DE W1AW",
+        fill=20,
+        font=f_sm,
+    )
+
+    mx0, my0, mx1, my1 = 18, 62, width - 19, height - 18
+
+    # Latitude / Longitude dashed graticule
+    for gx in range(mx0 + 90, mx1, 120):
+        for yy in range(my0, my1, 10):
+            d.line([(gx, yy), (gx, min(my1, yy + 5))], fill=120, width=1)
+        lon_deg = 170 - ((gx - mx0) // 120) * 10
+        d.text((gx - 18, my1 - 14), f"{lon_deg}W", fill=60, font=f_sm)
+
+    for gy in range(my0 + 55, my1 - 20, 65):
+        for xx in range(mx0, mx1, 10):
+            d.line([(xx, gy), (min(mx1, xx + 5), gy)], fill=120, width=1)
+        lat_deg = 55 - ((gy - my0) // 65) * 10
+        d.text((mx0 + 6, gy - 12), f"{lat_deg}N", fill=60, font=f_sm)
+
+    # Stylized Alaska / BC / Washington / Oregon / California coastline
+    coast = [
+        (mx0 + 380, my0 + 8), (mx0 + 455, my0 + 18), (mx0 + 530, my0 + 34),
+        (mx0 + 605, my0 + 62), (mx0 + 648, my0 + 108), (mx0 + 662, my0 + 158),
+        (mx0 + 675, my0 + 215), (mx0 + 706, my0 + 272), (mx0 + 748, my1 - 8),
+    ]
+    d.line(coast, fill=0, width=3)
+    d.text((mx0 + 695, my0 + 95), "PAC NW", fill=0, font=f_med)
+    d.text((mx0 + 725, my0 + 225), "CALIF", fill=0, font=f_med)
+
+    # Concentric Gulf of Alaska GALE LOW (984 mb) Isobars
+    lx, ly = mx0 + 255, my0 + 115
+    for idx_r, (rx, ry, mb) in enumerate([
+        (55, 38, "988"), (105, 72, "996"), (160, 108, "1004"), (220, 145, "1012")
+    ]):
+        d.ellipse([lx - rx, ly - ry, lx + rx, ly + ry], outline=0, width=2)
+        d.rectangle([lx + rx - 22, ly - 8, lx + rx + 18, ly + 8], fill=252)
+        d.text((lx + rx - 18, ly - 7), mb, fill=0, font=f_sm)
+
+    d.text((lx - 10, ly - 22), "L", fill=0, font=f_big)
+    d.text((lx - 24, ly + 8), "984 mb", fill=0, font=f_med)
+    d.text((lx - 32, ly + 23), "GALE", fill=0, font=f_sm)
+
+    # Cold Front sweeping SW from the Low with frontal barbs
+    cf_pts = [(lx + 6, ly + 22), (lx + 52, ly + 82), (lx + 72, ly + 146), (lx + 58, ly + 212)]
+    d.line(cf_pts, fill=0, width=3)
+    for k in range(len(cf_pts) - 1):
+        x0, y0 = cf_pts[k]
+        x1, y1 = cf_pts[k + 1]
+        mx, my = (x0 + x1) * 0.5, (y0 + y1) * 0.5
+        d.polygon([(mx, my - 6), (mx + 12, my + 2), (mx - 2, my + 8)], fill=0)
+
+    # Subtropical HIGH (1028 mb) in lower-right offshore waters
+    hx, hy = mx0 + 535, my0 + 218
+    for rx, ry, mb in [(62, 44, "1028"), (118, 82, "1020")]:
+        d.ellipse([hx - rx, hy - ry, hx + rx, hy + ry], outline=0, width=2)
+        d.rectangle([hx - rx - 16, hy - 8, hx - rx + 22, hy + 8], fill=252)
+        d.text((hx - rx - 14, hy - 7), mb, fill=0, font=f_sm)
+
+    d.text((hx - 10, hy - 22), "H", fill=0, font=f_big)
+    d.text((hx - 26, hy + 8), "1030 mb", fill=0, font=f_med)
+
+    return np.array(img, dtype=np.uint8)
+
+
+def synthesize_wefax_audio(
+    chart_u8: np.ndarray, lpm: float = 120.0, phasing_lines: int = 3, fs: float = DSP_RATE, amp: float = 0.72
+) -> np.ndarray:
+    """Synthesize WMO IOC-576 FM WEFAX audio (1500 Hz black .. 2300 Hz white + 5% white phasing lines)."""
+    spl = int(round(fs * (60.0 / lpm)))
+    h, w = chart_u8.shape
+    x_dst = np.linspace(0.0, 1.0, spl, endpoint=False, dtype=np.float32)
+    x_src = np.linspace(0.0, 1.0, w, endpoint=False, dtype=np.float32)
+
+    freq_rows: list[np.ndarray] = []
+    # Phasing lines: 5% white (2300 Hz) at column 0, 95% black (1500 Hz)
+    white_n = max(8, int(round(0.05 * spl)))
+    ph_line = np.full(spl, 1500.0, dtype=np.float64)
+    ph_line[:white_n] = 2300.0
+    for _ in range(max(1, phasing_lines)):
+        freq_rows.append(ph_line)
+
+    for r in range(h):
+        lum = chart_u8[r].astype(np.float32) / 255.0
+        lum_line = np.interp(x_dst, x_src, lum)
+        freq_rows.append((1500.0 + 800.0 * lum_line).astype(np.float64))
+
+    freqs = np.concatenate(freq_rows)
+    phase = np.cumsum(2.0 * math.pi * freqs / fs)
+    return (amp * np.sin(phase)).astype(np.float32)
+
+
+def build_sstv_test_card(
+    width: int = 320, height: int = 240, callsign: str = "W1AW", grid: str = "FN31pr"
+) -> np.ndarray:
+    """Build a crisp vintage color SSTV Test Card (SMPTE bars + bullseye + station callsign + grayscale)."""
+    img = Image.new("RGB", (width, height), (20, 24, 34))
+    d = ImageDraw.Draw(img)
+    try:
+        f_call = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 28)
+        f_sub = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 13)
+        f_tiny = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 11)
+    except Exception:
+        f_call = f_sub = f_tiny = ImageFont.load_default()
+
+    # Top SMPTE Color Bars
+    bars = [
+        (235, 235, 235),
+        (235, 225, 28),
+        (28, 225, 230),
+        (32, 215, 56),
+        (225, 42, 215),
+        (228, 36, 36),
+        (32, 58, 232),
+    ]
+    bh = int(height * 0.62)
+    for i, col in enumerate(bars):
+        x0 = int(round(i * width / len(bars)))
+        x1 = int(round((i + 1) * width / len(bars)))
+        d.rectangle([x0, 0, x1, bh], fill=col)
+
+    # Mid dark slate identification band
+    gy0 = int(height * 0.84)
+    d.rectangle([0, bh, width, gy0], fill=(22, 28, 42))
+
+    # Bottom 8-step luminance wedge
+    for i in range(8):
+        x0 = int(round(i * width / 8))
+        x1 = int(round((i + 1) * width / 8))
+        v = int(round(i * 255 / 7))
+        d.rectangle([x0, gy0, x1, height], fill=(v, v, v))
+
+    # Center circular station reticle & callsign plaque
+    cx, cy = width // 2, int(height * 0.44)
+    d.ellipse([cx - 66, cy - 66, cx + 66, cy + 66], fill=(18, 24, 34), outline=(245, 248, 255), width=3)
+    d.ellipse([cx - 56, cy - 56, cx + 56, cy + 56], outline=(72, 245, 198), width=2)
+
+    d.rectangle([28, cy - 24, width - 28, cy + 26], fill=(16, 22, 32), outline=(255, 186, 62), width=2)
+    d.text((cx - 54, cy - 18), callsign, fill=(96, 255, 216), font=f_call)
+    d.text((cx - 46, cy + 10), f"GRID {grid}", fill=(255, 206, 86), font=f_tiny)
+
+    d.text((14, bh + 10), f"DE {callsign} • CDE dtDecoder SSTV", fill=(242, 246, 255), font=f_sub)
+    d.text((14, bh + 30), "14.230 MHz USB • COLOR TEST CARD", fill=(104, 242, 196), font=f_tiny)
+    d.rectangle([1, 1, width - 2, height - 2], outline=(240, 244, 252), width=2)
+
+    return np.array(img, dtype=np.uint8)
+
+
+def _append_sstv_vis_header(segs: list[tuple[float, float]], vis_code7: int):
+    # Standard SSTV VIS header: 300ms 1900, 10ms 1200, 300ms 1900, 30ms 1200 start, 8x30ms bits, 30ms 1200 stop
+    segs.append((0.300, 1900.0))
+    segs.append((0.010, 1200.0))
+    segs.append((0.300, 1900.0))
+    segs.append((0.030, 1200.0))
+    ones = bin(vis_code7 & 0x7F).count("1")
+    vis_byte = (vis_code7 & 0x7F) | ((ones & 1) << 7)  # Even parity
+    for b in range(8):
+        bit = (vis_byte >> b) & 1
+        segs.append((0.030, 1100.0 if bit else 1300.0))
+    segs.append((0.030, 1200.0))
+
+
+def synthesize_sstv_robot36(
+    rgb_u8: np.ndarray, max_lines: int | None = None, fs: float = DSP_RATE, amp: float = 0.72
+) -> np.ndarray:
+    """Synthesize VIS 0x08 + Robot 36 color scanlines (150.0 ms / 1800 samples exact per line @ 12 kHz)."""
+    h, w, _ = rgb_u8.shape
+    n_lines = min(h, 240 if max_lines is None else max_lines)
+
+    # Pre-render VIS header
+    vis_segs: list[tuple[float, float]] = [(0.050, 1900.0)]
+    _append_sstv_vis_header(vis_segs, 0x08)
+    vis_n = int(round(sum(d for d, _ in vis_segs) * fs))
+    vis_f = np.empty(vis_n, dtype=np.float64)
+    acc = 0.0
+    p0 = 0
+    for dur, f_hz in vis_segs:
+        acc += dur
+        p1 = min(vis_n, int(round(acc * fs)))
+        vis_f[p0:p1] = f_hz
+        p0 = p1
+
+    spl = int(round(0.150 * fs))  # 1800 samples
+    n_sync = int(round(0.009 * fs))   # 108
+    n_porch = int(round(0.003 * fs))  # 36
+    n_y = int(round(0.088 * fs))      # 1056
+    n_sep = int(round(0.0045 * fs))   # 54
+    n_cpor = int(round(0.0015 * fs))  # 18
+    n_c = spl - (n_sync + n_porch + n_y + n_sep + n_cpor)  # 528
+
+    x_src = np.linspace(0.0, 1.0, w, endpoint=False, dtype=np.float32)
+    xy_dst = np.linspace(0.0, 1.0, n_y, endpoint=False, dtype=np.float32)
+    xc_dst = np.linspace(0.0, 1.0, n_c, endpoint=False, dtype=np.float32)
+
+    lines_f = np.empty((n_lines, spl), dtype=np.float64)
+    for row in range(n_lines):
+        r = rgb_u8[row, :, 0].astype(np.float32)
+        g = rgb_u8[row, :, 1].astype(np.float32)
+        b = rgb_u8[row, :, 2].astype(np.float32)
+        y_val = np.clip((0.299 * r + 0.587 * g + 0.114 * b) / 255.0, 0.0, 1.0)
+        if (row % 2) == 0:
+            c_val = np.clip((128.0 + 0.713 * (r - y_val * 255.0)) / 255.0, 0.0, 1.0)
+            sep_hz = 1500.0
+        else:
+            c_val = np.clip((128.0 + 0.564 * (b - y_val * 255.0)) / 255.0, 0.0, 1.0)
+            sep_hz = 2300.0
+
+        lf = lines_f[row]
+        idx = 0
+        lf[idx: idx + n_sync] = 1200.0
+        idx += n_sync
+        lf[idx: idx + n_porch] = 1500.0
+        idx += n_porch
+        lf[idx: idx + n_y] = 1500.0 + 800.0 * np.interp(xy_dst, x_src, y_val)
+        idx += n_y
+        lf[idx: idx + n_sep] = sep_hz
+        idx += n_sep
+        lf[idx: idx + n_cpor] = 1900.0
+        idx += n_cpor
+        lf[idx: idx + n_c] = 1500.0 + 800.0 * np.interp(xc_dst, x_src, c_val)
+
+    all_f = np.concatenate((vis_f, lines_f.ravel(), np.full(int(0.08 * fs), 1900.0, dtype=np.float64)))
+    phase = np.cumsum(2.0 * math.pi * all_f / fs)
+    return (amp * np.sin(phase)).astype(np.float32)
+
+
+def synthesize_sstv_martin_m1(
+    rgb_u8: np.ndarray, max_lines: int | None = None, fs: float = DSP_RATE, amp: float = 0.72
+) -> np.ndarray:
+    """Synthesize VIS 0x2C + Martin M1 color scanlines (320x256 G-B-R)."""
+    h, w, _ = rgb_u8.shape
+    n_lines = min(h, 256 if max_lines is None else max_lines)
+
+    vis_segs: list[tuple[float, float]] = [(0.050, 1900.0)]
+    _append_sstv_vis_header(vis_segs, 0x2C)
+    vis_n = int(round(sum(d for d, _ in vis_segs) * fs))
+    vis_f = np.empty(vis_n, dtype=np.float64)
+    acc = 0.0
+    p0 = 0
+    for dur, f_hz in vis_segs:
+        acc += dur
+        p1 = min(vis_n, int(round(acc * fs)))
+        vis_f[p0:p1] = f_hz
+        p0 = p1
+
+    spl_f = 0.446446 * fs
+    x_src = np.linspace(0.0, 1.0, w, endpoint=False, dtype=np.float32)
+    row_arrays: list[np.ndarray] = [vis_f]
+
+    sample_carry = 0.0
+    for row in range(n_lines):
+        target = spl_f + sample_carry
+        spl = int(round(target))
+        sample_carry = target - spl
+
+        def n_ms(ms: float) -> int:
+            return max(1, int(round(ms * spl / 446.446)))
+
+        nsync = n_ms(4.862)
+        nsep = n_ms(0.572)
+        nch = max(16, (spl - nsync - 4 * nsep) // 3)
+        xc = np.linspace(0.0, 1.0, nch, endpoint=False, dtype=np.float32)
+
+        g = np.interp(xc, x_src, rgb_u8[row, :, 1].astype(np.float32) / 255.0)
+        b = np.interp(xc, x_src, rgb_u8[row, :, 2].astype(np.float32) / 255.0)
+        r = np.interp(xc, x_src, rgb_u8[row, :, 0].astype(np.float32) / 255.0)
+
+        lf = np.full(spl, 1500.0, dtype=np.float64)
+        p = nsync + nsep
+        lf[:nsync] = 1200.0
+        lf[p: p + nch] = 1500.0 + 800.0 * g
+        p += nch + nsep
+        lf[p: p + nch] = 1500.0 + 800.0 * b
+        p += nch + nsep
+        end_r = min(spl, p + nch)
+        lf[p:end_r] = 1500.0 + 800.0 * r[: end_r - p]
+        row_arrays.append(lf)
+
+    row_arrays.append(np.full(int(0.08 * fs), 1900.0, dtype=np.float64))
+    all_f = np.concatenate(row_arrays)
+    phase = np.cumsum(2.0 * math.pi * all_f / fs)
+    return (amp * np.sin(phase)).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Live Audio Input Router (PulseAudio .monitor, Mic, WAV File, Test Transmitter)
+# ---------------------------------------------------------------------------
+def discover_pulse_sources() -> tuple[str | None, str | None]:
+    """Discover default PulseAudio/PipeWire .monitor source (dtRadio output!) and mic via pactl."""
+    monitor_src = None
+    mic_src = None
+    try:
+        sink = subprocess.check_output(
+            ["pactl", "get-default-sink"], text=True, stderr=subprocess.DEVNULL, timeout=1.2
+        ).strip()
+        if sink:
+            monitor_src = f"{sink}.monitor"
+    except Exception:
+        pass
+
+    try:
+        src_out = subprocess.check_output(
+            ["pactl", "list", "short", "sources"], text=True, stderr=subprocess.DEVNULL, timeout=1.2
+        )
+        monitors = []
+        mics = []
+        for ln in src_out.splitlines():
+            parts = ln.split()
+            if len(parts) >= 2:
+                name = parts[1]
+                if name.endswith(".monitor"):
+                    monitors.append(name)
+                else:
+                    mics.append(name)
+        if monitor_src and monitors and monitor_src not in monitors:
+            monitor_src = monitors[0]
+        elif not monitor_src and monitors:
+            monitor_src = monitors[0]
+        if mics:
+            mic_src = mics[0]
+    except Exception:
+        pass
+
+    try:
+        def_src = subprocess.check_output(
+            ["pactl", "get-default-source"], text=True, stderr=subprocess.DEVNULL, timeout=1.2
+        ).strip()
+        if def_src and not def_src.endswith(".monitor"):
+            mic_src = def_src
+    except Exception:
+        pass
+
+    return monitor_src, mic_src
+
+
+def load_wav_mono_12k(path: Path) -> np.ndarray:
+    """Load any PCM WAV file (8/16/24/32-bit, mono/stereo, arbitrary rate) into float32 @ 12000 Hz."""
+    with wave.open(str(path), "rb") as wf:
+        nch = wf.getnchannels()
+        sw = wf.getsampwidth()
+        sr = wf.getframerate()
+        nframes = wf.getnframes()
+        raw = wf.readframes(nframes)
+
+    if sw == 1:
+        x = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    elif sw == 2:
+        x = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sw == 3:
+        b = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
+        signed = (
+            b[:, 0].astype(np.int32)
+            | (b[:, 1].astype(np.int32) << 8)
+            | (b[:, 2].astype(np.int8).astype(np.int32) << 16)
+        )
+        x = signed.astype(np.float32) / 8388608.0
+    elif sw == 4:
+        x = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+    else:
+        raise ValueError(f"Unsupported WAV sample width: {sw} bytes")
+
+    if nch > 1:
+        x = x[: (len(x) // nch) * nch].reshape(-1, nch).mean(axis=1)
+
+    if sr != DSP_RATE and len(x) > 1:
+        out_len = max(1, int(round(len(x) * DSP_RATE / float(sr))))
+        t_old = np.linspace(0.0, 1.0, len(x), endpoint=False, dtype=np.float64)
+        t_new = np.linspace(0.0, 1.0, out_len, endpoint=False, dtype=np.float64)
+        x = np.interp(t_new, t_old, x).astype(np.float32)
+    return x.astype(np.float32)
+
+
+class DecoderAudioRouter:
+    """Routes live PulseAudio .monitor, Mic, WAV playback, or Test Signal TX into DSP queue & speaker."""
+
+    def __init__(self, on_status_cb=None):
+        self.on_status_cb = on_status_cb
+        self.rx_queue: queue.Queue[tuple[str, np.ndarray]] = queue.Queue(maxsize=240)
+
+        self.input_source = "monitor"  # "monitor" | "mic" | "wav" | "test"
+        self.input_gain = 1.0
+        self.mon_speaker = True
+        self.mon_volume = 0.55
+
+        self.monitor_dev, self.mic_dev = discover_pulse_sources()
+        self.active_dev_label = "STANDBY"
+
+        # Playback buffer state (used for WAV aircheck & built-in Test Signal Transmitter)
+        self._pb_lock = threading.Lock()
+        self._tx_buf: np.ndarray | None = None
+        self._tx_pos = 0
+        self._tx_label = ""
+        self._wav_buf: np.ndarray | None = None
+        self._wav_pos = 0
+        self._wav_paused = False
+        self.wav_name = ""
+
+        self._cap_pipe = None
+        self._out_pipe = None
+        self._out_appsrc = None
+        self._stop_evt = threading.Event()
+        self._feeder_thread = None
+
+    def _emit_status(self, msg: str):
+        if self.on_status_cb:
+            GLib.idle_add(self.on_status_cb, msg)
+
+    def start(self, headless: bool = False):
+        self._stop_evt.clear()
+        if not headless:
+            self.set_input_source(self.input_source)
+            self._ensure_speaker_pipeline()
+            self._feeder_thread = threading.Thread(target=self._feeder_loop, daemon=True)
+            self._feeder_thread.start()
+
+    def stop(self):
+        self._stop_evt.set()
+        if self._feeder_thread and self._feeder_thread.is_alive():
+            self._feeder_thread.join(timeout=0.8)
+        self._feeder_thread = None
+        self._stop_capture_pipeline()
+        self._stop_speaker_pipeline()
+
+    def is_transmitting_test(self) -> bool:
+        with self._pb_lock:
+            return self._tx_buf is not None and self._tx_pos < len(self._tx_buf)
+
+    def start_test_tx(self, samples: np.ndarray, label: str):
+        with self._pb_lock:
+            self._tx_buf = samples.astype(np.float32)
+            self._tx_pos = 0
+            self._tx_label = label
+        self._emit_status(f"TX TEST SIGNAL: {label} ({len(samples)/DSP_RATE:.1f}s @ 12.0 kHz)")
+
+    def stop_test_tx(self):
+        with self._pb_lock:
+            self._tx_buf = None
+            self._tx_pos = 0
+        self._emit_status(f"TX STOPPED — LISTENING ON {self.active_dev_label}")
+
+    def load_wav_file(self, path: Path) -> bool:
+        try:
+            pcm = load_wav_mono_12k(path)
+        except Exception as exc:
+            self._emit_status(f"WAV LOAD ERROR: {exc}")
+            return False
+        with self._pb_lock:
+            self._wav_buf = pcm
+            self._wav_pos = 0
+            self._wav_paused = False
+            self.wav_name = path.name
+        self.set_input_source("wav")
+        self._emit_status(f"WAV AIRCHECK: {path.name} ({len(pcm)/DSP_RATE:.1f}s @ 12.0 kHz)")
+        return True
+
+    def toggle_wav_pause(self) -> bool:
+        with self._pb_lock:
+            self._wav_paused = not self._wav_paused
+            return self._wav_paused
+
+    def rewind_wav(self):
+        with self._pb_lock:
+            self._wav_pos = 0
+            self._wav_paused = False
+
+    def _stop_capture_pipeline(self):
+        if self._cap_pipe is not None:
+            try:
+                self._cap_pipe.set_state(Gst.State.NULL)
+            except Exception:
+                pass
+            self._cap_pipe = None
+
+    def set_input_source(self, src_kind: str):
+        self.input_source = src_kind
+        self._stop_capture_pipeline()
+
+        if src_kind == "test":
+            self.active_dev_label = "BUILT-IN TEST LOOPBACK"
+            self._emit_status("INPUT: BUILT-IN TEST SIGNAL LOOPBACK (12.0 kHz)")
+            return
+        if src_kind == "wav":
+            lbl = f"WAV ({self.wav_name})" if self.wav_name else "WAV PLAYER"
+            self.active_dev_label = lbl
+            self._emit_status(f"INPUT: {lbl} @ 12.0 kHz")
+            return
+
+        self.monitor_dev, self.mic_dev = discover_pulse_sources()
+        pipe = Gst.Pipeline.new("dtdecoder_capture")
+        src = None
+        dev_desc = "DEFAULT AUDIO"
+
+        if src_kind == "monitor":
+            if self.monitor_dev and Gst.ElementFactory.find("pulsesrc"):
+                src = Gst.ElementFactory.make("pulsesrc", "cap_src")
+                src.set_property("device", self.monitor_dev)
+                dev_desc = self.monitor_dev
+            elif Gst.ElementFactory.find("pulsesrc"):
+                src = Gst.ElementFactory.make("pulsesrc", "cap_src")
+                dev_desc = "pulsesrc (default)"
+            else:
+                src = Gst.ElementFactory.make("autoaudiosrc", "cap_src")
+                dev_desc = "autoaudiosrc"
+        else:
+            if self.mic_dev and Gst.ElementFactory.find("pulsesrc"):
+                src = Gst.ElementFactory.make("pulsesrc", "cap_src")
+                src.set_property("device", self.mic_dev)
+                dev_desc = self.mic_dev
+            elif Gst.ElementFactory.find("pulsesrc"):
+                src = Gst.ElementFactory.make("pulsesrc", "cap_src")
+                dev_desc = "pulsesrc (mic)"
+            else:
+                src = Gst.ElementFactory.make("autoaudiosrc", "cap_src")
+                dev_desc = "autoaudiosrc (mic)"
+
+        q = Gst.ElementFactory.make("queue", None)
+        q.set_property("max-size-buffers", 10)
+        q.set_property("leaky", 2)
+        conv = Gst.ElementFactory.make("audioconvert", None)
+        res = Gst.ElementFactory.make("audioresample", None)
+        capsf = Gst.ElementFactory.make("capsfilter", None)
+        capsf.set_property(
+            "caps",
+            Gst.Caps.from_string(f"audio/x-raw,format=S16LE,layout=interleaved,rate={DSP_RATE},channels=1"),
+        )
+        appsink = Gst.ElementFactory.make("appsink", "cap_sink")
+        appsink.set_property("emit-signals", True)
+        appsink.set_property("sync", False)
+        appsink.set_property("drop", True)
+        appsink.set_property("max-buffers", 12)
+        appsink.connect("new-sample", self._on_capture_sample)
+
+        if not all((pipe, src, q, conv, res, capsf, appsink)):
+            self.active_dev_label = "LOOPBACK STANDBY"
+            self._emit_status("AUDIO CAPTURE UNAVAILABLE — TEST TRANSMITTER READY")
+            return
+
+        for el in (src, q, conv, res, capsf, appsink):
+            pipe.add(el)
+        src.link(q)
+        q.link(conv)
+        conv.link(res)
+        res.link(capsf)
+        capsf.link(appsink)
+
+        bus = pipe.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self._on_cap_error)
+
+        ret = pipe.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            pipe.set_state(Gst.State.NULL)
+            self.active_dev_label = "LOOPBACK STANDBY"
+            self._emit_status(f"CAPTURE STANDBY ({dev_desc}) — TEST TRANSMITTER READY")
+        else:
+            self._cap_pipe = pipe
+            self.active_dev_label = dev_desc
+            kind_lbl = "DESKTOP MONITOR (dtRadio)" if src_kind == "monitor" else "MIC / LINE-IN"
+            self._emit_status(f"{kind_lbl}: {dev_desc} @ 12.0 kHz S16LE")
+
+    def _on_cap_error(self, _bus, msg):
+        err, _dbg = msg.parse_error()
+        self._stop_capture_pipeline()
+        self.active_dev_label = "LOOPBACK STANDBY"
+        self._emit_status(f"CAPTURE STANDBY ({err.message[:38]}) — TEST TX READY")
+
+    def _on_capture_sample(self, appsink):
+        sample = appsink.emit("pull-sample")
+        if not sample:
+            return Gst.FlowReturn.OK
+        # While Test Signal Transmitter is actively injecting a burst, mute external capture
+        if self.is_transmitting_test() or self.input_source not in ("monitor", "mic"):
+            return Gst.FlowReturn.OK
+        buf = sample.get_buffer()
+        ok, mapinfo = buf.map(Gst.MapFlags.READ)
+        if ok:
+            try:
+                pcm = np.frombuffer(mapinfo.data, dtype=np.int16).astype(np.float32) * (1.0 / 32768.0)
+                if len(pcm) > 0:
+                    self._enqueue_chunk("ext", pcm)
+                    # Only monitor Mic to speakers if enabled (never monitor .monitor to avoid feedback!)
+                    if self.mon_speaker and self.input_source == "mic":
+                        self._push_speaker(pcm)
+            finally:
+                buf.unmap(mapinfo)
+        return Gst.FlowReturn.OK
+
+    def _enqueue_chunk(self, origin: str, pcm: np.ndarray):
+        scaled = np.clip(pcm * float(self.input_gain), -1.0, 1.0).astype(np.float32)
+        try:
+            self.rx_queue.put_nowait((origin, scaled))
+        except queue.Full:
+            try:
+                self.rx_queue.get_nowait()
+                self.rx_queue.put_nowait((origin, scaled))
+            except Exception:
+                pass
+
+    def _ensure_speaker_pipeline(self):
+        if self._out_pipe is not None:
+            return
+        pipe = Gst.Pipeline.new("dtdecoder_spk")
+        appsrc = Gst.ElementFactory.make("appsrc", "spk_src")
+        appsrc.set_property("is-live", True)
+        appsrc.set_property("block", False)
+        appsrc.set_property("format", Gst.Format.TIME)
+        appsrc.set_property(
+            "caps",
+            Gst.Caps.from_string(f"audio/x-raw,format=S16LE,layout=interleaved,rate={DSP_RATE},channels=1"),
+        )
+        q = Gst.ElementFactory.make("queue", None)
+        q.set_property("max-size-buffers", 8)
+        q.set_property("leaky", 2)
+        conv = Gst.ElementFactory.make("audioconvert", None)
+        res = Gst.ElementFactory.make("audioresample", None)
+        sink = Gst.ElementFactory.make("autoaudiosink", None)
+        if sink:
+            try:
+                sink.set_property("sync", False)
+            except Exception:
+                pass
+        if not all((pipe, appsrc, q, conv, res, sink)):
+            return
+        for el in (appsrc, q, conv, res, sink):
+            pipe.add(el)
+        appsrc.link(q)
+        q.link(conv)
+        conv.link(res)
+        res.link(sink)
+        if pipe.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            pipe.set_state(Gst.State.NULL)
+        else:
+            self._out_pipe = pipe
+            self._out_appsrc = appsrc
+
+    def _stop_speaker_pipeline(self):
+        if self._out_pipe is not None:
+            try:
+                self._out_pipe.set_state(Gst.State.NULL)
+            except Exception:
+                pass
+            self._out_pipe = None
+            self._out_appsrc = None
+
+    def _push_speaker(self, pcm: np.ndarray):
+        if not self.mon_speaker or self._out_appsrc is None or self.mon_volume <= 0.01:
+            return
+        s16 = np.clip(pcm * (self.mon_volume * 30000.0), -32767.0, 32767.0).astype(np.int16)
+        try:
+            self._out_appsrc.emit("push-buffer", Gst.Buffer.new_wrapped(s16.tobytes()))
+        except Exception:
+            pass
+
+    def _feeder_loop(self):
+        """Real-time 25 Hz (480 samples = 40.0 ms) paced feeder for Test TX & WAV playback."""
+        block_n = 480
+        dt = block_n / float(DSP_RATE)
+        next_t = time.monotonic()
+
+        while not self._stop_evt.is_set():
+            now = time.monotonic()
+            if now < next_t:
+                time.sleep(min(0.015, next_t - now))
+                continue
+            next_t = max(now, next_t + dt)
+
+            chunk = None
+            origin = "idle"
+            tx_finished_msg = None
+
+            with self._pb_lock:
+                if self._tx_buf is not None:
+                    end = min(len(self._tx_buf), self._tx_pos + block_n)
+                    seg = self._tx_buf[self._tx_pos:end]
+                    self._tx_pos = end
+                    if len(seg) < block_n:
+                        pad = np.zeros(block_n, dtype=np.float32)
+                        pad[: len(seg)] = seg
+                        chunk = pad
+                    else:
+                        chunk = seg.copy()
+                    origin = "tx"
+                    if self._tx_pos >= len(self._tx_buf):
+                        self._tx_buf = None
+                        self._tx_pos = 0
+                        tx_finished_msg = f"TX COMPLETE — LISTENING ON {self.active_dev_label}"
+                elif self.input_source == "wav" and self._wav_buf is not None and not self._wav_paused:
+                    end = min(len(self._wav_buf), self._wav_pos + block_n)
+                    seg = self._wav_buf[self._wav_pos:end]
+                    self._wav_pos = end
+                    if len(seg) > 0:
+                        if len(seg) < block_n:
+                            pad = np.zeros(block_n, dtype=np.float32)
+                            pad[: len(seg)] = seg
+                            chunk = pad
+                        else:
+                            chunk = seg.copy()
+                        origin = "wav"
+                    if self._wav_pos >= len(self._wav_buf):
+                        self._wav_pos = 0
+                        self._wav_paused = True
+                        tx_finished_msg = f"WAV EOF ({self.wav_name}) — CLICK ▶ TO REPLAY"
+                elif self.input_source == "test":
+                    # Quiet receiver thermal noise floor (-58 dBFS) when idle in Loopback mode
+                    chunk = np.random.normal(0.0, 0.0012, block_n).astype(np.float32)
+                    origin = "noise"
+
+            if chunk is not None:
+                self._enqueue_chunk(origin, chunk)
+                if origin in ("tx", "wav"):
+                    self._push_speaker(chunk)
+
+            if tx_finished_msg:
+                self._emit_status(tx_finished_msg)
+
+
+# ---------------------------------------------------------------------------
+# Multi-Mode DSP Coordinator & Cairo Instrument Renderers
+# ---------------------------------------------------------------------------
+class DecoderController:
+    def __init__(self):
+        self.mode = "CW"  # CW | RTTY | SAME | WEFAX | SSTV
+        self.squelch = 0.0
+        self.noise_gate = 0.08
+        self.slant_fine = 0.0  # -1.0 .. +1.0
+
+        # Decoders
+        self.cw = CwMorseDecoder(DSP_RATE)
+        self.rtty = RttyBaudotDecoder(DSP_RATE)
+        self.same = SameEasDecoder(DSP_RATE)
+        self.wefax = WefaxDecoder(DSP_RATE)
+        self.sstv = SstvDecoder(DSP_RATE)
+
+        # Rolling FFT & Waterfall state
+        self.fft_ring = np.zeros(FFT_SIZE, dtype=np.float32)
+        self.fft_win = np.hanning(FFT_SIZE).astype(np.float32)
+        self.wf_bgra = np.zeros((WF_H, WF_W, 4), dtype=np.uint8)
+        self.wf_bgra[:, :] = WF_LUT_BGRA[0]
+        self.spec_norm = np.zeros(WF_W, dtype=np.float32)
+        self.fft_freqs = np.fft.rfftfreq(FFT_SIZE, 1.0 / DSP_RATE)
+        self.wf_freq_grid = np.linspace(WF_MIN_HZ, WF_MAX_HZ, WF_W, dtype=np.float32)
+
+        # HAL ST-6 Crossed-Ellipse X-Y Scope filters
+        self.xy_mark_bp = QuadratureBandpass(2125.0, 85.0, DSP_RATE)
+        self.xy_space_bp = QuadratureBandpass(2295.0, 85.0, DSP_RATE)
+        self.xy_x = np.zeros(XY_TRACE_LEN, dtype=np.float32)
+        self.xy_y = np.zeros(XY_TRACE_LEN, dtype=np.float32)
+        self._update_xy_filters()
+
+        # Telemetry & Ballistic S-Meter
+        self.snr_db = 0.0
+        self.rms_dbfs = -72.0
+        self.target_s = 0.04
+        self.needle_s = 0.04
+        self.carrier_present = False
+        self.mark_led = False
+        self.space_led = False
+
+        # Pre-built test images (lazy-cached)
+        self._cached_wefax_chart: np.ndarray | None = None
+        self._cached_sstv_240: np.ndarray | None = None
+        self._cached_sstv_256: np.ndarray | None = None
+
+    def get_wefax_chart(self) -> np.ndarray:
+        if self._cached_wefax_chart is None:
+            self._cached_wefax_chart = build_wefax_weather_chart(864, 360)
+        return self._cached_wefax_chart
+
+    def get_sstv_card(self, height: int = 240) -> np.ndarray:
+        if height == 256:
+            if self._cached_sstv_256 is None:
+                self._cached_sstv_256 = build_sstv_test_card(320, 256, "W1AW", "FN31pr")
+            return self._cached_sstv_256
+        if self._cached_sstv_240 is None:
+            self._cached_sstv_240 = build_sstv_test_card(320, 240, "W1AW", "FN31pr")
+        return self._cached_sstv_240
+
+    def active_mark_space_hz(self) -> tuple[float, float]:
+        if self.mode == "CW":
+            return self.cw.pitch_hz, min(2900.0, self.cw.pitch_hz + 170.0)
+        if self.mode == "RTTY":
+            m = self.rtty.mark_hz
+            s = min(2950.0, m + self.rtty.shift_hz)
+            return (s, m) if self.rtty.reverse else (m, s)
+        if self.mode == "SAME":
+            return SameEasDecoder.MARK_HZ, SameEasDecoder.SPACE_HZ
+        # WEFAX & SSTV: White (2300 Hz) = X, Black (1500 Hz) = Y
+        return 2300.0, 1500.0
+
+    def _update_xy_filters(self):
+        fm, fs_hz = self.active_mark_space_hz()
+        bw = 72.0 if self.mode in ("CW", "RTTY") else 115.0
+        self.xy_mark_bp.configure(fm, bw)
+        self.xy_space_bp.configure(fs_hz, bw)
+
+    def set_mode(self, mode: str):
+        if mode in MODES:
+            self.mode = mode
+            self._update_xy_filters()
+
+    def set_tone_mark_hz(self, hz: float):
+        hz = max(380.0, min(2600.0, float(hz)))
+        if self.mode == "CW":
+            self.cw.set_pitch(hz)
+        elif self.mode == "RTTY":
+            self.rtty.configure(mark_hz=hz)
+        self._update_xy_filters()
+
+    def set_slant_fine(self, val_signed: float):
+        """val_signed in [-1.0, +1.0]."""
+        self.slant_fine = max(-1.0, min(1.0, float(val_signed)))
+        self.wefax.slant_ppm = self.slant_fine
+        self.sstv.slant_ppm = self.slant_fine
+
+    def snap_cw_peak(self) -> float:
+        """Find strongest spectral peak in 380..1400 Hz and snap CW pitch to it."""
+        spec = np.abs(np.fft.rfft(self.fft_ring * self.fft_win))
+        mask = (self.fft_freqs >= 380.0) & (self.fft_freqs <= 1400.0)
+        idxs = np.where(mask)[0]
+        if len(idxs) == 0:
+            return self.cw.pitch_hz
+        sub = spec[idxs]
+        pk_local = int(np.argmax(sub))
+        k = int(idxs[pk_local])
+        # Parabolic bin interpolation
+        if 1 <= k < len(spec) - 1:
+            a, b, c = float(spec[k - 1]), float(spec[k]), float(spec[k + 1])
+            denom = a - 2.0 * b + c
+            delta = 0.5 * (a - c) / denom if abs(denom) > 1e-9 else 0.0
+            delta = max(-0.5, min(0.5, delta))
+        else:
+            delta = 0.0
+        hz = float((k + delta) * DSP_RATE / FFT_SIZE)
+        self.cw.set_pitch(hz)
+        self._update_xy_filters()
+        return self.cw.pitch_hz
+
+    def ingest_samples(self, x: np.ndarray) -> dict:
+        """Feed mono 12 kHz float32 samples into spectrum, X-Y scope, and active mode decoder."""
+        events = {"tty_text": "", "same_alerts": [], "wefax_rows": 0, "sstv_rows": 0}
+        if len(x) == 0:
+            return events
+
+        # 1. Update rolling FFT ring
+        n = len(x)
+        if n >= FFT_SIZE:
+            self.fft_ring[:] = x[-FFT_SIZE:]
+        else:
+            self.fft_ring[:-n] = self.fft_ring[n:]
+            self.fft_ring[-n:] = x
+
+        # 2. Update HAL ST-6 Crossed-Ellipse X-Y Scope buffers
+        self._update_xy_filters()
+        mi, mq, menv = self.xy_mark_bp.process_iq(x)
+        si, sq, senv = self.xy_space_bp.process_iq(x)
+        # Authentic ST-6 quadrature minor-axis coupling -> crisp 90-deg crossed ellipses!
+        px = mi + 0.14 * sq
+        py = si + 0.14 * mq
+        pk = max(0.035, float(np.max(np.hypot(px, py))))
+        px_n = np.clip(px / pk, -1.15, 1.15)
+        py_n = np.clip(py / pk, -1.15, 1.15)
+        if len(px_n) >= XY_TRACE_LEN:
+            self.xy_x[:] = px_n[-XY_TRACE_LEN:]
+            self.xy_y[:] = py_n[-XY_TRACE_LEN:]
+        else:
+            k = len(px_n)
+            self.xy_x[:-k] = self.xy_x[k:]
+            self.xy_x[-k:] = px_n
+            self.xy_y[:-k] = self.xy_y[k:]
+            self.xy_y[-k:] = py_n
+
+        m_mean = float(np.mean(menv))
+        s_mean = float(np.mean(senv))
+        self.mark_led = m_mean > 0.018 and m_mean >= s_mean * 0.65
+        self.space_led = s_mean > 0.018 and s_mean >= m_mean * 0.65
+
+        # 3. Level & S-meter update
+        rms = float(np.sqrt(np.mean(x * x) + 1e-12))
+        self.rms_dbfs = 20.0 * math.log10(max(1e-5, rms))
+        self.target_s = max(0.03, min(1.0, (self.rms_dbfs + 66.0) / 62.0))
+        self.carrier_present = self.target_s > max(0.07, self.squelch * 0.85)
+
+        # 4. Active mode demodulation
+        if self.mode == "CW":
+            events["tty_text"] = self.cw.process(x, self.noise_gate, self.squelch)
+        elif self.mode == "RTTY":
+            events["tty_text"] = self.rtty.process(x, self.noise_gate, self.squelch)
+        elif self.mode == "SAME":
+            events["same_alerts"] = self.same.process(x, self.noise_gate, self.squelch)
+        elif self.mode == "WEFAX":
+            events["wefax_rows"] = self.wefax.process(x, self.squelch)
+        elif self.mode == "SSTV":
+            events["sstv_rows"] = self.sstv.process(x, self.squelch)
+
+        return events
+
+    def step_waterfall(self):
+        """Compute 2048-pt Hanning FFT, update SNR dB, and scroll waterfall 1 scanline."""
+        mag = np.abs(np.fft.rfft(self.fft_ring * self.fft_win)) / (FFT_SIZE * 0.25)
+        db = 20.0 * np.log10(np.maximum(mag, 1e-6))
+
+        # Estimate in-band SNR vs median noise floor across 250..2900 Hz
+        band_mask = (self.fft_freqs >= 250.0) & (self.fft_freqs <= 2900.0)
+        band_db = db[band_mask]
+        floor_db = float(np.percentile(band_db, 25))
+        peak_db = float(np.max(band_db))
+        self.snr_db = max(0.0, min(55.0, peak_db - floor_db))
+
+        # Interpolate onto 200..3000 Hz waterfall width
+        wf_db = np.interp(self.wf_freq_grid, self.fft_freqs, db)
+        norm = np.clip((wf_db - (floor_db - 3.0)) / 46.0, 0.0, 1.0)
+        self.spec_norm = 0.45 * self.spec_norm + 0.55 * norm.astype(np.float32)
+
+        idx = np.clip((self.spec_norm * 255.0).astype(np.int32), 0, 255)
+        self.wf_bgra[1:] = self.wf_bgra[:-1]
+        self.wf_bgra[0] = WF_LUT_BGRA[idx]
+
+        # Ballistic S-meter needle smoothing
+        alpha = 0.34 if self.target_s > self.needle_s else 0.12
+        self.needle_s += alpha * (self.target_s - self.needle_s)
+
+    def is_sync_locked(self) -> bool:
+        if self.mode == "CW":
+            return self.cw.sync_locked
+        if self.mode == "RTTY":
+            return self.rtty.sync_locked
+        if self.mode == "SAME":
+            return self.same.sync_locked or self.same.alert_lamp_active
+        if self.mode == "WEFAX":
+            return self.wefax.sync_locked
+        if self.mode == "SSTV":
+            return self.sstv.sync_locked
+        return False
+
+    # ---- Cairo Rendering: Top Instrument Deck ----
+    def draw_top_deck(self, cr: cairo.Context, W: float, H: float) -> tuple[float, float]:
+        """
+        Render Top Instrument Deck:
+          [A] Warm Backlit Analog Signal/SNR Meter
+          [B] 200-3000 Hz FFT Spectrum + Scrolling Phosphor Waterfall + Passband Cursors
+          [C] HAL ST-6 Crossed-Ellipse X-Y Mark/Space Tuning Scope
+          [D] Glowing Cyan-Green VFD Telemetry + Hardware LEDs
+        Returns (wf_x, wf_w) for interactive waterfall mouse click/drag tuning.
+        """
+        cr.rectangle(0, 0, W, H)
+        cr.set_source_rgb(0.11, 0.13, 0.16)
+        cr.fill()
+
+        pad = 6.0
+        ih = H - 2.0 * pad
+        sm_w = max(188.0, min(216.0, W * 0.185))
+        xy_w = max(164.0, min(186.0, ih + 8.0))
+        vfd_w = max(232.0, min(268.0, W * 0.235))
+        wf_x = pad + sm_w + 6.0
+        wf_w = max(260.0, W - wf_x - xy_w - vfd_w - pad - 12.0)
+        xy_x0 = wf_x + wf_w + 6.0
+        vfd_x = xy_x0 + xy_w + 6.0
+
+        # ---- [A] Warm Backlit Analog Signal / SNR Meter ----
+        sx, sy, sw, sh = pad, pad, sm_w, ih
+        cr.rectangle(sx, sy, sw, sh)
+        cr.set_source_rgb(0.06, 0.07, 0.09)
+        cr.fill()
+
+        mx, my, mw, mh = sx + 5, sy + 5, sw - 10, sh - 10
+        glow = cairo.RadialGradient(mx + mw * 0.5, my + mh * 0.95, 6.0, mx + mw * 0.5, my + mh * 0.62, mw * 0.85)
+        glow.add_color_stop_rgb(0.0, 1.00, 0.94, 0.74)
+        glow.add_color_stop_rgb(0.65, 0.97, 0.85, 0.55)
+        glow.add_color_stop_rgb(1.0, 0.83, 0.68, 0.37)
+        cr.rectangle(mx, my, mw, mh)
+        cr.set_source(glow)
+        cr.fill()
+
+        piv_x = mx + mw * 0.5
+        piv_y = my + mh + 22.0
+        arc_r = min(mw * 0.60, mh * 0.95)
+        a0 = math.radians(-128.0)
+        a1 = math.radians(-52.0)
+        a_s9 = a0 + 0.58 * (a1 - a0)
+
+        cr.set_line_width(2.1)
+        cr.set_source_rgb(0.14, 0.12, 0.10)
+        cr.arc(piv_x, piv_y, arc_r, a0, a_s9)
+        cr.stroke()
+
+        cr.set_line_width(3.0)
+        cr.set_source_rgb(0.78, 0.14, 0.12)
+        cr.arc(piv_x, piv_y, arc_r, a_s9, a1)
+        cr.stroke()
+
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(8.6)
+        for frac, lbl, is_red in [
+            (0.00, "1", False), (0.19, "3", False), (0.38, "6", False),
+            (0.58, "9", False), (0.79, "+20", True), (1.00, "+40", True),
+        ]:
+            ang = a0 + frac * (a1 - a0)
+            cr.set_source_rgb(0.78, 0.14, 0.12) if is_red else cr.set_source_rgb(0.14, 0.12, 0.10)
+            cr.set_line_width(1.5)
+            cr.move_to(piv_x + (arc_r - 4) * math.cos(ang), piv_y + (arc_r - 4) * math.sin(ang))
+            cr.line_to(piv_x + (arc_r + 5) * math.cos(ang), piv_y + (arc_r + 5) * math.sin(ang))
+            cr.stroke()
+            tx = piv_x + (arc_r + 14) * math.cos(ang)
+            ty = piv_y + (arc_r + 14) * math.sin(ang)
+            ext = cr.text_extents(lbl)
+            cr.move_to(tx - ext.width * 0.5, ty + ext.height * 0.4)
+            cr.show_text(lbl)
+
+        cr.set_font_size(8.5)
+        cr.set_source_rgb(0.24, 0.19, 0.12)
+        cr.move_to(mx + 6, my + 13)
+        cr.show_text("SIGNAL / SNR")
+        snr_txt = f"{self.snr_db:4.1f} dB"
+        ext_s = cr.text_extents(snr_txt)
+        cr.move_to(mx + mw - ext_s.width - 6, my + 13)
+        cr.show_text(snr_txt)
+
+        if self.squelch > 0.03 and not self.carrier_present:
+            cr.set_source_rgb(0.78, 0.18, 0.12)
+            cr.move_to(mx + 6, my + mh - 6)
+            cr.show_text("SQL MUTED")
+
+        cr.save()
+        cr.rectangle(mx, my, mw, mh)
+        cr.clip()
+        n_ang = a0 + max(0.0, min(1.0, self.needle_s)) * (a1 - a0)
+        cr.set_line_width(2.0)
+        cr.set_source_rgba(0.1, 0.08, 0.05, 0.32)
+        cr.move_to(piv_x + 1.8, piv_y + 1.8)
+        cr.line_to(piv_x + 1.8 + (arc_r + 8) * math.cos(n_ang), piv_y + 1.8 + (arc_r + 8) * math.sin(n_ang))
+        cr.stroke()
+        cr.set_source_rgb(0.78, 0.12, 0.10)
+        cr.move_to(piv_x, piv_y)
+        cr.line_to(piv_x + (arc_r + 8) * math.cos(n_ang), piv_y + (arc_r + 8) * math.sin(n_ang))
+        cr.stroke()
+        cr.arc(piv_x, piv_y, 16.0, 0, 2 * math.pi)
+        cr.set_source_rgb(0.14, 0.15, 0.18)
+        cr.fill()
+        cr.restore()
+
+        # ---- [B] 200-3000 Hz Spectrum + Phosphor Waterfall + Tuning Cursors ----
+        cr.rectangle(wf_x, pad, wf_w, ih)
+        cr.set_source_rgb(0.03, 0.05, 0.09)
+        cr.fill()
+
+        scale_h = 16.0
+        sp_h = max(34.0, (ih - scale_h) * 0.28)
+        wf_y0 = pad + scale_h + sp_h
+        wf_dh = max(30.0, ih - scale_h - sp_h - 2.0)
+
+        # Frequency ruler bar at top of waterfall
+        cr.rectangle(wf_x, pad, wf_w, scale_h)
+        cr.set_source_rgb(0.08, 0.11, 0.16)
+        cr.fill()
+        cr.set_font_size(7.8)
+        for f_tick in range(400, 3000, 400):
+            fx = wf_x + ((f_tick - WF_MIN_HZ) / (WF_MAX_HZ - WF_MIN_HZ)) * wf_w
+            cr.set_source_rgba(0.35, 0.48, 0.62, 0.55)
+            cr.set_line_width(1.0)
+            cr.move_to(fx, pad + scale_h)
+            cr.line_to(fx, pad + scale_h + sp_h)
+            cr.stroke()
+            cr.set_source_rgb(0.72, 0.84, 0.94)
+            lbl = f"{f_tick}"
+            ext = cr.text_extents(lbl)
+            cr.move_to(fx - ext.width * 0.5, pad + 11.5)
+            cr.show_text(lbl)
+
+        # Live FFT spectrum curve
+        sy0 = pad + scale_h
+        cr.save()
+        cr.rectangle(wf_x, sy0, wf_w, sp_h)
+        cr.clip()
+        cr.move_to(wf_x, sy0 + sp_h)
+        step_k = max(1, WF_W // 220)
+        for k in range(0, WF_W, step_k):
+            px = wf_x + (k / float(WF_W - 1)) * wf_w
+            py = sy0 + sp_h - (self.spec_norm[k] * (sp_h - 4.0)) - 1.0
+            cr.line_to(px, py)
+        cr.line_to(wf_x + wf_w, sy0 + sp_h)
+        cr.close_path()
+        grad_sp = cairo.LinearGradient(0, sy0, 0, sy0 + sp_h)
+        grad_sp.add_color_stop_rgba(0.0, 0.28, 0.98, 0.78, 0.52)
+        grad_sp.add_color_stop_rgba(1.0, 0.05, 0.25, 0.28, 0.08)
+        cr.set_source(grad_sp)
+        cr.fill_preserve()
+        cr.set_source_rgb(0.42, 1.00, 0.84)
+        cr.set_line_width(1.3)
+        cr.stroke()
+        cr.restore()
+
+        # Blit scrolling waterfall ImageSurface
+        wf_surf = cairo.ImageSurface.create_for_data(
+            memoryview(self.wf_bgra), cairo.FORMAT_ARGB32, WF_W, WF_H, WF_W * 4
+        )
+        cr.save()
+        cr.translate(wf_x, wf_y0)
+        cr.scale(wf_w / float(WF_W), wf_dh / float(WF_H))
+        cr.set_source_surface(wf_surf, 0.0, 0.0)
+        cr.get_source().set_filter(cairo.FILTER_BILINEAR)
+        cr.paint()
+        cr.restore()
+
+        # Passband / Tone Cursors overlaid on Spectrum + Waterfall
+        def hz_to_x(hz: float) -> float:
+            return wf_x + ((hz - WF_MIN_HZ) / (WF_MAX_HZ - WF_MIN_HZ)) * wf_w
+
+        cr.save()
+        cr.rectangle(wf_x, pad + scale_h, wf_w, ih - scale_h)
+        cr.clip()
+        y_top = pad + scale_h
+        y_bot = pad + ih
+
+        if self.mode == "CW":
+            cx = hz_to_x(self.cw.pitch_hz)
+            bw_px = (55.0 / (WF_MAX_HZ - WF_MIN_HZ)) * wf_w
+            cr.rectangle(cx - bw_px, y_top, 2 * bw_px, y_bot - y_top)
+            cr.set_source_rgba(1.0, 0.72, 0.18, 0.16)
+            cr.fill()
+            cr.set_source_rgba(1.0, 0.45, 0.22, 0.95)
+            cr.set_line_width(1.8)
+            cr.move_to(cx, y_top)
+            cr.line_to(cx, y_bot)
+            cr.stroke()
+        elif self.mode in ("RTTY", "SAME"):
+            fm, fs_hz = self.active_mark_space_hz()
+            xm, xs = hz_to_x(fm), hz_to_x(fs_hz)
+            x_lo, x_hi = min(xm, xs), max(xm, xs)
+            cr.rectangle(x_lo - 4, y_top, (x_hi - x_lo) + 8, y_bot - y_top)
+            cr.set_source_rgba(0.25, 0.92, 0.78, 0.12)
+            cr.fill()
+            # Mark cursor (warm amber-red) & Space cursor (cyan-green)
+            for x_pos, col in ((xm, (1.0, 0.46, 0.22)), (xs, (0.36, 0.98, 0.86))):
+                cr.set_source_rgb(*col)
+                cr.set_line_width(1.8)
+                cr.move_to(x_pos, y_top)
+                cr.line_to(x_pos, y_bot)
+                cr.stroke()
+        else:
+            # WEFAX (1500..2300 Hz) & SSTV (1200 sync + 1500..2300 video)
+            x_blk = hz_to_x(1500.0)
+            x_wht = hz_to_x(2300.0)
+            cr.rectangle(x_blk, y_top, x_wht - x_blk, y_bot - y_top)
+            cr.set_source_rgba(0.38, 0.92, 1.0, 0.12)
+            cr.fill()
+            for x_p, col in ((x_blk, (0.45, 0.82, 1.0)), (x_wht, (1.0, 0.86, 0.36))):
+                cr.set_source_rgb(*col)
+                cr.set_line_width(1.5)
+                cr.move_to(x_p, y_top)
+                cr.line_to(x_p, y_bot)
+                cr.stroke()
+            if self.mode == "SSTV":
+                x_syn = hz_to_x(1200.0)
+                cr.set_source_rgb(1.0, 0.38, 0.32)
+                cr.set_line_width(1.5)
+                cr.move_to(x_syn, y_top)
+                cr.line_to(x_syn, y_bot)
+                cr.stroke()
+        cr.restore()
+
+        # ---- [C] HAL ST-6 / Tektronix Crossed-Ellipse X-Y Tuning Scope ----
+        cr.rectangle(xy_x0, pad, xy_w, ih)
+        cr.set_source_rgb(0.03, 0.08, 0.05)
+        cr.fill()
+
+        scx = xy_x0 + xy_w * 0.5
+        scy = pad + ih * 0.52
+        sr = min(xy_w, ih) * 0.42
+
+        # Radial CRT phosphor vignette
+        p31 = cairo.RadialGradient(scx, scy, 4.0, scx, scy, sr * 1.15)
+        p31.add_color_stop_rgb(0.0, 0.05, 0.17, 0.10)
+        p31.add_color_stop_rgb(1.0, 0.02, 0.06, 0.04)
+        cr.arc(scx, scy, sr, 0, 2 * math.pi)
+        cr.set_source(p31)
+        cr.fill()
+
+        # Graticule ring + Mark (X) / Space (Y) crosshairs
+        cr.set_line_width(1.0)
+        cr.set_source_rgba(0.22, 0.62, 0.38, 0.65)
+        cr.arc(scx, scy, sr, 0, 2 * math.pi)
+        cr.stroke()
+        cr.arc(scx, scy, sr * 0.5, 0, 2 * math.pi)
+        cr.stroke()
+        cr.move_to(scx - sr, scy)
+        cr.line_to(scx + sr, scy)
+        cr.move_to(scx, scy - sr)
+        cr.line_to(scx, scy + sr)
+        cr.stroke()
+
+        cr.set_font_size(7.8)
+        cr.set_source_rgb(0.52, 0.92, 0.68)
+        cr.move_to(xy_x0 + 6, pad + 12)
+        cr.show_text("X-Y MARK/SPACE")
+        cr.move_to(scx + sr - 10, scy - 4)
+        cr.show_text("M")
+        cr.move_to(scx + 4, scy - sr + 10)
+        cr.show_text("S")
+
+        # Glowing P31 Green Phosphor X-Y Beam (halo + bright core)
+        if self.carrier_present:
+            cr.save()
+            cr.arc(scx, scy, sr, 0, 2 * math.pi)
+            cr.clip()
+            pts_x = scx + self.xy_x * (sr * 0.88)
+            pts_y = scy - self.xy_y * (sr * 0.88)
+
+            for lw, rgba in ((3.4, (0.08, 0.90, 0.44, 0.28)), (1.4, (0.58, 1.00, 0.78, 0.90))):
+                cr.set_line_width(lw)
+                cr.set_source_rgba(*rgba)
+                cr.move_to(float(pts_x[0]), float(pts_y[0]))
+                for px_i, py_i in zip(pts_x[1::2].tolist(), pts_y[1::2].tolist()):
+                    cr.line_to(px_i, py_i)
+                cr.stroke()
+            cr.restore()
+        else:
+            # Resting center phosphor spot
+            cr.arc(scx, scy, 2.5, 0, 2 * math.pi)
+            cr.set_source_rgba(0.45, 1.0, 0.72, 0.8)
+            cr.fill()
+
+        # ---- [D] Glowing VFD Telemetry Readout + Hardware LEDs ----
+        cr.rectangle(vfd_x, pad, vfd_w, ih)
+        cr.set_source_rgb(0.04, 0.09, 0.10)
+        cr.fill()
+        cr.rectangle(vfd_x + 2, pad + 2, vfd_w - 4, ih - 4)
+        cr.set_source_rgb(0.05, 0.12, 0.13)
+        cr.fill()
+
+        # Mode header badge
+        cr.set_font_size(12.5)
+        cr.set_source_rgb(0.36, 0.99, 0.86)
+        cr.move_to(vfd_x + 10, pad + 22)
+        cr.show_text(MODE_TITLES.get(self.mode, self.mode))
+
+        # Mode-specific primary frequency & rate telemetry
+        if self.mode == "CW":
+            f_str = f"PITCH  {self.cw.pitch_hz:6.1f} Hz"
+            r_str = f"SPEED  {self.cw.wpm:5.1f} WPM"
+        elif self.mode == "RTTY":
+            fm, fs_hz = self.active_mark_space_hz()
+            f_str = f"M/S {fm:4.0f}/{fs_hz:4.0f} Hz"
+            r_str = f"BAUD   {self.rtty.baud:5.2f} BD"
+        elif self.mode == "SAME":
+            f_str = "AFSK 2083/1563Hz"
+            r_str = "RATE   520.8 BD"
+        elif self.mode == "WEFAX":
+            f_str = "FM  1500-2300 Hz"
+            r_str = f"DRUM  {self.wefax.lpm:5.0f} LPM"
+        else:
+            f_str = "SYNC 1200/1900Hz"
+            r_str = f"SSTV  {self.sstv.mode_name}"
+
+        cr.set_font_size(10.5)
+        cr.set_source_rgb(0.68, 0.98, 0.92)
+        cr.move_to(vfd_x + 10, pad + 45)
+        cr.show_text(f_str)
+
+        cr.set_source_rgb(1.00, 0.80, 0.34)
+        cr.move_to(vfd_x + 10, pad + 66)
+        cr.show_text(r_str)
+
+        cr.set_font_size(9.5)
+        cr.set_source_rgb(0.52, 0.92, 0.84)
+        cr.move_to(vfd_x + 10, pad + 86)
+        cr.show_text(f"SNR {self.snr_db:4.1f} dB  LVL {self.rms_dbfs:5.1f}")
+
+        # Hardware LED Annunciators along bottom of VFD
+        leds = [
+            ("SYNC", self.is_sync_locked(), (0.22, 0.98, 0.56)),
+            ("DCD", self.carrier_present, (0.28, 0.94, 0.84)),
+            ("MARK", self.mark_led, (1.00, 0.62, 0.24)),
+            ("SPCE", self.space_led, (0.36, 0.96, 0.88)),
+            ("EAS", self.same.alert_lamp_active, (1.00, 0.24, 0.20)),
+        ]
+        led_y = pad + ih - 24.0
+        cell_w = (vfd_w - 16.0) / len(leds)
+        cr.set_font_size(7.6)
+        for li, (lname, is_on, rgb_on) in enumerate(leds):
+            lx = vfd_x + 8.0 + (li + 0.5) * cell_w
+            if is_on:
+                cr.arc(lx, led_y - 6, 6.2, 0, 2 * math.pi)
+                cr.set_source_rgba(rgb_on[0], rgb_on[1], rgb_on[2], 0.32)
+                cr.fill()
+                cr.arc(lx, led_y - 6, 4.0, 0, 2 * math.pi)
+                cr.set_source_rgb(*rgb_on)
+                cr.fill()
+            else:
+                cr.arc(lx, led_y - 6, 4.0, 0, 2 * math.pi)
+                cr.set_source_rgb(0.16, 0.22, 0.24)
+                cr.fill()
+            ext = cr.text_extents(lname)
+            cr.set_source_rgb(0.82, 0.90, 0.92) if is_on else cr.set_source_rgb(0.46, 0.56, 0.58)
+            cr.move_to(lx - ext.width * 0.5, led_y + 9)
+            cr.show_text(lname)
+
+        return wf_x, wf_w
+
+    # ---- Cairo Rendering: Tractor-Feed Sprocket Strips ----
+    def draw_tty_sprockets(self, cr: cairo.Context, W: float, H: float):
+        cr.rectangle(0, 0, W, H)
+        cr.set_source_rgb(0.965, 0.930, 0.865)
+        cr.fill()
+        # Subtle perforated tear line
+        cr.set_source_rgba(0.62, 0.56, 0.46, 0.55)
+        cr.set_line_width(1.0)
+        cr.set_dash([3.0, 3.0])
+        cr.move_to(W - 1.5, 0)
+        cr.line_to(W - 1.5, H)
+        cr.stroke()
+        cr.set_dash([])
+        # Sprocket holes every 18 px
+        cx = W * 0.5
+        for yy in range(10, int(H), 18):
+            cr.arc(cx, yy, 3.6, 0, 2 * math.pi)
+            cr.set_source_rgb(0.32, 0.30, 0.27)
+            cr.fill()
+            cr.arc(cx, yy, 3.6, 0, 2 * math.pi)
+            cr.set_source_rgba(0.82, 0.77, 0.68, 0.8)
+            cr.set_line_width(1.0)
+            cr.stroke()
+
+    # ---- Cairo Rendering: Right-Hand Mode Telemetry / EAS Alert Card ----
+    def draw_telemetry_card(self, cr: cairo.Context, W: float, H: float):
+        cr.rectangle(0, 0, W, H)
+        cr.set_source_rgb(0.08, 0.10, 0.13)
+        cr.fill()
+
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+
+        if self.mode == "CW":
+            cr.set_font_size(10.0)
+            cr.set_source_rgb(0.42, 0.98, 0.84)
+            cr.move_to(10, 20)
+            cr.show_text("CW MORSE TELEMETRY")
+
+            cr.set_font_size(9.0)
+            cr.set_source_rgb(0.86, 0.90, 0.95)
+            cr.move_to(10, 44)
+            cr.show_text(f"TRACKED WPM : {self.cw.wpm:5.1f} WPM")
+            cr.move_to(10, 62)
+            cr.show_text(f"DIT UNIT    : {self.cw.t_dit*1000.0:5.1f} ms")
+            cr.move_to(10, 80)
+            cr.show_text(f"DAH (3x)    : {self.cw.t_dit*3000.0:5.1f} ms")
+            cr.move_to(10, 98)
+            cr.show_text(f"TONE PITCH  : {self.cw.pitch_hz:5.1f} Hz")
+
+            # Live Envelope vs Adaptive Threshold bar
+            cr.move_to(10, 124)
+            cr.set_source_rgb(1.0, 0.80, 0.36)
+            cr.show_text("ENVELOPE / THRESHOLD")
+            bx, by, bw, bh = 10.0, 132.0, max(60.0, W - 20.0), 18.0
+            cr.rectangle(bx, by, bw, bh)
+            cr.set_source_rgb(0.14, 0.18, 0.22)
+            cr.fill()
+            scale = max(0.05, self.cw.peak_env * 1.15)
+            ew = min(bw, (self.cw.last_env / scale) * bw)
+            cr.rectangle(bx, by, ew, bh)
+            cr.set_source_rgb(0.28, 0.96, 0.68) if self.cw.key_down else cr.set_source_rgb(0.22, 0.56, 0.52)
+            cr.fill()
+            tx = bx + min(bw, (self.cw.last_thresh / scale) * bw)
+            cr.set_source_rgb(1.0, 0.38, 0.24)
+            cr.set_line_width(2.0)
+            cr.move_to(tx, by - 2)
+            cr.line_to(tx, by + bh + 2)
+            cr.stroke()
+
+            # Current Element Pattern Preview
+            cr.set_font_size(9.0)
+            cr.set_source_rgb(0.75, 0.84, 0.92)
+            cr.move_to(10, 174)
+            cr.show_text("ELEMENT BUFFER:")
+            pat = self.cw.current_pattern or "---"
+            preview_ch = MORSE_TO_CHAR.get(self.cw.current_pattern, "")
+            cr.set_font_size(14.0)
+            cr.set_source_rgb(0.42, 0.99, 0.86)
+            cr.move_to(10, 198)
+            cr.show_text(f"{pat}  {('→ ' + preview_ch) if preview_ch else ''}")
+
+        elif self.mode == "RTTY":
+            cr.set_font_size(10.0)
+            cr.set_source_rgb(0.42, 0.98, 0.84)
+            cr.move_to(10, 20)
+            cr.show_text("ITA2 BAUDOT REGISTER")
+
+            cr.set_font_size(9.0)
+            cr.set_source_rgb(0.86, 0.90, 0.95)
+            fm, fs_hz = self.active_mark_space_hz()
+            cr.move_to(10, 44)
+            cr.show_text(f"MARK / SPACE: {fm:.0f}/{fs_hz:.0f} Hz")
+            cr.move_to(10, 62)
+            cr.show_text(f"BAUD / SHIFT: {self.rtty.baud:.2f} / {self.rtty.shift_hz:.0f}Hz")
+            cr.move_to(10, 80)
+            shift_lbl = "FIGS (NUM/SYM)" if self.rtty.figs_shift else "LTRS (ALPHA)"
+            cr.set_source_rgb(1.0, 0.78, 0.32) if self.rtty.figs_shift else cr.set_source_rgb(0.42, 0.98, 0.76)
+            cr.show_text(f"SHIFT STATE : {shift_lbl}")
+            cr.set_source_rgb(0.82, 0.88, 0.94)
+            cr.move_to(10, 98)
+            cr.show_text(f"UART STATE  : {self.rtty.uart_state}")
+
+            # 5-Level Punched Paper Tape Graphic!
+            tp_x, tp_y, tp_w, tp_h = 10.0, 116.0, max(80.0, W - 20.0), 46.0
+            cr.rectangle(tp_x, tp_y, tp_w, tp_h)
+            cr.set_source_rgb(0.95, 0.88, 0.65)  # Oiled yellow teletype punch tape
+            cr.fill()
+            cr.set_font_size(8.0)
+            cr.set_source_rgb(0.22, 0.18, 0.10)
+            cr.move_to(tp_x + 6, tp_y + 12)
+            cr.show_text("5-UNIT ITA2 TAPE (b1..b5)")
+            step_x = (tp_w - 24.0) / 6.0
+            for bi in range(6):
+                hx = tp_x + 18.0 + bi * step_x
+                hy = tp_y + 30.0
+                if bi == 2:
+                    # Feed sprocket hole between b2 and b3!
+                    cr.arc(hx, hy, 3.2, 0, 2 * math.pi)
+                    cr.set_source_rgb(0.12, 0.14, 0.18)
+                    cr.fill()
+                else:
+                    bit_i = bi if bi < 2 else (bi - 1)
+                    bit_on = self.rtty.last_bits[bit_i] == 1
+                    cr.arc(hx, hy, 6.2, 0, 2 * math.pi)
+                    if bit_on:
+                        cr.set_source_rgb(0.10, 0.12, 0.16)
+                        cr.fill()
+                    else:
+                        cr.set_source_rgba(0.45, 0.38, 0.24, 0.45)
+                        cr.set_line_width(1.2)
+                        cr.stroke()
+
+        elif self.mode == "SAME":
+            # Dedicated NOAA / FEMA Emergency Alert System Decoder Display
+            al = self.same.last_alert
+            lamp_col = (0.92, 0.22, 0.16) if self.same.alert_lamp_active else (0.18, 0.26, 0.32)
+            cr.rectangle(8, 8, W - 16, 28)
+            cr.set_source_rgb(*lamp_col)
+            cr.fill()
+            cr.set_font_size(10.0)
+            cr.set_source_rgb(1.0, 1.0, 1.0) if self.same.alert_lamp_active else cr.set_source_rgb(0.68, 0.76, 0.84)
+            cr.move_to(14, 26)
+            if al:
+                eom_tag = " [EOM]" if self.same.eom_received else f" [{al.get('burst_count', 1)}x]"
+                cr.show_text(f"EAS {al['severity']}: {al['event']}{eom_tag}")
+            else:
+                cr.show_text("SAME / EAS STANDBY")
+
+            cr.set_font_size(8.6)
+            if al:
+                cr.set_source_rgb(1.0, 0.84, 0.38)
+                cr.move_to(10, 54)
+                cr.show_text(al["event_desc"][:30])
+
+                cr.set_source_rgb(0.76, 0.94, 0.90)
+                cr.move_to(10, 72)
+                cr.show_text(f"ORG : {al['org']} ({al['sender']})")
+                cr.move_to(10, 89)
+                cr.show_text(f"TIME: {al['issued_desc']}")
+                cr.move_to(10, 106)
+                cr.show_text(f"PURG: +{al['purge_desc']}")
+
+                cr.set_source_rgb(0.95, 0.96, 0.98)
+                cr.move_to(10, 126)
+                cr.show_text("AFFECTED AREAS:")
+                yy = 143
+                for loc_s in al["location_names"][:4]:
+                    cr.set_source_rgb(0.46, 0.98, 0.82)
+                    cr.move_to(12, yy)
+                    cr.show_text(loc_s[:31])
+                    yy += 16
+            else:
+                cr.set_source_rgb(0.64, 0.74, 0.82)
+                cr.move_to(10, 60)
+                cr.show_text("Monitoring 520.83 baud AFSK")
+                cr.move_to(10, 78)
+                cr.show_text("Mark:  2083.3 Hz (Bit 1)")
+                cr.move_to(10, 96)
+                cr.show_text("Space: 1562.5 Hz (Bit 0)")
+                cr.set_source_rgb(0.42, 0.94, 0.80)
+                cr.move_to(10, 126)
+                cr.show_text("Click [▶ SEND TEST SIGNAL]")
+                cr.move_to(10, 144)
+                cr.show_text("to transmit Hartford Co. CT")
+                cr.move_to(10, 162)
+                cr.show_text("RWT (009003) test burst.")
+
+    # ---- Cairo Rendering: Alden Thermal Drum WEFAX Canvas ----
+    def draw_wefax_drum(self, cr: cairo.Context, W: float, H: float):
+        cr.rectangle(0, 0, W, H)
+        cr.set_source_rgb(0.10, 0.12, 0.15)
+        cr.fill()
+
+        pad = 6.0
+        dw = max(100.0, W - 2 * pad)
+        dh = max(80.0, H - 2 * pad)
+
+        # Convert grayscale canvas to BGRA for Cairo
+        n_vis = max(220, min(self.wefax.MAX_LINES, max(260, self.wefax.line_idx + 24)))
+        gray = self.wefax.canvas[:n_vis]
+        # Warm thermal paper tint (#FFFDF7)
+        bgra = np.empty((n_vis, self.wefax.WIDTH, 4), dtype=np.uint8)
+        bgra[:, :, 0] = (gray.astype(np.uint16) * 244 // 255).astype(np.uint8)  # B
+        bgra[:, :, 1] = (gray.astype(np.uint16) * 250 // 255).astype(np.uint8)  # G
+        bgra[:, :, 2] = gray                                                    # R
+        bgra[:, :, 3] = 255
+
+        surf = cairo.ImageSurface.create_for_data(
+            memoryview(bgra), cairo.FORMAT_ARGB32, self.wefax.WIDTH, n_vis, self.wefax.WIDTH * 4
+        )
+        cr.save()
+        cr.translate(pad, pad)
+        cr.scale(dw / float(self.wefax.WIDTH), dh / float(n_vis))
+        cr.set_source_surface(surf, 0.0, 0.0)
+        cr.get_source().set_filter(cairo.FILTER_BILINEAR)
+        cr.paint()
+        cr.restore()
+
+        # Glowing thermal stylus line indicator at current drum row
+        if 0 < self.wefax.line_idx < n_vis:
+            sy = pad + (self.wefax.line_idx / float(n_vis)) * dh
+            cr.set_source_rgba(0.98, 0.32, 0.18, 0.88)
+            cr.set_line_width(2.0)
+            cr.move_to(pad, sy)
+            cr.line_to(pad + dw, sy)
+            cr.stroke()
+
+    # ---- Cairo Rendering: Slow-Scan TV Color Monitor ----
+    def draw_sstv_crt(self, cr: cairo.Context, W: float, H: float):
+        cr.rectangle(0, 0, W, H)
+        cr.set_source_rgb(0.07, 0.08, 0.11)
+        cr.fill()
+
+        fh = self.sstv.active_height()
+        fw = self.sstv.WIDTH
+        aspect = fw / float(fh)
+        avail_w = max(80.0, W - 16.0)
+        avail_h = max(60.0, H - 16.0)
+        if avail_w / avail_h > aspect:
+            dh = avail_h
+            dw = dh * aspect
+        else:
+            dw = avail_w
+            dh = dw / aspect
+        ox = (W - dw) * 0.5
+        oy = (H - dh) * 0.5
+
+        # Sunken studio monitor frame
+        cr.rectangle(ox - 4, oy - 4, dw + 8, dh + 8)
+        cr.set_source_rgb(0.03, 0.04, 0.06)
+        cr.fill()
+
+        rgb = self.sstv.frame_rgb[:fh]
+        bgra = np.empty((fh, fw, 4), dtype=np.uint8)
+        bgra[:, :, 0] = rgb[:, :, 2]
+        bgra[:, :, 1] = rgb[:, :, 1]
+        bgra[:, :, 2] = rgb[:, :, 0]
+        bgra[:, :, 3] = 255
+
+        surf = cairo.ImageSurface.create_for_data(memoryview(bgra), cairo.FORMAT_ARGB32, fw, fh, fw * 4)
+        cr.save()
+        cr.translate(ox, oy)
+        cr.scale(dw / float(fw), dh / float(fh))
+        cr.set_source_surface(surf, 0.0, 0.0)
+        cr.get_source().set_filter(cairo.FILTER_BILINEAR)
+        cr.paint()
+        cr.restore()
+
+        # Active horizontal electron scanline glow
+        if self.sstv.rx_state == "ACTIVE_LINES" and 0 <= self.sstv.line_idx < fh:
+            sy = oy + (self.sstv.line_idx / float(fh)) * dh
+            cr.set_source_rgba(0.42, 1.0, 0.84, 0.85)
+            cr.set_line_width(1.8)
+            cr.move_to(ox, sy)
+            cr.line_to(ox + dw, sy)
+            cr.stroke()
+
+
+# ---------------------------------------------------------------------------
+# Main dtDecoder Vintage HF Digital & Facsimile Terminal Window (1120x660)
+# ---------------------------------------------------------------------------
+class DtDecoderWindow(Gtk.Window):
+    def __init__(self, self_test: bool = False):
+        super().__init__(title="dtDecoder — HF Digital, CW, RTTY, SAME/EAS, WEFAX & SSTV Decoder")
+        self.set_default_size(1120, 660)
+        self.set_resizable(True)
+        self._self_test = self_test
+
+        for ic_cand in (
+            HOME / ".dt" / "icons" / "dtdecoder.pm",
+            Path(__file__).resolve().parent / "icons" / "dtdecoder.pm",
+        ):
+            if ic_cand.is_file():
+                try:
+                    self.set_icon_from_file(str(ic_cand))
+                    break
+                except Exception:
+                    pass
+
+        chrome, sel, well = load_cde_palette()
+        prov = Gtk.CssProvider()
+        prov.load_from_data(build_decoder_css(chrome, sel, well))
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        self.ctrl = DecoderController()
+        self.router = DecoderAudioRouter(on_status_cb=self._set_status)
+        self._wf_geom = (220.0, 420.0)
+        self._wf_dragging = False
+        self._updating_knobs = False
+        self._wefax_turbo = False
+
+        self._build_ui()
+        self._load_state()
+        self._sync_all_buttons()
+
+        self.router.start(headless=self._self_test)
+        GLib.timeout_add(33, self._on_ui_tick)
+        self.connect("destroy", self._on_destroy)
+
+        if self._self_test:
+            GLib.timeout_add(120, self._run_gui_self_test)
+
+    # ---- UI Construction ----
+    def _build_ui(self):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(outer)
+
+        cab = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        cab.get_style_context().add_class("rx-cabinet")
+        outer.pack_start(cab, True, True, 0)
+
+        # 1. Top Instrument Deck (S-Meter + Waterfall + Crossed-Ellipse X-Y Scope + VFD)
+        deck_frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        deck_frame.get_style_context().add_class("sunken-bezel")
+        cab.pack_start(deck_frame, False, False, 0)
+
+        self.deck_area = Gtk.DrawingArea()
+        self.deck_area.set_size_request(1080, 178)
+        self.deck_area.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+            | Gdk.EventMask.SCROLL_MASK
+        )
+        self.deck_area.connect("draw", self._on_draw_deck)
+        self.deck_area.connect("button-press-event", self._on_deck_press)
+        self.deck_area.connect("button-release-event", self._on_deck_release)
+        self.deck_area.connect("motion-notify-event", self._on_deck_motion)
+        self.deck_area.connect("scroll-event", self._on_deck_scroll)
+        deck_frame.pack_start(self.deck_area, True, True, 0)
+
+        # 2. Strip 1: Audio Input Router + 5 Decoder Modes + [▶ SEND TEST SIGNAL]
+        bar1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        bar1.get_style_context().add_class("rx-strip")
+        cab.pack_start(bar1, False, False, 0)
+
+        lbl_in = Gtk.Label(label="INPUT")
+        lbl_in.get_style_context().add_class("rx-engraved")
+        bar1.pack_start(lbl_in, False, False, 2)
+
+        self.src_btns: dict[str, Gtk.Button] = {}
+        for skey, slbl, stip in [
+            ("monitor", "DESKTOP MON", "Tap default PulseAudio/PipeWire .monitor (decodes dtRadio live!)"),
+            ("mic", "MIC / LINE", "Live soundcard / transceiver line-in"),
+            ("test", "LOOPBACK", "Quiet internal test bench loopback"),
+        ]:
+            b = Gtk.Button(label=slbl)
+            b.set_tooltip_text(stip)
+            b.connect("clicked", self._on_source_clicked, skey)
+            self.src_btns[skey] = b
+            bar1.pack_start(b, False, False, 0)
+
+        btn_wav = Gtk.Button(label="LOAD .WAV")
+        btn_wav.set_tooltip_text("Load WAV aircheck from ~/Music/dtRadio or disk")
+        btn_wav.connect("clicked", self._on_load_wav_clicked)
+        self.src_btns["wav"] = btn_wav
+        bar1.pack_start(btn_wav, False, False, 0)
+
+        self.btn_spk = Gtk.Button(label="🔊 MON")
+        self.btn_spk.set_tooltip_text("Toggle audible speaker output for Test Signal TX & WAV playback")
+        self.btn_spk.connect("clicked", self._on_toggle_spk)
+        bar1.pack_start(self.btn_spk, False, False, 1)
+
+        bar1.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 4)
+
+        lbl_md = Gtk.Label(label="MODE")
+        lbl_md.get_style_context().add_class("rx-engraved")
+        bar1.pack_start(lbl_md, False, False, 2)
+
+        self.mode_btns: dict[str, Gtk.Button] = {}
+        for mkey, mlbl in [
+            ("CW", "CW / MORSE"),
+            ("RTTY", "RTTY BAUDOT"),
+            ("SAME", "SAME / EAS"),
+            ("WEFAX", "HF WEFAX"),
+            ("SSTV", "SSTV"),
+        ]:
+            b = Gtk.Button(label=mlbl)
+            b.connect("clicked", self._on_mode_clicked, mkey)
+            self.mode_btns[mkey] = b
+            bar1.pack_start(b, False, False, 0)
+
+        self.btn_test_tx = Gtk.Button(label="▶ SEND TEST SIGNAL")
+        self.btn_test_tx.get_style_context().add_class("btn-tx")
+        self.btn_test_tx.set_tooltip_text(
+            "Synthesize & transmit a live signal for the active decoder mode (audible + fed into decoder)"
+        )
+        self.btn_test_tx.connect("clicked", self._on_test_tx_clicked)
+        bar1.pack_end(self.btn_test_tx, False, False, 0)
+
+        # 3. Strip 2: Mode-Specific Controls Stack + Universal Copy/Save Controls
+        bar2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        bar2.get_style_context().add_class("rx-strip")
+        cab.pack_start(bar2, False, False, 0)
+
+        self.sub_stack = Gtk.Stack()
+        self.sub_stack.set_transition_type(Gtk.StackTransitionType.NONE)
+        bar2.pack_start(self.sub_stack, True, True, 0)
+
+        # -- 3a. CW Sub-Bar --
+        cw_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        btn_snap = Gtk.Button(label="⌖ SNAP PEAK")
+        btn_snap.set_tooltip_text("Auto-center CW filter onto strongest audio tone in 380-1400 Hz")
+        btn_snap.connect("clicked", self._on_cw_snap)
+        cw_bar.pack_start(btn_snap, False, False, 0)
+
+        lbl_wpm = Gtk.Label(label="TX WPM")
+        lbl_wpm.get_style_context().add_class("rx-engraved")
+        cw_bar.pack_start(lbl_wpm, False, False, 2)
+        self.cw_wpm_combo = Gtk.ComboBoxText()
+        for w_opt in ("15 WPM", "20 WPM", "25 WPM", "32 WPM"):
+            self.cw_wpm_combo.append_text(w_opt)
+        self.cw_wpm_combo.set_active(1)
+        cw_bar.pack_start(self.cw_wpm_combo, False, False, 0)
+
+        lbl_cwt = Gtk.Label(label="TEST MSG")
+        lbl_cwt.get_style_context().add_class("rx-engraved")
+        cw_bar.pack_start(lbl_cwt, False, False, 2)
+        self.cw_msg_entry = Gtk.Entry()
+        self.cw_msg_entry.set_text("CQ CQ DE W1AW W1AW FN31 K")
+        cw_bar.pack_start(self.cw_msg_entry, True, True, 0)
+
+        btn_cw_clr = Gtk.Button(label="CLEAR ROLL")
+        btn_cw_clr.connect("clicked", lambda _b: self._clear_tty_roll())
+        cw_bar.pack_start(btn_cw_clr, False, False, 0)
+        btn_cw_sav = Gtk.Button(label="SAVE TXT")
+        btn_cw_sav.connect("clicked", lambda _b: self._save_tty_log())
+        cw_bar.pack_start(btn_cw_sav, False, False, 0)
+        self.sub_stack.add_named(cw_bar, "CW")
+
+        # -- 3b. RTTY Sub-Bar --
+        rtty_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        lbl_bd = Gtk.Label(label="BAUD")
+        lbl_bd.get_style_context().add_class("rx-engraved")
+        rtty_bar.pack_start(lbl_bd, False, False, 1)
+        self.rtty_baud_btns: dict[float, Gtk.Button] = {}
+        for bd in (45.45, 50.0, 75.0):
+            b = Gtk.Button(label=f"{bd:g}")
+            b.connect("clicked", self._on_rtty_baud, bd)
+            self.rtty_baud_btns[bd] = b
+            rtty_bar.pack_start(b, False, False, 0)
+
+        lbl_sh = Gtk.Label(label="SHIFT")
+        lbl_sh.get_style_context().add_class("rx-engraved")
+        rtty_bar.pack_start(lbl_sh, False, False, 2)
+        self.rtty_shift_btns: dict[float, Gtk.Button] = {}
+        for sh in (170.0, 425.0, 850.0):
+            b = Gtk.Button(label=f"{int(sh)}Hz")
+            b.connect("clicked", self._on_rtty_shift, sh)
+            self.rtty_shift_btns[sh] = b
+            rtty_bar.pack_start(b, False, False, 0)
+
+        self.btn_rtty_rev = Gtk.Button(label="REV")
+        self.btn_rtty_rev.set_tooltip_text("Reverse Mark/Space FSK polarity")
+        self.btn_rtty_rev.connect("clicked", self._on_rtty_rev)
+        rtty_bar.pack_start(self.btn_rtty_rev, False, False, 0)
+
+        self.btn_rtty_usos = Gtk.Button(label="USOS")
+        self.btn_rtty_usos.set_tooltip_text("Unshift-On-Space (resets FIGS to LTRS on space)")
+        self.btn_rtty_usos.connect("clicked", self._on_rtty_usos)
+        rtty_bar.pack_start(self.btn_rtty_usos, False, False, 0)
+
+        self.rtty_msg_entry = Gtk.Entry()
+        self.rtty_msg_entry.set_text("ZCZC NWS HIGH SEAS FORECAST - RYRY DE W1AW FN31 73 NNNN")
+        rtty_bar.pack_start(self.rtty_msg_entry, True, True, 0)
+
+        btn_rt_clr = Gtk.Button(label="CLEAR")
+        btn_rt_clr.connect("clicked", lambda _b: self._clear_tty_roll())
+        rtty_bar.pack_start(btn_rt_clr, False, False, 0)
+        self.sub_stack.add_named(rtty_bar, "RTTY")
+
+        # -- 3c. SAME / EAS Sub-Bar --
+        same_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        lbl_sp = Gtk.Label(label="TEST HEADER (NON-BROADCAST)")
+        lbl_sp.get_style_context().add_class("rx-engraved")
+        same_bar.pack_start(lbl_sp, False, False, 2)
+
+        self.same_preset_combo = Gtk.ComboBoxText()
+        for plbl, _phdr in SAME_TEST_PRESETS:
+            self.same_preset_combo.append_text(plbl)
+        self.same_preset_combo.set_active(0)
+        same_bar.pack_start(self.same_preset_combo, True, True, 0)
+
+        btn_ack = Gtk.Button(label="RESET ALERT LAMP")
+        btn_ack.connect("clicked", self._on_same_reset_lamp)
+        same_bar.pack_start(btn_ack, False, False, 0)
+
+        btn_sm_clr = Gtk.Button(label="CLEAR LOG")
+        btn_sm_clr.connect("clicked", self._on_same_clear)
+        same_bar.pack_start(btn_sm_clr, False, False, 0)
+        self.sub_stack.add_named(same_bar, "SAME")
+
+        # -- 3d. WEFAX Sub-Bar --
+        wf_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        lbl_ioc = Gtk.Label(label="WMO IOC 576 • 1500Hz BLACK / 2300Hz WHITE")
+        lbl_ioc.get_style_context().add_class("rx-engraved")
+        wf_bar.pack_start(lbl_ioc, False, False, 2)
+
+        self.btn_wf_lpm = Gtk.Button(label="120 LPM (STD)")
+        self.btn_wf_lpm.set_tooltip_text("Standard 120 LPM off-air Weatherfax drum speed (2 lines/sec)")
+        self.btn_wf_lpm.connect("clicked", lambda _b: self._set_wefax_turbo(False))
+        wf_bar.pack_start(self.btn_wf_lpm, False, False, 0)
+
+        self.btn_wf_turbo = Gtk.Button(label="TURBO 8x (DEMO)")
+        self.btn_wf_turbo.set_tooltip_text("Accelerated 960 LPM drum + test transmitter for rapid chart preview")
+        self.btn_wf_turbo.connect("clicked", lambda _b: self._set_wefax_turbo(True))
+        wf_bar.pack_start(self.btn_wf_turbo, False, False, 0)
+
+        self.btn_wf_inv = Gtk.Button(label="INVERT")
+        self.btn_wf_inv.connect("clicked", self._on_wefax_invert)
+        wf_bar.pack_start(self.btn_wf_inv, False, False, 0)
+
+        btn_wf_ph = Gtk.Button(label="RE-PHASE")
+        btn_wf_ph.connect("clicked", lambda _b: self.ctrl.wefax.request_rephase())
+        wf_bar.pack_start(btn_wf_ph, False, False, 0)
+
+        btn_wf_clr = Gtk.Button(label="CLEAR DRUM")
+        btn_wf_clr.connect("clicked", lambda _b: self.ctrl.wefax.reset())
+        wf_bar.pack_start(btn_wf_clr, False, False, 0)
+
+        btn_wf_png = Gtk.Button(label="SAVE PNG")
+        btn_wf_png.connect("clicked", self._on_save_wefax_png)
+        wf_bar.pack_end(btn_wf_png, False, False, 0)
+        self.sub_stack.add_named(wf_bar, "WEFAX")
+
+        # -- 3e. SSTV Sub-Bar --
+        sstv_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        lbl_sv = Gtk.Label(label="SSTV FORMAT")
+        lbl_sv.get_style_context().add_class("rx-engraved")
+        sstv_bar.pack_start(lbl_sv, False, False, 2)
+
+        self.sstv_mode_btns: dict[str, Gtk.Button] = {}
+        for sm in ("ROBOT 36", "MARTIN M1"):
+            b = Gtk.Button(label=sm)
+            b.connect("clicked", self._on_sstv_submode, sm)
+            self.sstv_mode_btns[sm] = b
+            sstv_bar.pack_start(b, False, False, 0)
+
+        self.btn_sstv_auto = Gtk.Button(label="AUTO VIS")
+        self.btn_sstv_auto.set_tooltip_text("Auto-detect Robot 36 / Martin M1 from 1900/1200 Hz VIS header")
+        self.btn_sstv_auto.connect("clicked", self._on_sstv_toggle_vis)
+        sstv_bar.pack_start(self.btn_sstv_auto, False, False, 0)
+
+        btn_sv_res = Gtk.Button(label="RE-SYNC / CLEAR")
+        btn_sv_res.connect("clicked", lambda _b: self.ctrl.sstv.reset())
+        sstv_bar.pack_start(btn_sv_res, False, False, 0)
+
+        self.sstv_stat_lbl = Gtk.Label(label="VIS: STANDBY • 320x240")
+        self.sstv_stat_lbl.get_style_context().add_class("rx-badge")
+        sstv_bar.pack_start(self.sstv_stat_lbl, False, False, 6)
+
+        btn_sv_png = Gtk.Button(label="SAVE PNG")
+        btn_sv_png.connect("clicked", self._on_save_sstv_png)
+        sstv_bar.pack_end(btn_sv_png, False, False, 0)
+        self.sub_stack.add_named(sstv_bar, "SSTV")
+
+        # 4. Main Center Workspace Stack (Teletype Paper Roll / WEFAX Drum / SSTV Monitor)
+        self.work_stack = Gtk.Stack()
+        self.work_stack.set_transition_type(Gtk.StackTransitionType.NONE)
+        cab.pack_start(self.work_stack, True, True, 0)
+
+        # -- Page A: Perforated #FFF7E9 Teletype Paper Roll + Right Telemetry Card (CW, RTTY, SAME) --
+        tty_split = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+        paper_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        paper_box.get_style_context().add_class("tty-roll-frame")
+        tty_split.pack_start(paper_box, True, True, 0)
+
+        sp_left = Gtk.DrawingArea()
+        sp_left.set_size_request(18, -1)
+        sp_left.connect("draw", self._on_draw_sprockets)
+        paper_box.pack_start(sp_left, False, False, 0)
+
+        tty_scroll = Gtk.ScrolledWindow()
+        tty_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.tty_view = Gtk.TextView()
+        self.tty_view.set_editable(False)
+        self.tty_view.set_cursor_visible(True)
+        self.tty_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.tty_view.set_left_margin(10)
+        self.tty_view.set_right_margin(10)
+        self.tty_view.set_top_margin(6)
+        self.tty_view.set_bottom_margin(6)
+        self.tty_view.get_style_context().add_class("tty-paper")
+        self.tty_buf = self.tty_view.get_buffer()
+        self.tty_buf.set_text(
+            "=== dtDecoder TELETYPE COPY ROLL (12.0 kHz DSP READY) ===\n"
+            "Listening on Desktop Monitor (dtRadio) — or click [▶ SEND TEST SIGNAL].\n\n"
+        )
+        self._tty_end_mark = self.tty_buf.create_mark("end_mark", self.tty_buf.get_end_iter(), False)
+        tty_scroll.add(self.tty_view)
+        paper_box.pack_start(tty_scroll, True, True, 0)
+
+        sp_right = Gtk.DrawingArea()
+        sp_right.set_size_request(18, -1)
+        sp_right.connect("draw", self._on_draw_sprockets)
+        paper_box.pack_start(sp_right, False, False, 0)
+
+        telem_frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        telem_frame.get_style_context().add_class("sunken-bezel")
+        self.telem_area = Gtk.DrawingArea()
+        self.telem_area.set_size_request(268, 220)
+        self.telem_area.connect("draw", self._on_draw_telemetry)
+        telem_frame.pack_start(self.telem_area, True, True, 0)
+        tty_split.pack_start(telem_frame, False, False, 0)
+
+        self.work_stack.add_named(tty_split, "tty")
+
+        # -- Page B: Alden Marine Thermal Drum Facsimile Canvas --
+        wf_split = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        wf_frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        wf_frame.get_style_context().add_class("sunken-bezel")
+        self.wefax_area = Gtk.DrawingArea()
+        self.wefax_area.set_size_request(800, 230)
+        self.wefax_area.connect("draw", self._on_draw_wefax)
+        wf_frame.pack_start(self.wefax_area, True, True, 0)
+        wf_split.pack_start(wf_frame, True, True, 0)
+
+        wf_side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        wf_side.get_style_context().add_class("rx-strip")
+        wf_side.set_size_request(255, -1)
+        lbl_wfh = Gtk.Label(label="ALDEN THERMAL DRUM")
+        lbl_wfh.get_style_context().add_class("rx-badge")
+        lbl_wfh.set_xalign(0.0)
+        wf_side.pack_start(lbl_wfh, False, False, 2)
+
+        self.wefax_info_lbl = Gtk.Label()
+        self.wefax_info_lbl.get_style_context().add_class("rx-engraved")
+        self.wefax_info_lbl.set_xalign(0.0)
+        self.wefax_info_lbl.set_yalign(0.0)
+        self.wefax_info_lbl.set_line_wrap(True)
+        wf_side.pack_start(self.wefax_info_lbl, True, True, 2)
+        wf_split.pack_start(wf_side, False, False, 0)
+
+        self.work_stack.add_named(wf_split, "wefax")
+
+        # -- Page C: Slow-Scan Television Phosphor Monitor --
+        sv_split = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        sv_frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        sv_frame.get_style_context().add_class("sunken-bezel")
+        self.sstv_area = Gtk.DrawingArea()
+        self.sstv_area.set_size_request(800, 230)
+        self.sstv_area.connect("draw", self._on_draw_sstv)
+        sv_frame.pack_start(self.sstv_area, True, True, 0)
+        sv_split.pack_start(sv_frame, True, True, 0)
+
+        sv_side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        sv_side.get_style_context().add_class("rx-strip")
+        sv_side.set_size_request(255, -1)
+        lbl_svh = Gtk.Label(label="SLOW-SCAN TV MONITOR")
+        lbl_svh.get_style_context().add_class("rx-badge")
+        lbl_svh.set_xalign(0.0)
+        sv_side.pack_start(lbl_svh, False, False, 2)
+
+        self.sstv_info_lbl = Gtk.Label()
+        self.sstv_info_lbl.get_style_context().add_class("rx-engraved")
+        self.sstv_info_lbl.set_xalign(0.0)
+        self.sstv_info_lbl.set_yalign(0.0)
+        self.sstv_info_lbl.set_line_wrap(True)
+        sv_side.pack_start(self.sstv_info_lbl, True, True, 2)
+        sv_split.pack_start(sv_side, False, False, 0)
+
+        self.work_stack.add_named(sv_split, "sstv")
+
+        # 5. Six Machined Spun-Aluminum Rotary Knobs Row
+        knob_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        knob_row.get_style_context().add_class("rx-strip")
+        cab.pack_start(knob_row, False, False, 0)
+
+        self.knob_tone = RotaryKnob(
+            "TONE / MARK",
+            (700.0 - 380.0) / 2220.0,
+            (700.0 - 380.0) / 2220.0,
+            self._on_knob_tone,
+            lambda v: f"{int(round(380.0 + v * 2220.0))} Hz",
+        )
+        self.knob_sq = RotaryKnob(
+            "SQUELCH",
+            0.00,
+            0.00,
+            self._on_knob_sq,
+            lambda v: "OPEN" if v < 0.03 else f"S{int(1 + v * 8)}",
+        )
+        self.knob_gain = RotaryKnob(
+            "INPUT GAIN",
+            0.50,
+            0.50,
+            self._on_knob_gain,
+            lambda v: f"{int(round(v * 200.0))}%",
+        )
+        self.knob_gate = RotaryKnob(
+            "NOISE GATE",
+            0.16,
+            0.16,
+            self._on_knob_gate,
+            lambda v: f"{int(round(v * 100.0))}%",
+        )
+        self.knob_slant = RotaryKnob(
+            "SLANT / FINE",
+            0.50,
+            0.50,
+            self._on_knob_slant,
+            lambda v: f"{int(round((v - 0.5) * 100.0)):+d}",
+        )
+        self.knob_vol = RotaryKnob(
+            "MON VOL",
+            0.55,
+            0.55,
+            self._on_knob_vol,
+            lambda v: f"{int(round(v * 100.0))}%",
+        )
+
+        for kn in (self.knob_tone, self.knob_sq, self.knob_gain, self.knob_gate, self.knob_slant, self.knob_vol):
+            knob_row.pack_start(kn, True, True, 0)
+
+        # 6. Bottom CDE Sunken Status Strip
+        st_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        st_bar.get_style_context().add_class("cde-status")
+        outer.pack_start(st_bar, False, False, 0)
+
+        self.status_lbl = Gtk.Label(label="READY")
+        self.status_lbl.set_xalign(0.0)
+        st_bar.pack_start(self.status_lbl, True, True, 0)
+
+        self.rate_lbl = Gtk.Label(label="DSP: 12.0 kHz S16LE • 2048-PT FFT")
+        self.rate_lbl.set_xalign(1.0)
+        st_bar.pack_end(self.rate_lbl, False, False, 0)
+
+    # ---- Helpers & State Sync ----
+    def _set_btn_active(self, btn: Gtk.Button, active: bool):
+        ctx = btn.get_style_context()
+        if active:
+            ctx.add_class("sw-active")
+        else:
+            ctx.remove_class("sw-active")
+
+    def _sync_all_buttons(self):
+        for k, b in self.src_btns.items():
+            self._set_btn_active(b, self.router.input_source == k)
+        self._set_btn_active(self.btn_spk, self.router.mon_speaker)
+
+        for m, b in self.mode_btns.items():
+            self._set_btn_active(b, self.ctrl.mode == m)
+
+        self.sub_stack.set_visible_child_name(self.ctrl.mode)
+        if self.ctrl.mode in ("CW", "RTTY", "SAME"):
+            self.work_stack.set_visible_child_name("tty")
+        elif self.ctrl.mode == "WEFAX":
+            self.work_stack.set_visible_child_name("wefax")
+        else:
+            self.work_stack.set_visible_child_name("sstv")
+
+        for bd, b in self.rtty_baud_btns.items():
+            self._set_btn_active(b, abs(self.ctrl.rtty.baud - bd) < 0.1)
+        for sh, b in self.rtty_shift_btns.items():
+            self._set_btn_active(b, abs(self.ctrl.rtty.shift_hz - sh) < 1.0)
+        self._set_btn_active(self.btn_rtty_rev, self.ctrl.rtty.reverse)
+        self._set_btn_active(self.btn_rtty_usos, self.ctrl.rtty.usos)
+
+        self._set_btn_active(self.btn_wf_lpm, not self._wefax_turbo)
+        self._set_btn_active(self.btn_wf_turbo, self._wefax_turbo)
+        self._set_btn_active(self.btn_wf_inv, self.ctrl.wefax.invert)
+
+        for sm, b in self.sstv_mode_btns.items():
+            self._set_btn_active(b, self.ctrl.sstv.mode_name == sm)
+        self._set_btn_active(self.btn_sstv_auto, self.ctrl.sstv.auto_vis)
+
+        # Sync TONE/MARK knob to active mode's center/mark frequency
+        self._updating_knobs = True
+        target_hz = self.ctrl.cw.pitch_hz if self.ctrl.mode == "CW" else self.ctrl.rtty.mark_hz
+        self.knob_tone.set_value((target_hz - 380.0) / 2220.0, notify=False)
+        self._updating_knobs = False
+
+    def _append_tty_text(self, text: str):
+        if not text:
+            return
+        end_it = self.tty_buf.get_end_iter()
+        self.tty_buf.insert(end_it, text)
+        # Keep buffer bounded cleanly
+        if self.tty_buf.get_char_count() > 16000:
+            s_it = self.tty_buf.get_start_iter()
+            cut_it = self.tty_buf.get_iter_at_offset(2000)
+            self.tty_buf.delete(s_it, cut_it)
+        self.tty_view.scroll_mark_onscreen(self._tty_end_mark)
+
+    def _clear_tty_roll(self):
+        self.ctrl.cw.decoded_text = ""
+        self.ctrl.rtty.decoded_text = ""
+        self.tty_buf.set_text("")
+
+    def _save_tty_log(self):
+        CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_p = CAPTURE_DIR / f"dtdecoder_copy_{ts}.txt"
+        s_it, e_it = self.tty_buf.get_bounds()
+        out_p.write_text(self.tty_buf.get_text(s_it, e_it, False), encoding="utf-8")
+        self._set_status(f"SAVED TELETYPE ROLL -> {out_p}")
+
+    def _set_status(self, msg: str):
+        self.status_lbl.set_text(msg)
+        return False
+
+    # ---- UI Tick (~30 fps) ----
+    def _on_ui_tick(self) -> bool:
+        # Drain queued audio chunks into DSP
+        drained = 0
+        while drained < 24:
+            try:
+                _origin, chunk = self.router.rx_queue.get_nowait()
+            except queue.Empty:
+                break
+            drained += 1
+            ev = self.ctrl.ingest_samples(chunk)
+            if ev["tty_text"]:
+                self._append_tty_text(ev["tty_text"])
+            for al in ev["same_alerts"]:
+                stamp = datetime.datetime.now().strftime("%H:%M:%S")
+                self._append_tty_text(
+                    f"\n*** [EAS {al['severity']}] {stamp} — {al['raw']} ***\n"
+                    f"    {al['summary']}\n\n"
+                )
+
+        self.ctrl.step_waterfall()
+
+        # Update TX button styling
+        tx_active = self.router.is_transmitting_test()
+        tctx = self.btn_test_tx.get_style_context()
+        if tx_active:
+            self.btn_test_tx.set_label("■ STOP TEST TX")
+            tctx.remove_class("btn-tx")
+            tctx.add_class("btn-tx-on")
+        else:
+            self.btn_test_tx.set_label("▶ SEND TEST SIGNAL")
+            tctx.remove_class("btn-tx-on")
+            tctx.add_class("btn-tx")
+
+        # Update WEFAX & SSTV side telemetry labels
+        if self.ctrl.mode == "WEFAX":
+            ph_txt = "LOCKED (COL 0)" if self.ctrl.wefax.phasing_locked else "SEARCHING..."
+            self.wefax_info_lbl.set_text(
+                f"IOC:      576 (WMO STD)\n"
+                f"SPEED:    {self.ctrl.wefax.lpm:.0f} LPM\n"
+                f"PHASING:  {ph_txt}\n"
+                f"SCANLINE: {self.ctrl.wefax.line_idx} / {self.ctrl.wefax.MAX_LINES}\n"
+                f"SLANT:    {int(round(self.ctrl.slant_fine * 50)):+d}\n"
+                f"POLARITY: {'INVERTED' if self.ctrl.wefax.invert else 'NORMAL'}\n\n"
+                f"Click [▶ SEND TEST SIGNAL]\n"
+                f"to transmit USCG NMC Pt. Reyes\n"
+                f"Pacific Surface Analysis."
+            )
+            self.wefax_area.queue_draw()
+        elif self.ctrl.mode == "SSTV":
+            vis_s = f"0x{self.ctrl.sstv.vis_code:02X}" if self.ctrl.sstv.vis_code >= 0 else "AUTO"
+            fh = self.ctrl.sstv.active_height()
+            self.sstv_stat_lbl.set_text(
+                f"VIS: {vis_s} ({self.ctrl.sstv.mode_name}) • LINE {self.ctrl.sstv.line_idx}/{fh}"
+            )
+            self.sstv_info_lbl.set_text(
+                f"FORMAT:   {self.ctrl.sstv.mode_name}\n"
+                f"RES:      320 x {fh} RGB\n"
+                f"VIS CODE: {vis_s}\n"
+                f"STATE:    {self.ctrl.sstv.rx_state}\n"
+                f"SCANLINE: {self.ctrl.sstv.line_idx} / {fh}\n"
+                f"SYNC:     1200 Hz (9.0 ms)\n"
+                f"VIDEO:    1500-2300 Hz\n\n"
+                f"Click [▶ SEND TEST SIGNAL]\n"
+                f"to transmit W1AW / FN31pr\n"
+                f"Color SSTV Test Card."
+            )
+            self.sstv_area.queue_draw()
+        else:
+            self.telem_area.queue_draw()
+
+        self.deck_area.queue_draw()
+        return True
+
+    # ---- Cairo Draw Callbacks ----
+    def _on_draw_deck(self, w, cr: cairo.Context):
+        alloc = w.get_allocation()
+        self._wf_geom = self.ctrl.draw_top_deck(cr, float(alloc.width), float(alloc.height))
+        return False
+
+    def _on_draw_sprockets(self, w, cr: cairo.Context):
+        alloc = w.get_allocation()
+        self.ctrl.draw_tty_sprockets(cr, float(alloc.width), float(alloc.height))
+        return False
+
+    def _on_draw_telemetry(self, w, cr: cairo.Context):
+        alloc = w.get_allocation()
+        self.ctrl.draw_telemetry_card(cr, float(alloc.width), float(alloc.height))
+        return False
+
+    def _on_draw_wefax(self, w, cr: cairo.Context):
+        alloc = w.get_allocation()
+        self.ctrl.draw_wefax_drum(cr, float(alloc.width), float(alloc.height))
+        return False
+
+    def _on_draw_sstv(self, w, cr: cairo.Context):
+        alloc = w.get_allocation()
+        self.ctrl.draw_sstv_crt(cr, float(alloc.width), float(alloc.height))
+        return False
+
+    # ---- Interactive Waterfall Tuning ----
+    def _tune_from_wf_x(self, ev_x: float):
+        wf_x, wf_w = self._wf_geom
+        if wf_w <= 10.0:
+            return
+        frac = max(0.0, min(1.0, (ev_x - wf_x) / wf_w))
+        hz = WF_MIN_HZ + frac * (WF_MAX_HZ - WF_MIN_HZ)
+        if self.ctrl.mode in ("CW", "RTTY"):
+            self.ctrl.set_tone_mark_hz(hz)
+            self._updating_knobs = True
+            self.knob_tone.set_value((hz - 380.0) / 2220.0, notify=False)
+            self._updating_knobs = False
+            self.deck_area.queue_draw()
+
+    def _on_deck_press(self, _w, ev):
+        wf_x, wf_w = self._wf_geom
+        if ev.button == 1 and wf_x <= ev.x <= wf_x + wf_w:
+            self._wf_dragging = True
+            self._tune_from_wf_x(ev.x)
+            return True
+        return False
+
+    def _on_deck_release(self, _w, _ev):
+        self._wf_dragging = False
+        return False
+
+    def _on_deck_motion(self, _w, ev):
+        if self._wf_dragging:
+            self._tune_from_wf_x(ev.x)
+            return True
+        return False
+
+    def _on_deck_scroll(self, _w, ev):
+        if self.ctrl.mode not in ("CW", "RTTY"):
+            return False
+        cur = self.ctrl.cw.pitch_hz if self.ctrl.mode == "CW" else self.ctrl.rtty.mark_hz
+        step = 10.0
+        if ev.direction == Gdk.ScrollDirection.UP:
+            cur += step
+        elif ev.direction == Gdk.ScrollDirection.DOWN:
+            cur -= step
+        elif ev.direction == Gdk.ScrollDirection.SMOOTH:
+            _, _dx, dy = ev.get_scroll_deltas()
+            cur -= dy * step
+        self.ctrl.set_tone_mark_hz(cur)
+        self._sync_all_buttons()
+        return True
+
+    # ---- Control Callbacks ----
+    def _on_source_clicked(self, _b, src_key: str):
+        self.router.stop_test_tx()
+        self.router.set_input_source(src_key)
+        self._sync_all_buttons()
+
+    def _on_load_wav_clicked(self, _b):
+        dlg = Gtk.FileChooserDialog(
+            title="Open WAV Aircheck Recording",
+            parent=self,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dlg.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
+        if AIRCHECK_DIR.is_dir():
+            dlg.set_current_folder(str(AIRCHECK_DIR))
+        else:
+            dlg.set_current_folder(str(HOME))
+        flt = Gtk.FileFilter()
+        flt.set_name("WAV Audio (*.wav)")
+        flt.add_pattern("*.wav")
+        flt.add_pattern("*.WAV")
+        dlg.add_filter(flt)
+        resp = dlg.run()
+        fname = dlg.get_filename()
+        dlg.destroy()
+        if resp == Gtk.ResponseType.OK and fname:
+            self.router.load_wav_file(Path(fname))
+            self._sync_all_buttons()
+
+    def _on_toggle_spk(self, _b):
+        self.router.mon_speaker = not self.router.mon_speaker
+        self._sync_all_buttons()
+
+    def _on_mode_clicked(self, _b, mode_key: str):
+        if self.router.is_transmitting_test():
+            self.router.stop_test_tx()
+        self.ctrl.set_mode(mode_key)
+        self._sync_all_buttons()
+
+    def _on_cw_snap(self, _b):
+        snapped = self.ctrl.snap_cw_peak()
+        self._sync_all_buttons()
+        self._set_status(f"CW PEAK SNAP -> {snapped:.1f} Hz")
+
+    def _on_rtty_baud(self, _b, baud: float):
+        self.ctrl.rtty.configure(baud=baud)
+        self._sync_all_buttons()
+
+    def _on_rtty_shift(self, _b, shift: float):
+        self.ctrl.rtty.configure(shift_hz=shift)
+        self.ctrl._update_xy_filters()
+        self._sync_all_buttons()
+
+    def _on_rtty_rev(self, _b):
+        self.ctrl.rtty.configure(reverse=not self.ctrl.rtty.reverse)
+        self.ctrl._update_xy_filters()
+        self._sync_all_buttons()
+
+    def _on_rtty_usos(self, _b):
+        self.ctrl.rtty.configure(usos=not self.ctrl.rtty.usos)
+        self._sync_all_buttons()
+
+    def _on_same_reset_lamp(self, _b):
+        self.ctrl.same.alert_lamp_active = False
+        self.ctrl.same.eom_received = False
+
+    def _on_same_clear(self, _b):
+        self.ctrl.same.clear_alerts()
+        self._clear_tty_roll()
+
+    def _set_wefax_turbo(self, turbo: bool):
+        self._wefax_turbo = turbo
+        self.ctrl.wefax.lpm = 960.0 if turbo else 120.0
+        self._sync_all_buttons()
+
+    def _on_wefax_invert(self, _b):
+        self.ctrl.wefax.invert = not self.ctrl.wefax.invert
+        self._sync_all_buttons()
+
+    def _on_save_wefax_png(self, _b):
+        CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_p = CAPTURE_DIR / f"wefax_{ts}.png"
+        n_rows = max(64, self.ctrl.wefax.line_idx)
+        Image.fromarray(self.ctrl.wefax.canvas[:n_rows], mode="L").save(out_p)
+        self._set_status(f"SAVED WEFAX CHART -> {out_p}")
+
+    def _on_sstv_submode(self, _b, sm: str):
+        self.ctrl.sstv.mode_name = sm
+        self.ctrl.sstv.reset()
+        self._sync_all_buttons()
+
+    def _on_sstv_toggle_vis(self, _b):
+        self.ctrl.sstv.auto_vis = not self.ctrl.sstv.auto_vis
+        self._sync_all_buttons()
+
+    def _on_save_sstv_png(self, _b):
+        CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_p = CAPTURE_DIR / f"sstv_{ts}.png"
+        fh = self.ctrl.sstv.active_height()
+        Image.fromarray(self.ctrl.sstv.frame_rgb[:fh], mode="RGB").save(out_p)
+        self._set_status(f"SAVED SSTV FRAME -> {out_p}")
+
+    # ---- Built-In Live Test Signal Transmitter ([▶ SEND TEST SIGNAL]) ----
+    def _on_test_tx_clicked(self, _b):
+        if self.router.is_transmitting_test():
+            self.router.stop_test_tx()
+            return
+
+        m = self.ctrl.mode
+        if m == "CW":
+            wpm_txt = self.cw_wpm_combo.get_active_text() or "20 WPM"
+            wpm = float(wpm_txt.split()[0])
+            msg = self.cw_msg_entry.get_text().strip() or "CQ CQ DE W1AW FN31 K"
+            self.ctrl.cw.reset()
+            self._append_tty_text(f"\n[CW TEST TX {wpm:.0f} WPM @ {self.ctrl.cw.pitch_hz:.0f} Hz]: ")
+            pcm = synthesize_cw_audio(msg, wpm=wpm, pitch_hz=self.ctrl.cw.pitch_hz)
+            self.router.start_test_tx(pcm, f"CW {wpm:.0f} WPM ({msg[:28]})")
+
+        elif m == "RTTY":
+            msg = self.rtty_msg_entry.get_text().strip() or "RYRY DE W1AW 73"
+            if not msg.startswith("\r\n"):
+                msg = "\r\n" + msg + "\r\n"
+            self.ctrl.rtty.reset()
+            self._append_tty_text(
+                f"\n[RTTY TEST TX {self.ctrl.rtty.baud:g} Bd / {self.ctrl.rtty.shift_hz:.0f} Hz]: "
+            )
+            pcm = synthesize_rtty_audio(
+                msg,
+                baud=self.ctrl.rtty.baud,
+                mark_hz=self.ctrl.rtty.mark_hz,
+                shift_hz=self.ctrl.rtty.shift_hz,
+                reverse=self.ctrl.rtty.reverse,
+            )
+            self.router.start_test_tx(pcm, f"RTTY {self.ctrl.rtty.baud:g} BAUD ITA2")
+
+        elif m == "SAME":
+            idx = max(0, self.same_preset_combo.get_active())
+            plbl, hdr = SAME_TEST_PRESETS[min(idx, len(SAME_TEST_PRESETS) - 1)]
+            self.ctrl.same.reset_stream()
+            pcm = synthesize_same_audio(hdr, include_attn_and_eom=True, bursts=2)
+            self.router.start_test_tx(pcm, f"SAME AFSK ({plbl})")
+
+        elif m == "WEFAX":
+            self.ctrl.wefax.reset()
+            lpm = 960.0 if self._wefax_turbo else 120.0
+            self.ctrl.wefax.lpm = lpm
+            chart = self.ctrl.get_wefax_chart()
+            pcm = synthesize_wefax_audio(chart, lpm=lpm, phasing_lines=3)
+            self.router.start_test_tx(pcm, f"NMC PT REYES WEFAX ({lpm:.0f} LPM)")
+
+        elif m == "SSTV":
+            sub = self.ctrl.sstv.mode_name
+            self.ctrl.sstv.reset()
+            self.ctrl.sstv.mode_name = sub
+            if sub == "MARTIN M1":
+                card = self.ctrl.get_sstv_card(256)
+                pcm = synthesize_sstv_martin_m1(card)
+            else:
+                card = self.ctrl.get_sstv_card(240)
+                pcm = synthesize_sstv_robot36(card)
+            self.router.start_test_tx(pcm, f"SSTV {sub} W1AW TEST CARD")
+
+    # ---- Rotary Knob Callbacks ----
+    def _on_knob_tone(self, val: float):
+        if self._updating_knobs:
+            return
+        hz = 380.0 + val * 2220.0
+        self.ctrl.set_tone_mark_hz(hz)
+
+    def _on_knob_sq(self, val: float):
+        self.ctrl.squelch = val
+
+    def _on_knob_gain(self, val: float):
+        self.router.input_gain = max(0.05, val * 2.0)
+
+    def _on_knob_gate(self, val: float):
+        self.ctrl.noise_gate = val * 0.5
+
+    def _on_knob_slant(self, val: float):
+        self.ctrl.set_slant_fine((val - 0.5) * 2.0)
+
+    def _on_knob_vol(self, val: float):
+        self.router.mon_volume = val
+
+    # ---- Persistence ----
+    def _load_state(self):
+        if not STATE_FILE.is_file():
+            return
+        try:
+            st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            mode = str(st.get("mode", "CW"))
+            if mode in MODES:
+                self.ctrl.set_mode(mode)
+            self.ctrl.cw.set_pitch(float(st.get("cw_pitch_hz", 700.0)))
+            self.ctrl.rtty.configure(
+                baud=float(st.get("rtty_baud", 45.45)),
+                mark_hz=float(st.get("rtty_mark_hz", 2125.0)),
+                shift_hz=float(st.get("rtty_shift_hz", 170.0)),
+            )
+            self.knob_sq.set_value(float(st.get("squelch", 0.0)), notify=True)
+            self.knob_gain.set_value(float(st.get("gain", 0.5)), notify=True)
+            self.knob_gate.set_value(float(st.get("gate", 0.16)), notify=True)
+            self.knob_vol.set_value(float(st.get("mon_vol", 0.55)), notify=True)
+            self.router.mon_speaker = bool(st.get("mon_speaker", True))
+        except Exception:
+            pass
+
+    def _save_state(self):
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            st = {
+                "mode": self.ctrl.mode,
+                "cw_pitch_hz": self.ctrl.cw.pitch_hz,
+                "rtty_baud": self.ctrl.rtty.baud,
+                "rtty_mark_hz": self.ctrl.rtty.mark_hz,
+                "rtty_shift_hz": self.ctrl.rtty.shift_hz,
+                "squelch": self.knob_sq.value,
+                "gain": self.knob_gain.value,
+                "gate": self.knob_gate.value,
+                "mon_vol": self.knob_vol.value,
+                "mon_speaker": self.router.mon_speaker,
+            }
+            STATE_FILE.write_text(json.dumps(st, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _run_gui_self_test(self) -> bool:
+        rc = verify_all_decoders_and_cairo()
+        if rc == 0:
+            print("DTDECODER_SELF_TEST_OK")
+            sys.stdout.flush()
+        self.destroy()
+        if rc != 0:
+            sys.exit(rc)
+        return False
+
+    def _on_destroy(self, _w):
+        if not self._self_test:
+            self._save_state()
+        self.router.stop()
+        if Gtk.main_level() > 0:
+            Gtk.main_quit()
+
+
+# ---------------------------------------------------------------------------
+# End-to-End Automated Self-Test (All 5 DSP Modes + Cairo Instrument Surfaces)
+# ---------------------------------------------------------------------------
+def verify_all_decoders_and_cairo() -> int:
+    ctrl = DecoderController()
+
+    # 1. Verify CW / MORSE synthesis + adaptive decoder + peak snap
+    ctrl.set_mode("CW")
+    ctrl.cw.set_pitch(700.0)
+    cw_pcm = synthesize_cw_audio("CQ DE W1AW K", wpm=22.0, pitch_hz=700.0)
+    for idx in range(0, len(cw_pcm), 600):
+        ctrl.ingest_samples(cw_pcm[idx: idx + 600])
+    ctrl.step_waterfall()
+    assert "CQ DE W1AW K" in ctrl.cw.decoded_text, f"CW mismatch: {ctrl.cw.decoded_text!r}"
+
+    # 2. Verify RTTY (BAUDOT ITA2 + FIGS/LTRS + USOS) synthesis + ATC UART decoder
+    ctrl.set_mode("RTTY")
+    ctrl.rtty.reset()
+    ctrl.rtty.configure(baud=45.45, mark_hz=2125.0, shift_hz=170.0, reverse=False, usos=True)
+    rtty_pcm = synthesize_rtty_audio(
+        "\r\nZCZC DE W1AW FN31 73\r\n", baud=45.45, mark_hz=2125.0, shift_hz=170.0
+    )
+    for idx in range(0, len(rtty_pcm), 600):
+        ctrl.ingest_samples(rtty_pcm[idx: idx + 600])
+    ctrl.step_waterfall()
+    assert "W1AW" in ctrl.rtty.decoded_text and "73" in ctrl.rtty.decoded_text, (
+        f"RTTY mismatch: {ctrl.rtty.decoded_text!r}"
+    )
+
+    # 3. Verify SAME / EAS 520.83 baud AFSK header + EOM decoder
+    ctrl.set_mode("SAME")
+    ctrl.same.reset_stream()
+    test_hdr = "ZCZC-WXR-RWT-009003+0030-3311830-KBOX/NWS-"
+    same_pcm = synthesize_same_audio(test_hdr, include_attn_and_eom=True, bursts=2)
+    for idx in range(0, len(same_pcm), 600):
+        ctrl.ingest_samples(same_pcm[idx: idx + 600])
+    assert ctrl.same.last_alert is not None, "SAME failed to decode ZCZC header"
+    assert ctrl.same.last_alert["org"] == "WXR", f"Unexpected SAME org: {ctrl.same.last_alert}"
+    assert ctrl.same.last_alert["event"] == "RWT", f"Unexpected SAME event: {ctrl.same.last_alert}"
+    assert "009003" in ctrl.same.last_alert["locations"], "Missing Hartford County FIPS 009003"
+    assert ctrl.same.eom_received, "SAME failed to detect NNNN EOM"
+
+    # 4. Verify HF WEFAX (IOC 576) FM synthesis + phasing auto-align + drum scanlines
+    ctrl.set_mode("WEFAX")
+    ctrl.wefax.reset()
+    ctrl.wefax.lpm = 960.0
+    chart_slice = ctrl.get_wefax_chart()[:24]
+    wf_pcm = synthesize_wefax_audio(chart_slice, lpm=960.0, phasing_lines=3)
+    for idx in range(0, len(wf_pcm), 600):
+        ctrl.ingest_samples(wf_pcm[idx: idx + 600])
+    assert ctrl.wefax.phasing_locked, "WEFAX failed to lock white-on-black phasing pulse"
+    assert ctrl.wefax.lines_decoded >= 20, f"WEFAX decoded too few lines: {ctrl.wefax.lines_decoded}"
+    contrast = int(np.max(ctrl.wefax.canvas[:20])) - int(np.min(ctrl.wefax.canvas[:20]))
+    assert contrast > 140, f"WEFAX scanline contrast too low: {contrast}"
+
+    # 5. Verify SSTV (Robot 36 VIS 0x08 + color YCrCb scanlines)
+    ctrl.set_mode("SSTV")
+    ctrl.sstv.reset()
+    card = ctrl.get_sstv_card(240)
+    sstv_pcm = synthesize_sstv_robot36(card, max_lines=16)
+    for idx in range(0, len(sstv_pcm), 600):
+        ctrl.ingest_samples(sstv_pcm[idx: idx + 600])
+    assert ctrl.sstv.vis_code == 0x08, f"SSTV VIS mismatch: {ctrl.sstv.vis_code}"
+    assert ctrl.sstv.mode_name == "ROBOT 36", f"SSTV mode mismatch: {ctrl.sstv.mode_name}"
+    assert ctrl.sstv.lines_decoded >= 14, f"SSTV decoded too few lines: {ctrl.sstv.lines_decoded}"
+    rgb_span = int(np.max(ctrl.sstv.frame_rgb[:14])) - int(np.min(ctrl.sstv.frame_rgb[:14]))
+    assert rgb_span > 140, f"SSTV color contrast too low: {rgb_span}"
+
+    # 6. Verify Cairo UI rendering across all modes & custom canvases
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1100, 300)
+    cr = cairo.Context(surf)
+    for m in MODES:
+        ctrl.set_mode(m)
+        ctrl.step_waterfall()
+        ctrl.draw_top_deck(cr, 1100.0, 180.0)
+        ctrl.draw_telemetry_card(cr, 268.0, 220.0)
+    ctrl.draw_tty_sprockets(cr, 18.0, 240.0)
+    ctrl.draw_wefax_drum(cr, 800.0, 240.0)
+    ctrl.draw_sstv_crt(cr, 800.0, 240.0)
+
+    return 0
+
+
+def main():
+    self_test = "--self-test" in sys.argv[1:]
+    gtk_ok, _ = Gtk.init_check(sys.argv)
+
+    if self_test and not gtk_ok:
+        rc = verify_all_decoders_and_cairo()
+        if rc == 0:
+            print("DTDECODER_SELF_TEST_OK")
+            sys.stdout.flush()
+        sys.exit(rc)
+
+    if not gtk_ok:
+        sys.stderr.write("dtDecoder: cannot open X11 display.\n")
+        sys.exit(1)
+
+    win = DtDecoderWindow(self_test=self_test)
+    win.show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

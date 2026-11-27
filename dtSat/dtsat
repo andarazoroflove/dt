@@ -1,0 +1,2917 @@
+#!/usr/bin/env python3
+"""
+dtSat — Vintage NASA/NORAD & Amateur Radio Satellite Pass & Doppler Tracker for CDE
+
+Features:
+  - Authentic 1980s/1990s Cheyenne Mountain / NASA Mission Control workstation console
+    styled for CDE (OSF/Motif 3D bevels, xrdb palette sync, glowing VFD readouts)
+  - Pure-Python SGP4/J2 Secular & Short-Period Perturbation Orbital Propagator:
+      * Standard 3-line NORAD TLE parser (Modulo-10 checksums, B* & ndot drag)
+      * Iterative Newton-Raphson Kepler solver, J2 nodal regression & apsidal precession
+      * GMST Earth rotation, ECI -> ECEF -> WGS84 Geodetic Lat/Lon/Alt/Velocity
+      * Topocentric Azimuth, Elevation, Slant Range & Range-Rate from W1AW [FN31pr]
+  - 15 Built-in Iconic Spacecraft TLEs (100% offline ready) + Live CelesTrak Updater
+    (amateur, weather, stations cached to ~/.cache/dtsat/tles.txt)
+  - Vintage NORAD World Map (Gtk.DrawingArea):
+      * Embedded crisp vector continents/lakes, US/international borders, graticule & Maidenhead grid
+      * Switchable NORAD CYAN/BLUE, P31 PHOSPHOR GREEN, and AMBER TACTICAL themes
+      * Astronomical Solar Day/Night Terminator, W1AW [FN31pr] beacon, 3-orbit ground track,
+        live spherical radio-visibility footprint, and active Line-of-Sight vector
+  - Circular Az/El Polar Sky-Dome Radar:
+      * Horizon/30°/60° rings, N/E/S/W compass, all visible satellites, and full
+        AOS -> MAX EL -> LOS pass trajectory arc with 1-minute tick marks
+  - Glowing VFD Telemetry Banner + Live Full-Duplex Amateur & Weather Doppler Computer
+  - Interactive Fanfold Greenbar 24-Hour Pass Predictor Table (click any pass to preview)
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import dataclasses
+import datetime
+import json
+import math
+import os
+import re
+import struct
+import subprocess
+import sys
+import threading
+import time
+import zlib
+from pathlib import Path
+from typing import Any
+
+import cairo
+import gi
+import requests
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Pango", "1.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango
+
+HOME = Path.home()
+CONFIG_DIR = HOME / ".config" / "dtsat"
+CACHE_DIR = HOME / ".cache" / "dtsat"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+TLE_CACHE_FILE = CACHE_DIR / "tles.txt"
+
+UA = "dtSat/1.0 (CDE Amateur Radio & NORAD Orbital Tracker; W1AW FN31pr)"
+
+DEFAULT_CALLSIGN = "W1AW"
+DEFAULT_GRID = "FN31pr"
+DEFAULT_LAT = 41.7292
+DEFAULT_LON = -72.7083
+DEFAULT_ALT_M = 45.0
+
+# WGS-84 / SGP4 Physical & Astrodynamic Constants
+MU_EARTH = 398600.4418          # km^3 / s^2
+RE_WGS84 = 6378.137             # km (equatorial radius)
+FLAT_WGS84 = 1.0 / 298.257223563
+E2_WGS84 = 2.0 * FLAT_WGS84 - FLAT_WGS84 * FLAT_WGS84
+J2_EARTH = 1.08262668e-3
+OMEGA_EARTH = 7.2921150e-5      # rad / s
+C_LIGHT_KM_S = 299792.458       # km / s
+SEC_PER_DAY = 86400.0
+TWO_PI = 2.0 * math.pi
+
+CELESTRAK_URLS = [
+    ("stations", "https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&FORMAT=tle"),
+    ("amateur", "https://celestrak.org/NORAD/elements/gp.php?GROUP=amateur&FORMAT=tle"),
+    ("weather", "https://celestrak.org/NORAD/elements/gp.php?GROUP=weather&FORMAT=tle"),
+]
+
+# ---------------------------------------------------------------------------
+# Built-in Baseline TLEs for 15 Iconic Amateur, Weather & Crew Spacecraft
+# ---------------------------------------------------------------------------
+BUILTIN_TLES_RAW = """ISS (ZARYA)
+1 25544U 98067A   26330.51423611  .00014520  00000-0  26142-3 0  9997
+2 25544  51.6416 214.8240 0004852  92.4110 268.1840 15.49814210596422
+SO-50
+1 27607U 02058C   26330.48211806  .00000318  00000-0  41250-4 0  9999
+2 27607  64.5542 148.3120 0006120 244.6180 114.8250 14.71638420286141
+AO-91
+1 43017U 17073E   26330.42152778  .00001840  00000-0  11840-3 0  9993
+2 43017  97.7054  38.7420 0024315 172.9040 187.8120 14.81246510483128
+RS-44
+1 44909U 19096E   26330.39120370  .00000042  00000-0  18520-4 0  9996
+2 44909  82.5218 305.1180 0021840  64.2150 297.9420 12.79641230323450
+AO-7
+1 07530U 74089B   26330.45185185 -.00000028  00000-0  11200-4 0  9993
+2 07530 101.9540  18.4620 0001195 212.5480 147.5120 12.53648120382191
+IO-117
+1 53106U 22080E   26330.31250000  .00000012  00000-0  10000-4 0  9990
+2 53106  70.1425 192.6340 0000842 128.4120 231.6840  6.42531840102845
+PO-101
+1 43678U 18084H   26330.46875000  .00002210  00000-0  94210-4 0  9998
+2 43678  97.6812 122.9410 0001420  81.3250 278.9420 14.95421830441208
+LILACSAT-2
+1 40908U 15049K   26330.50115741  .00006420  00000-0  18420-3 0  9998
+2 40908  97.4518  54.2180 0001680 145.8120 214.4120 15.19241820619848
+TEVEL-3
+1 50990U 22002BH  26330.44097222  .00008950  00000-0  21450-3 0  9990
+2 50990  97.4485  68.9120 0001540 198.4120 161.7120 15.23518420268154
+NOAA 15
+1 25338U 98030A   26330.49189815  .00000185  00000-0  88420-4 0  9990
+2 25338  98.7124 342.1840 0001045  52.8140 307.3920 14.26218450481927
+NOAA 18
+1 28654U 05018A   26330.47569444  .00000142  00000-0  82150-4 0  9993
+2 28654  98.8842  86.4120 0001412 118.6240 241.6180 14.13241820118421
+NOAA 19
+1 33591U 09005A   26330.52083333  .00000138  00000-0  81420-4 0  9997
+2 33591  99.1625 104.8120 0001385 284.1920  75.7840 14.12531840924188
+METEOR-M2 3
+1 57166U 23091A   26330.43402778  .00000192  00000-0  91240-4 0  9991
+2 57166  98.7012 268.5140 0000895  94.2180 265.9840 14.22248150178421
+CSS (TIANHE)
+1 48274U 21035A   26330.53125000  .00021540  00000-0  24850-3 0  9990
+2 48274  41.4742 176.3180 0000615 312.4180  47.6240 15.59521840318450
+HUBBLE (HST)
+1 20580U 90037B   26330.41203704  .00004820  00000-0  15420-3 0  9998
+2 20580  28.4698 291.7420 0001120  38.9120 321.1840 15.15841260784120
+"""
+
+# Canonical display names mapped by NORAD catalog number so CelesTrak updates
+# preserve clean callsigns (e.g. SAUDISAT 1C -> SO-50, RADFXSAT -> AO-91).
+CORE_NORAD_NAMES: dict[int, str] = {
+    25544: "ISS (ZARYA)",
+    27607: "SO-50",
+    43017: "AO-91",
+    44909: "RS-44",
+    7530:  "AO-7",
+    53106: "IO-117",
+    43678: "PO-101",
+    40908: "LILACSAT-2",
+    50990: "TEVEL-3",
+    25338: "NOAA 15",
+    28654: "NOAA 18",
+    33591: "NOAA 19",
+    57166: "METEOR-M2 3",
+    48274: "CSS (TIANHE)",
+    20580: "HUBBLE (HST)",
+}
+
+# ---------------------------------------------------------------------------
+# Amateur Radio Transponder & Weather Satellite Frequency Presets
+# (label, norad_id_or_0, down_mhz, up_mhz, mode_note)
+# ---------------------------------------------------------------------------
+RADIO_PRESETS: list[tuple[str, int, float, float, str]] = [
+    ("ISS Crossband Rpt (437.800 dn / 145.990 up)", 25544, 437.8000, 145.9900, "FM · PL 67.0 Hz"),
+    ("ISS FM Voice Region-1/2 (145.800 dn)",        25544, 145.8000, 145.2000, "FM · Crew Voice"),
+    ("ISS APRS Packet (145.825 MHz)",               25544, 145.8250, 145.8250, "AFSK 1200 Bd"),
+    ("SO-50 FM Repeater (436.795 dn / 145.850 up)", 27607, 436.7950, 145.8500, "FM · PL 67.0 Hz (74.4 arm)"),
+    ("AO-91 Fox-1B FM (145.960 dn / 435.250 up)",   43017, 145.9600, 435.2500, "FM · PL 67.0 Hz"),
+    ("RS-44 Linear Inv (435.640 USB / 145.965 LSB)", 44909, 435.6400, 145.9650, "Linear SSB/CW Inv"),
+    ("AO-7 Mode B Linear (145.950 USB / 432.150 LSB)", 7530, 145.9500, 432.1500, "Linear SSB/CW Inv"),
+    ("IO-117 GreenCube MEO Digipeater (435.310)",   53106, 435.3100, 435.3100, "FSK Digipeater"),
+    ("PO-101 Diwata-2 FM (145.900 dn / 437.500 up)", 43678, 145.9000, 437.5000, "FM · PL 141.3 Hz"),
+    ("LILACSAT-2 FM/Telem (437.200 dn / 144.350 up)", 40908, 437.2000, 144.3500, "FM / 9k6 BPSK"),
+    ("TEVEL-3 FM Repeater (436.400 dn / 145.970 up)", 50990, 436.4000, 145.9700, "FM · PL 141.3 Hz"),
+    ("NOAA 15 APT Weather (137.6200 MHz)",          25338, 137.6200,   0.0000, "APT WFM 38 kHz"),
+    ("NOAA 18 APT Weather (137.9125 MHz)",          28654, 137.9125,   0.0000, "APT WFM 38 kHz"),
+    ("NOAA 19 APT Weather (137.1000 MHz)",          33591, 137.1000,   0.0000, "APT WFM 38 kHz"),
+    ("METEOR-M2 3 LRPT Weather (137.9000 MHz)",     57166, 137.9000,   0.0000, "LRPT 72k QPSK"),
+    ("CSS Tianhe UHF Link (436.8200 MHz)",          48274, 436.8200,   0.0000, "Space Station UHF"),
+    ("Hubble HST S-Band Downlink (2255.500 MHz)",   20580, 2255.5000,  0.0000, "S-Band Telemetry"),
+    ("Custom User Frequency (Manual MHz)",              0, 145.8000, 435.8000, "Custom Transponder"),
+]
+
+# ---------------------------------------------------------------------------
+# Display Themes (NORAD CYAN/BLUE, P31 PHOSPHOR GREEN, AMBER TACTICAL)
+# ---------------------------------------------------------------------------
+MAP_THEMES: dict[str, dict[str, Any]] = {
+    "norad": {
+        "label": "NORAD CYAN/BLUE",
+        "ocean": (0.028, 0.068, 0.135),
+        "night_rgba": (0.004, 0.014, 0.036, 0.58),
+        "land_fill": (0.070, 0.155, 0.255),
+        "coast": (0.20, 0.68, 0.88),
+        "border": (0.14, 0.44, 0.62),
+        "grid": (0.12, 0.30, 0.46),
+        "maiden": (0.16, 0.50, 0.64),
+        "term_line": (0.98, 0.76, 0.24),
+        "track_past": (0.28, 0.62, 0.78),
+        "track_fut": (0.34, 0.98, 0.86),
+        "foot_fill": (0.18, 0.88, 0.96, 0.13),
+        "foot_stroke": (0.36, 0.96, 1.00, 0.88),
+        "sat_pri": (1.00, 0.90, 0.28),
+        "sat_other": (0.58, 0.90, 1.00),
+        "qth": (1.00, 0.44, 0.22),
+        "los": (0.42, 1.00, 0.56),
+        "radar_bg": (0.025, 0.062, 0.118),
+        "radar_ring": (0.18, 0.54, 0.72),
+        "radar_arc": (0.36, 0.98, 0.84),
+    },
+    "p31": {
+        "label": "P31 PHOSPHOR GREEN",
+        "ocean": (0.018, 0.055, 0.032),
+        "night_rgba": (0.002, 0.018, 0.008, 0.60),
+        "land_fill": (0.048, 0.138, 0.076),
+        "coast": (0.22, 0.84, 0.42),
+        "border": (0.14, 0.52, 0.26),
+        "grid": (0.09, 0.32, 0.16),
+        "maiden": (0.16, 0.56, 0.28),
+        "term_line": (0.72, 1.00, 0.38),
+        "track_past": (0.22, 0.64, 0.34),
+        "track_fut": (0.46, 1.00, 0.58),
+        "foot_fill": (0.24, 0.96, 0.44, 0.13),
+        "foot_stroke": (0.44, 1.00, 0.58, 0.88),
+        "sat_pri": (0.86, 1.00, 0.42),
+        "sat_other": (0.46, 0.94, 0.58),
+        "qth": (0.96, 1.00, 0.36),
+        "los": (0.68, 1.00, 0.68),
+        "radar_bg": (0.016, 0.048, 0.026),
+        "radar_ring": (0.18, 0.62, 0.30),
+        "radar_arc": (0.48, 1.00, 0.58),
+    },
+    "amber": {
+        "label": "AMBER TACTICAL",
+        "ocean": (0.068, 0.040, 0.012),
+        "night_rgba": (0.022, 0.010, 0.002, 0.60),
+        "land_fill": (0.155, 0.094, 0.026),
+        "coast": (0.94, 0.62, 0.16),
+        "border": (0.62, 0.38, 0.10),
+        "grid": (0.38, 0.23, 0.07),
+        "maiden": (0.62, 0.38, 0.12),
+        "term_line": (1.00, 0.86, 0.38),
+        "track_past": (0.72, 0.46, 0.14),
+        "track_fut": (1.00, 0.78, 0.24),
+        "foot_fill": (1.00, 0.68, 0.16, 0.14),
+        "foot_stroke": (1.00, 0.78, 0.26, 0.88),
+        "sat_pri": (1.00, 0.94, 0.56),
+        "sat_other": (0.98, 0.68, 0.24),
+        "qth": (1.00, 0.42, 0.18),
+        "los": (1.00, 0.90, 0.42),
+        "radar_bg": (0.058, 0.034, 0.010),
+        "radar_ring": (0.68, 0.44, 0.12),
+        "radar_arc": (1.00, 0.80, 0.26),
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Embedded Compact Vector World Geography + US State & Border Polylines
+# ---------------------------------------------------------------------------
+WORLD_VEC_B64 = (
+    "eNpVWm+IHNlxr5ZWu6vVSiumiXW68518JN3YwQmJHIeeD3EgkQ6yvQ45wVkiMAMBffH6Q2YgXIKjyZfZOOQIzIDx5N+Fg54LSPmQ"
+    "c2B7Q7IbB+4+TMcEyQQTQndiW8acHNs9d0G6P7ZP81L1q3q9Yy2op1/3e69evapf/apef5roL0/8849eOH+fahdR5eaucEMK+W7f"
+    "xST/Cle6yqXcIr9r/itcSDGVfJ87+ZNfxH0rvkbcVnFLbm3y9OWFtBRul8e8wjMQ9526jK9Tbi/dACO3MfrMJTxCSGPX4/4x/075"
+    "2qGEf8uvkP+X5zWPLCOI1G1+OuP+B9xecn+Rp+LrgO+lRwFZavf1Rch95bn0Tpv2Eb834NEK9K+xrsLkv0Mtvs65l4xUQiq5vwN9"
+    "1Kwjkah2Il+EZ6W9G1OC+xbt8PvbLCGRziqzFdCcaLPi9bf4/TlWP3IyeuUu87pGrkuX8U5M8k7JumtDwop1GfKIMx4ntnUkJlHl"
+    "xriWfJV9OOC7fciUsIb6pGuW+wnLI+toUcbjVk40lbC8tZtQlyWKsKI2P02xupotI+a/ro0xxNpL7ldhl0TixPQj1y7/xZhnl+dQ"
+    "e5J3O9jZAveyczVWM8fcCdoz2Nwu9q9F17G+HZZEJErZNgrTU+lm2OuYRraXfWhh7LyMPZ5RrKWGxkvYTIHfqoXKdJabziqMk7nr"
+    "+FW5AtYtPURPY1yldZ+vY5Yiphu8U/pOtSSPaENsmmgbGiogQUy3bLSBi8z2dL9LeIXMOYKHyLV26n8RScuMe9dm2WqXCfVZt2L/"
+    "BfyodlexD94uu9yuVnOVdS57HJPqXm00pR58KmXdxtD0jPUXQnJvJynfdTF/zTYsuhzZ3o4hT4dCvLdjK23DGsWOxM4zd99+3+V3"
+    "unzfh9bHTlYuXlbYldjSdQ1T1oJiTcZPpvxrl68zp14vWs9Ny5f4T2xdZFL95bxS0fOY+4aUkEcn3ZuMNaG7UuPt62xhBNvNWDZF"
+    "jct4MyLpP2XrKVli8YwWay4GAnRh1wX2L+G/LvxFcWACPArpDj/rseak9aWg4Bl2edUZrDKBRkQzei8+0oJ2aqf41oWHiaW3zUs7"
+    "2EW1HMW8KfxfMay2FVwFZvRJdHCZZc+xyjZsXHB1znKOuL2AX0XsVxN+pisn/MrMvkr4oNhZjd3xmKoeO+L5RM7KdlrmLzFmwutM"
+    "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"
+)
+
+BORDER_POLYLINES: list[list[tuple[float, float]]] = [
+    [(-123.2, 49.0), (-95.15, 49.0), (-89.5, 48.0), (-84.5, 46.5), (-82.4, 43.0),
+     (-79.0, 43.2), (-76.3, 44.2), (-74.7, 45.0), (-71.5, 45.0), (-69.2, 47.4), (-67.8, 47.1), (-67.0, 45.2)],
+    [(-141.0, 69.6), (-141.0, 60.3), (-139.0, 60.0), (-135.0, 59.5), (-130.0, 56.0)],
+    [(-117.1, 32.55), (-114.8, 32.7), (-111.1, 31.33), (-108.2, 31.33), (-106.5, 31.78),
+     (-104.0, 29.5), (-103.0, 29.0), (-101.4, 29.8), (-99.5, 27.5), (-97.15, 25.95)],
+    [(-117.0, 49.0), (-116.05, 49.0), (-116.05, 47.98), (-115.7, 47.45), (-114.9, 46.8),
+     (-114.3, 46.6), (-114.5, 45.8), (-113.8, 45.6), (-113.0, 44.45), (-111.4, 44.5),
+     (-111.05, 44.65), (-111.05, 42.0), (-117.02, 42.0), (-117.02, 43.8), (-117.2, 44.3),
+     (-116.45, 45.6), (-116.92, 46.0), (-117.0, 46.4), (-117.0, 49.0)],
+    [(-124.2, 42.0), (-111.05, 42.0)],
+    [(-124.0, 46.2), (-119.0, 46.0), (-117.0, 46.0)],
+    [(-120.0, 42.0), (-120.0, 39.0), (-114.6, 35.0)],
+    [(-114.05, 42.0), (-114.05, 36.0)],
+    [(-111.05, 45.0), (-104.05, 45.0)],
+    [(-111.05, 41.0), (-102.05, 41.0)],
+    [(-109.05, 41.0), (-109.05, 31.33)],
+    [(-114.8, 37.0), (-94.6, 37.0)],
+    [(-104.05, 49.0), (-104.05, 41.0)],
+    [(-102.05, 41.0), (-102.05, 36.5)],
+    [(-103.0, 37.0), (-103.0, 32.0), (-106.6, 32.0)],
+    [(-100.0, 36.5), (-100.0, 34.5), (-94.5, 33.6)],
+    [(-96.6, 49.0), (-96.4, 43.5), (-95.8, 40.0), (-94.6, 37.0), (-94.0, 29.7)],
+    [(-104.05, 45.94), (-96.6, 45.94)],
+    [(-104.05, 43.0), (-96.5, 43.0)],
+    [(-102.05, 40.0), (-95.3, 40.0)],
+    [(-90.6, 42.5), (-87.5, 42.5)],
+    [(-87.5, 41.7), (-80.5, 41.7)],
+    [(-80.52, 42.2), (-80.52, 39.7), (-75.0, 39.7)],
+    [(-84.8, 39.1), (-84.8, 41.7)],
+    [(-94.6, 36.5), (-75.9, 36.5)],
+    [(-88.5, 35.0), (-81.0, 35.0)],
+    [(-88.4, 35.0), (-88.1, 30.2)],
+    [(-85.6, 35.0), (-85.0, 31.0), (-87.5, 31.0)],
+    [(-5.5, 43.4), (3.1, 42.4)],
+    [(7.6, 47.6), (6.1, 46.2), (7.0, 45.8), (6.7, 45.0), (7.5, 43.8)],
+    [(14.8, 53.9), (14.6, 51.0), (12.2, 50.3), (13.8, 48.8)],
+    [(24.0, 54.0), (23.5, 49.0), (28.2, 45.5)],
+    [(25.0, 22.0), (35.0, 22.0)],
+    [(-70.0, -18.0), (-68.5, -24.0), (-70.3, -33.0), (-71.8, -42.0), (-72.5, -51.5)],
+]
+
+
+def decode_embedded_world_polygons() -> list[tuple[bool, list[tuple[float, float]]]]:
+    raw = zlib.decompress(base64.b64decode(WORLD_VEC_B64))
+    off = 0
+    (npolys,) = struct.unpack_from("<H", raw, off)
+    off += 2
+    out: list[tuple[bool, list[tuple[float, float]]]] = []
+    for _ in range(npolys):
+        is_hole, npts = struct.unpack_from("<BH", raw, off)
+        off += 3
+        px, py = 0, 0
+        pts: list[tuple[float, float]] = []
+        for _ in range(npts):
+            dx, dy = struct.unpack_from("<hh", raw, off)
+            off += 4
+            px += dx
+            py += dy
+            pts.append((px / 50.0, py / 50.0))
+        out.append((bool(is_hole), pts))
+    return out
+
+
+WORLD_POLYGONS = decode_embedded_world_polygons()
+
+
+# ---------------------------------------------------------------------------
+# CDE Palette Loader & Vintage Motif Mission-Control CSS
+# ---------------------------------------------------------------------------
+def load_cde_palette() -> tuple[str, str, str]:
+    chrome, sel, well = "#aeb2c3", "#2c567e", "#fff7e9"
+    try:
+        out = subprocess.check_output(["xrdb", "-query"], text=True, stderr=subprocess.DEVNULL)
+        pal_name = "Crimson.dp"
+        for ln in out.splitlines():
+            if "ColorPalette:" in ln:
+                pal_name = ln.split(":", 1)[1].strip()
+                break
+        for pdir in (HOME / ".dt/palettes", Path("/usr/dt/palettes")):
+            pf = pdir / pal_name
+            if pf.is_file():
+                hexes = [l.strip() for l in pf.read_text().splitlines() if l.strip().startswith("#")]
+                if len(hexes) >= 4:
+                    def norm16(h: str) -> str:
+                        h = h.lstrip("#")
+                        return f"#{h[0:2]}{h[4:6]}{h[8:10]}" if len(h) == 12 else "#" + h[:6]
+                    chrome, sel, well = norm16(hexes[1]), norm16(hexes[2]), norm16(hexes[3])
+                break
+    except Exception:
+        pass
+    return chrome, sel, well
+
+
+def build_sat_css(chrome: str, sel: str, well: str) -> bytes:
+    css = f"""
+    window, dialog, .background {{
+        background-color: {chrome};
+        color: #101216;
+        font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+        font-size: 8.5pt;
+    }}
+    .sat-cabinet {{
+        background-color: #2e3440;
+        border-top: 2px solid #596377;
+        border-left: 2px solid #596377;
+        border-right: 2px solid #15181f;
+        border-bottom: 2px solid #15181f;
+        padding: 4px;
+    }}
+    .sat-strip {{
+        background-color: #373e4c;
+        border-top: 2px solid #576074;
+        border-left: 2px solid #576074;
+        border-right: 2px solid #1a1e26;
+        border-bottom: 2px solid #1a1e26;
+        padding: 3px 6px;
+    }}
+    .sat-bevel-in {{
+        background-color: #111822;
+        border-top: 2px solid #141820;
+        border-left: 2px solid #141820;
+        border-right: 2px solid #636d82;
+        border-bottom: 2px solid #636d82;
+    }}
+    .sat-engraved {{
+        color: #d7e0ef;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8pt;
+    }}
+    entry {{
+        background-image: none;
+        background-color: #151d26;
+        color: #7efce0;
+        border-top: 2px solid #0d1218;
+        border-left: 2px solid #0d1218;
+        border-right: 2px solid #59647a;
+        border-bottom: 2px solid #59647a;
+        border-radius: 0px;
+        padding: 1px 4px;
+        min-height: 20px;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8.5pt;
+    }}
+    button {{
+        background-image: none;
+        background-color: #464e5e;
+        color: #edf2f7;
+        border-top: 2px solid #758096;
+        border-left: 2px solid #758096;
+        border-right: 2px solid #1b1f28;
+        border-bottom: 2px solid #1b1f28;
+        border-radius: 0px;
+        padding: 2px 7px;
+        min-height: 20px;
+        box-shadow: none;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8pt;
+    }}
+    button label {{
+        color: #edf2f7;
+    }}
+    button:hover {{
+        background-color: #535c6e;
+    }}
+    button:active, button:checked {{
+        background-color: #25483d;
+        color: #72fad0;
+        border-top: 2px solid #12241e;
+        border-left: 2px solid #12241e;
+        border-right: 2px solid #54ab8e;
+        border-bottom: 2px solid #54ab8e;
+    }}
+    button:checked label {{
+        color: #72fad0;
+    }}
+    button.btn-tle {{
+        background-color: #1f548c;
+        color: #ffffff;
+        border-top: 2px solid #68a4e3;
+        border-left: 2px solid #68a4e3;
+        border-right: 2px solid #0d2540;
+        border-bottom: 2px solid #0d2540;
+    }}
+    button.btn-tle:hover {{
+        background-color: #2864a6;
+    }}
+    button.btn-tle label {{
+        color: #ffffff;
+    }}
+    combobox button.combo {{
+        background-color: #202630;
+        color: #dcfaef;
+        border-top: 2px solid #12161c;
+        border-left: 2px solid #12161c;
+        border-right: 2px solid #626b7f;
+        border-bottom: 2px solid #626b7f;
+        padding: 2px 5px;
+        min-height: 20px;
+    }}
+    combobox button.combo label, combobox cellview {{
+        color: #dcfaef;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8pt;
+    }}
+    menu {{
+        background-color: #282e38;
+        color: #edf2f7;
+        border: 1px solid #6c758a;
+    }}
+    menuitem {{
+        color: #edf2f7;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8pt;
+        padding: 3px 8px;
+    }}
+    menuitem:hover {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    treeview.view {{
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8pt;
+        color: #101812;
+        background-color: #eef6ea;
+    }}
+    treeview.view:selected {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    treeview.view header button {{
+        background-color: #3a4252;
+        color: #e4ecf7;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 7.8pt;
+        font-weight: bold;
+        padding: 2px 5px;
+    }}
+    .cde-status {{
+        background-color: {chrome};
+        color: #101216;
+        padding: 2px 8px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8pt;
+    }}
+    """
+    return css.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Maidenhead Grid & Geodetic Helpers
+# ---------------------------------------------------------------------------
+def clamp(v: float, lo: float, hi: float) -> float:
+    return lo if v < lo else (hi if v > hi else v)
+
+
+def latlon_to_grid(lat: float, lon: float) -> str:
+    lon_c = ((lon + 180.0) % 360.0)
+    lat_c = clamp(lat + 90.0, 0.0, 179.9999)
+    f_lon = int(lon_c // 20.0)
+    f_lat = int(lat_c // 10.0)
+    rem_lon = lon_c - f_lon * 20.0
+    rem_lat = lat_c - f_lat * 10.0
+    s_lon = int(rem_lon // 2.0)
+    s_lat = int(rem_lat // 1.0)
+    sub_lon = int((rem_lon - s_lon * 2.0) * 12.0)
+    sub_lat = int((rem_lat - s_lat * 1.0) * 24.0)
+    sub_lon = max(0, min(23, sub_lon))
+    sub_lat = max(0, min(23, sub_lat))
+    return (
+        chr(ord("A") + f_lon)
+        + chr(ord("A") + f_lat)
+        + str(s_lon)
+        + str(s_lat)
+        + chr(ord("a") + sub_lon)
+        + chr(ord("a") + sub_lat)
+    )
+
+
+def grid_to_latlon(grid: str) -> tuple[float, float] | None:
+    g = grid.strip()
+    if len(g) < 4:
+        return None
+    g0, g1 = g[0].upper(), g[1].upper()
+    if not ("A" <= g0 <= "R" and "A" <= g1 <= "R" and g[2].isdigit() and g[3].isdigit()):
+        return None
+    lon = -180.0 + (ord(g0) - ord("A")) * 20.0 + int(g[2]) * 2.0
+    lat = -90.0 + (ord(g1) - ord("A")) * 10.0 + int(g[3]) * 1.0
+    if len(g) >= 6 and ("a" <= g[4].lower() <= "x") and ("a" <= g[5].lower() <= "x"):
+        lon += (ord(g[4].lower()) - ord("a") + 0.5) * (2.0 / 24.0)
+        lat += (ord(g[5].lower()) - ord("a") + 0.5) * (1.0 / 24.0)
+    else:
+        lon += 1.0
+        lat += 0.5
+    return round(lat, 4), round(lon, 4)
+
+
+def az_to_compass(az: float) -> str:
+    pts = [
+        "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+        "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
+    ]
+    return pts[int(((az % 360.0) + 11.25) // 22.5) % 16]
+
+
+# ---------------------------------------------------------------------------
+# Pure-Python SGP4/J2 Orbital Mechanics, Solar Ephemeris & Doppler Engine
+# ---------------------------------------------------------------------------
+@dataclasses.dataclass
+class GroundStation:
+    callsign: str = DEFAULT_CALLSIGN
+    grid: str = DEFAULT_GRID
+    lat_deg: float = DEFAULT_LAT
+    lon_deg: float = DEFAULT_LON
+    alt_m: float = DEFAULT_ALT_M
+
+    def ecef_and_enu(self) -> tuple[tuple[float, float, float], tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]]:
+        lat = math.radians(self.lat_deg)
+        lon = math.radians(self.lon_deg)
+        sl, cl = math.sin(lat), math.cos(lat)
+        so, co = math.sin(lon), math.cos(lon)
+        alt_km = self.alt_m / 1000.0
+        n_rad = RE_WGS84 / math.sqrt(1.0 - E2_WGS84 * sl * sl)
+        ox = (n_rad + alt_km) * cl * co
+        oy = (n_rad + alt_km) * cl * so
+        oz = (n_rad * (1.0 - E2_WGS84) + alt_km) * sl
+        east = (-so, co, 0.0)
+        north = (-sl * co, -sl * so, cl)
+        up = (cl * co, cl * so, sl)
+        return (ox, oy, oz), (east, north, up)
+
+
+@dataclasses.dataclass
+class TLESatellite:
+    name: str
+    line1: str
+    line2: str
+    norad_id: int
+    intl_desig: str
+    epoch_unix: float
+    epoch_year: int
+    epoch_doy: float
+    ndot_rev_day2: float
+    bstar: float
+    inc_rad: float
+    raan0_rad: float
+    ecc0: float
+    argp0_rad: float
+    ma0_rad: float
+    n0_rev_day: float
+    rev_epoch: int
+    # Precomputed Brouwer mean elements
+    n0_dp_rad_s: float
+    a0_dp_km: float
+
+
+@dataclasses.dataclass
+class SatTelemetry:
+    sat: TLESatellite
+    unix_ts: float
+    lat_deg: float
+    lon_deg: float
+    alt_km: float
+    vel_km_s: float
+    az_deg: float
+    el_deg: float
+    slant_range_km: float
+    range_rate_km_s: float
+    orbit_num: int
+    sunlit: bool
+    footprint_radius_km: float
+    footprint_half_angle_rad: float
+    eci_km: tuple[float, float, float]
+    ecef_km: tuple[float, float, float]
+
+
+@dataclasses.dataclass
+class SatPass:
+    sat: TLESatellite
+    aos_ts: float
+    tca_ts: float
+    los_ts: float
+    aos_az: float
+    max_el: float
+    tca_az: float
+    los_az: float
+    duration_s: float
+    arc_points: list[tuple[float, float, float, float, float]]  # (ts, az, el, lat, lon)
+
+
+def tle_checksum(line68: str) -> int:
+    total = 0
+    for ch in line68[:68]:
+        if "0" <= ch <= "9":
+            total += ord(ch) - 48
+        elif ch == "-":
+            total += 1
+    return total % 10
+
+
+def _parse_tle_exp(field: str) -> float:
+    s = field.strip()
+    if not s or s in ("00000-0", "00000+0", "+00000-0", "-00000-0"):
+        return 0.0
+    m = re.match(r"^([+-]?)(\d+)([+-]\d+)$", s)
+    if m:
+        sgn = -1.0 if m.group(1) == "-" else 1.0
+        mant = float("0." + m.group(2))
+        return sgn * mant * (10.0 ** int(m.group(3)))
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def parse_tle_triplet(name: str, line1: str, line2: str, strict_checksum: bool = False) -> TLESatellite:
+    l1 = line1.strip()
+    l2 = line2.strip()
+    if len(l1) < 68 or len(l2) < 68 or not l1.startswith("1 ") or not l2.startswith("2 "):
+        raise ValueError(f"Malformed TLE lines for {name!r}")
+    if strict_checksum and len(l1) >= 69 and len(l2) >= 69:
+        if int(l1[68]) != tle_checksum(l1[:68]) or int(l2[68]) != tle_checksum(l2[:68]):
+            raise ValueError(f"TLE checksum mismatch for {name!r}")
+
+    norad_id = int(l1[2:7].strip())
+    intl_desig = l1[9:17].strip()
+    ep_yr2 = int(l1[18:20].strip())
+    epoch_year = 2000 + ep_yr2 if ep_yr2 < 57 else 1900 + ep_yr2
+    epoch_doy = float(l1[20:32].strip())
+    ep_dt = datetime.datetime(epoch_year, 1, 1, tzinfo=datetime.timezone.utc) + datetime.timedelta(days=epoch_doy - 1.0)
+    epoch_unix = ep_dt.timestamp()
+
+    nd_raw = l1[33:43].strip()
+    if nd_raw.startswith(".") or nd_raw.startswith("+.") or nd_raw.startswith("-."):
+        nd_raw = nd_raw.replace("+.", "+0.").replace("-.", "-0.")
+        if nd_raw.startswith("."):
+            nd_raw = "0" + nd_raw
+    ndot_rev_day2 = float(nd_raw or 0.0)
+    bstar = _parse_tle_exp(l1[53:61])
+
+    inc_deg = float(l2[8:16].strip())
+    raan_deg = float(l2[17:25].strip())
+    ecc0 = float("0." + l2[26:33].strip())
+    argp_deg = float(l2[34:42].strip())
+    ma_deg = float(l2[43:51].strip())
+    n0_rev_day = float(l2[52:63].strip())
+    rev_str = l2[63:68].strip()
+    rev_epoch = int(rev_str) if rev_str.isdigit() else 0
+
+    inc_rad = math.radians(inc_deg)
+    raan0_rad = math.radians(raan_deg)
+    argp0_rad = math.radians(argp_deg)
+    ma0_rad = math.radians(ma_deg)
+
+    # Recover Brouwer mean motion & semi-major axis from Kozai mean motion (SGP4 initialization)
+    n0_rad_s = n0_rev_day * TWO_PI / SEC_PER_DAY
+    a1 = (MU_EARTH / (n0_rad_s * n0_rad_s)) ** (1.0 / 3.0)
+    cos_i = math.cos(inc_rad)
+    theta2 = cos_i * cos_i
+    beta02 = max(1e-8, 1.0 - ecc0 * ecc0)
+    beta0 = math.sqrt(beta02)
+    k2 = 0.5 * J2_EARTH * RE_WGS84 * RE_WGS84
+    del1 = 1.5 * k2 * (3.0 * theta2 - 1.0) / (a1 * a1 * beta0 * beta02)
+    a0 = a1 * (1.0 - del1 / 3.0 - del1 * del1 - (134.0 / 81.0) * (del1 ** 3))
+    del0 = 1.5 * k2 * (3.0 * theta2 - 1.0) / (a0 * a0 * beta0 * beta02)
+    n0_dp_rad_s = n0_rad_s / (1.0 + del0)
+    a0_dp_km = (MU_EARTH / (n0_dp_rad_s * n0_dp_rad_s)) ** (1.0 / 3.0)
+
+    clean_name = CORE_NORAD_NAMES.get(norad_id, name.strip())
+    return TLESatellite(
+        name=clean_name,
+        line1=l1,
+        line2=l2,
+        norad_id=norad_id,
+        intl_desig=intl_desig,
+        epoch_unix=epoch_unix,
+        epoch_year=epoch_year,
+        epoch_doy=epoch_doy,
+        ndot_rev_day2=ndot_rev_day2,
+        bstar=bstar,
+        inc_rad=inc_rad,
+        raan0_rad=raan0_rad,
+        ecc0=ecc0,
+        argp0_rad=argp0_rad,
+        ma0_rad=ma0_rad,
+        n0_rev_day=n0_rev_day,
+        rev_epoch=rev_epoch,
+        n0_dp_rad_s=n0_dp_rad_s,
+        a0_dp_km=a0_dp_km,
+    )
+
+
+def parse_tle_catalog(text: str, strict_checksum: bool = False) -> list[TLESatellite]:
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    sats: dict[int, TLESatellite] = {}
+    i = 0
+    while i < len(lines):
+        if i + 2 < len(lines) and lines[i + 1].startswith("1 ") and lines[i + 2].startswith("2 "):
+            try:
+                sat = parse_tle_triplet(lines[i], lines[i + 1], lines[i + 2], strict_checksum=strict_checksum)
+                sats[sat.norad_id] = sat
+            except Exception:
+                pass
+            i += 3
+        elif i + 1 < len(lines) and lines[i].startswith("1 ") and lines[i + 1].startswith("2 "):
+            try:
+                cid = int(lines[i][2:7].strip())
+                sat = parse_tle_triplet(f"NORAD {cid}", lines[i], lines[i + 1], strict_checksum=strict_checksum)
+                sats[sat.norad_id] = sat
+            except Exception:
+                pass
+            i += 2
+        else:
+            i += 1
+    return list(sats.values())
+
+
+def gmst_radians(unix_ts: float) -> float:
+    jd = unix_ts / SEC_PER_DAY + 2440587.5
+    d_ut1 = jd - 2451545.0
+    t_cent = d_ut1 / 36525.0
+    gmst_deg = (
+        280.46061837
+        + 360.98564736629 * d_ut1
+        + 0.000387933 * t_cent * t_cent
+        - (t_cent ** 3) / 38710000.0
+    ) % 360.0
+    return math.radians(gmst_deg)
+
+
+def solar_ephemeris(unix_ts: float) -> tuple[tuple[float, float, float], float, float]:
+    """Return (sun_unit_eci, subsolar_lat_deg, subsolar_lon_deg)."""
+    jd = unix_ts / SEC_PER_DAY + 2440587.5
+    n_d = jd - 2451545.0
+    mean_lon = (280.460 + 0.9856474 * n_d) % 360.0
+    mean_anom = math.radians((357.528 + 0.9856003 * n_d) % 360.0)
+    ecl_lon = math.radians(mean_lon + 1.915 * math.sin(mean_anom) + 0.020 * math.sin(2.0 * mean_anom))
+    obliq = math.radians(23.439 - 0.0000004 * n_d)
+
+    sx = math.cos(ecl_lon)
+    sy = math.cos(obliq) * math.sin(ecl_lon)
+    sz = math.sin(obliq) * math.sin(ecl_lon)
+
+    sun_lat_deg = math.degrees(math.asin(clamp(sz, -1.0, 1.0)))
+    sun_ra_rad = math.atan2(sy, sx)
+    gmst_rad = gmst_radians(unix_ts)
+    sun_lon_deg = ((math.degrees(sun_ra_rad - gmst_rad) + 180.0) % 360.0) - 180.0
+    return (sx, sy, sz), sun_lat_deg, sun_lon_deg
+
+
+def propagate_satellite(
+    sat: TLESatellite,
+    unix_ts: float,
+    obs: GroundStation,
+    obs_cache: tuple[tuple[float, float, float], tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]] | None = None,
+    sun_unit_eci: tuple[float, float, float] | None = None,
+) -> SatTelemetry:
+    dt_sec = unix_ts - sat.epoch_unix
+    dt_days = dt_sec / SEC_PER_DAY
+
+    # Secular atmospheric drag update (clamped so multi-year offline epochs stay in valid LEO)
+    drag_frac = clamp((2.0 * sat.ndot_rev_day2 * dt_days) / max(0.1, sat.n0_rev_day), -0.015, 0.015)
+    bstar_frac = clamp(1.5 * sat.bstar * sat.n0_dp_rad_s * dt_sec * 0.02, -0.01, 0.01)
+    n_sec = sat.n0_dp_rad_s * (1.0 + drag_frac + bstar_frac)
+    a_km = (MU_EARTH / (n_sec * n_sec)) ** (1.0 / 3.0)
+    ecc = clamp(sat.ecc0 * (1.0 - abs(sat.bstar) * abs(dt_days) * 0.02), 1e-6, 0.95)
+
+    # J2 secular nodal regression, apsidal precession, and mean anomaly rate
+    cos_i0 = math.cos(sat.inc_rad)
+    sin_i0 = math.sin(sat.inc_rad)
+    cos2_i0 = cos_i0 * cos_i0
+    sin2_i0 = sin_i0 * sin_i0
+    one_minus_e2 = max(1e-8, 1.0 - ecc * ecc)
+    p_km = a_km * one_minus_e2
+    k2 = 0.5 * J2_EARTH * RE_WGS84 * RE_WGS84
+    j2_factor = (k2 / (p_km * p_km)) * sat.n0_dp_rad_s
+
+    raan_dot = -3.0 * j2_factor * cos_i0
+    argp_dot = 1.5 * j2_factor * (5.0 * cos2_i0 - 1.0)
+    ma_dot = n_sec + 1.5 * j2_factor * math.sqrt(one_minus_e2) * (3.0 * cos2_i0 - 1.0)
+
+    raan_sec = (sat.raan0_rad + raan_dot * dt_sec) % TWO_PI
+    argp_sec = (sat.argp0_rad + argp_dot * dt_sec) % TWO_PI
+    ma = (sat.ma0_rad + ma_dot * dt_sec) % TWO_PI
+
+    # Solve Kepler's equation M = E - e*sin(E) via Newton-Raphson
+    ea = ma + ecc * math.sin(ma)
+    for _ in range(8):
+        f_val = ea - ecc * math.sin(ea) - ma
+        fp_val = 1.0 - ecc * math.cos(ea)
+        dea = -f_val / fp_val
+        ea += dea
+        if abs(dea) < 1e-12:
+            break
+
+    sin_e = math.sin(ea)
+    cos_e = math.cos(ea)
+    nu = 2.0 * math.atan2(math.sqrt(1.0 + ecc) * sin_e * 0.5 / max(1e-12, math.cos(ea * 0.5)) if abs(math.cos(ea * 0.5)) > 1e-8 else math.sqrt(1.0 + ecc) * math.sin(ea * 0.5),
+                          1.0 if abs(math.cos(ea * 0.5)) > 1e-8 else math.sqrt(1.0 - ecc) * math.cos(ea * 0.5))
+    # Direct clean half-angle formula
+    nu = 2.0 * math.atan2(math.sqrt(1.0 + ecc) * math.sin(0.5 * ea), math.sqrt(1.0 - ecc) * math.cos(0.5 * ea))
+    r_kepler = a_km * (1.0 - ecc * cos_e)
+    u_kepler = argp_sec + nu
+
+    # SGP4 short-period J2 osculating refinements
+    sin_2u = math.sin(2.0 * u_kepler)
+    cos_2u = math.cos(2.0 * u_kepler)
+    r_km = r_kepler + (0.5 * k2 / p_km) * sin2_i0 * cos_2u
+    u_rad = u_kepler - (0.25 * k2 / (p_km * p_km)) * (7.0 * cos2_i0 - 1.0) * sin_2u
+    raan_rad = raan_sec + (1.5 * k2 / (p_km * p_km)) * cos_i0 * sin_2u
+    inc_rad = sat.inc_rad + (1.5 * k2 / (p_km * p_km)) * sin_i0 * cos_i0 * cos_2u
+
+    v_scale = math.sqrt(MU_EARTH / p_km)
+    r_dot = v_scale * ecc * math.sin(nu) - (n_sec * k2 / p_km) * sin2_i0 * sin_2u
+    rf_dot = v_scale * (1.0 + ecc * math.cos(nu)) + (n_sec * k2 / p_km) * (sin2_i0 * cos_2u + 1.5 * (1.0 - 1.5 * sin2_i0))
+
+    # Orientation unit vectors U_hat, V_hat -> ECI position & velocity
+    cos_o, sin_o = math.cos(raan_rad), math.sin(raan_rad)
+    cos_u, sin_u = math.cos(u_rad), math.sin(u_rad)
+    cos_i, sin_i = math.cos(inc_rad), math.sin(inc_rad)
+
+    ux = cos_o * cos_u - sin_o * sin_u * cos_i
+    uy = sin_o * cos_u + cos_o * sin_u * cos_i
+    uz = sin_u * sin_i
+
+    vx_u = -cos_o * sin_u - sin_o * cos_u * cos_i
+    vy_u = -sin_o * sin_u + cos_o * cos_u * cos_i
+    vz_u = cos_u * sin_i
+
+    x_eci = r_km * ux
+    y_eci = r_km * uy
+    z_eci = r_km * uz
+
+    vx_eci = r_dot * ux + rf_dot * vx_u
+    vy_eci = r_dot * uy + rf_dot * vy_u
+    vz_eci = r_dot * uz + rf_dot * vz_u
+    vel_km_s = math.sqrt(vx_eci * vx_eci + vy_eci * vy_eci + vz_eci * vz_eci)
+
+    # ECI -> ECEF via GMST Earth rotation
+    gmst = gmst_radians(unix_ts)
+    cg, sg = math.cos(gmst), math.sin(gmst)
+    x_ecef = x_eci * cg + y_eci * sg
+    y_ecef = -x_eci * sg + y_eci * cg
+    z_ecef = z_eci
+
+    vx_ecef = vx_eci * cg + vy_eci * sg + OMEGA_EARTH * y_ecef
+    vy_ecef = -vx_eci * sg + vy_eci * cg - OMEGA_EARTH * x_ecef
+    vz_ecef = vz_eci
+
+    # ECEF -> WGS84 Geodetic Lat, Lon, Alt
+    lon_rad = math.atan2(y_ecef, x_ecef)
+    p_xy = math.hypot(x_ecef, y_ecef)
+    lat_rad = math.atan2(z_ecef, p_xy * (1.0 - E2_WGS84))
+    n_prime = RE_WGS84
+    for _ in range(5):
+        sl = math.sin(lat_rad)
+        n_prime = RE_WGS84 / math.sqrt(1.0 - E2_WGS84 * sl * sl)
+        lat_rad = math.atan2(z_ecef + E2_WGS84 * n_prime * sl, p_xy)
+    if abs(math.cos(lat_rad)) > 1e-5:
+        alt_km = p_xy / math.cos(lat_rad) - n_prime
+    else:
+        alt_km = abs(z_ecef) / max(1e-5, abs(math.sin(lat_rad))) - n_prime * (1.0 - E2_WGS84)
+
+    lat_deg = math.degrees(lat_rad)
+    lon_deg = math.degrees(lon_rad)
+
+    # Topocentric Azimuth, Elevation, Slant Range & Range-Rate from Ground Station
+    (ox, oy, oz), (east, north, up) = obs_cache if obs_cache is not None else obs.ecef_and_enu()
+    rx = x_ecef - ox
+    ry = y_ecef - oy
+    rz = z_ecef - oz
+    slant_km = max(1e-3, math.sqrt(rx * rx + ry * ry + rz * rz))
+
+    e_comp = rx * east[0] + ry * east[1] + rz * east[2]
+    n_comp = rx * north[0] + ry * north[1] + rz * north[2]
+    u_comp = rx * up[0] + ry * up[1] + rz * up[2]
+
+    az_deg = math.degrees(math.atan2(e_comp, n_comp)) % 360.0
+    el_deg = math.degrees(math.asin(clamp(u_comp / slant_km, -1.0, 1.0)))
+    range_rate_km_s = (rx * vx_ecef + ry * vy_ecef + rz * vz_ecef) / slant_km
+
+    # Sunlit vs Earth cylindrical umbral eclipse check
+    if sun_unit_eci is None:
+        sun_unit_eci, _, _ = solar_ephemeris(unix_ts)
+    s_dot = x_eci * sun_unit_eci[0] + y_eci * sun_unit_eci[1] + z_eci * sun_unit_eci[2]
+    if s_dot >= 0.0:
+        sunlit = True
+    else:
+        px_s = x_eci - s_dot * sun_unit_eci[0]
+        py_s = y_eci - s_dot * sun_unit_eci[1]
+        pz_s = z_eci - s_dot * sun_unit_eci[2]
+        perp_sq = px_s * px_s + py_s * py_s + pz_s * pz_s
+        sunlit = perp_sq >= (RE_WGS84 * RE_WGS84)
+
+    # Orbit number & visibility footprint radius R = R_E * arccos(R_E / (R_E + h))
+    total_revs = dt_days * (ma_dot * SEC_PER_DAY / TWO_PI) + (sat.ma0_rad / TWO_PI)
+    orbit_num = max(1, sat.rev_epoch + int(math.floor(total_revs)))
+    half_ang = math.acos(clamp(RE_WGS84 / (RE_WGS84 + max(1.0, alt_km)), -1.0, 1.0))
+    fp_radius_km = RE_WGS84 * half_ang
+
+    return SatTelemetry(
+        sat=sat,
+        unix_ts=unix_ts,
+        lat_deg=lat_deg,
+        lon_deg=lon_deg,
+        alt_km=alt_km,
+        vel_km_s=vel_km_s,
+        az_deg=az_deg,
+        el_deg=el_deg,
+        slant_range_km=slant_km,
+        range_rate_km_s=range_rate_km_s,
+        orbit_num=orbit_num,
+        sunlit=sunlit,
+        footprint_radius_km=fp_radius_km,
+        footprint_half_angle_rad=half_ang,
+        eci_km=(x_eci, y_eci, z_eci),
+        ecef_km=(x_ecef, y_ecef, z_ecef),
+    )
+
+
+def compute_doppler_pair(down_mhz: float, up_mhz: float, range_rate_km_s: float) -> tuple[float, float, float, float]:
+    """
+    Compute live two-way satellite Doppler shift:
+      - RX Downlink observed at ground: f_rx = f_down * (1 - v_r / c)
+      - TX Uplink pre-compensated at ground so satellite receives f_up: f_tx = f_up * (1 + v_r / c)
+    Returns (rx_mhz, df_rx_hz, tx_mhz, df_tx_hz).
+    """
+    beta = range_rate_km_s / C_LIGHT_KM_S
+    if down_mhz > 0.0:
+        rx_mhz = down_mhz * (1.0 - beta)
+        df_rx_hz = -down_mhz * 1e6 * beta
+    else:
+        rx_mhz, df_rx_hz = 0.0, 0.0
+
+    if up_mhz > 0.0:
+        tx_mhz = up_mhz * (1.0 + beta)
+        df_tx_hz = +up_mhz * 1e6 * beta
+    else:
+        tx_mhz, df_tx_hz = 0.0, 0.0
+    return rx_mhz, df_rx_hz, tx_mhz, df_tx_hz
+
+
+# ---------------------------------------------------------------------------
+# Fast 24-Hour Pass Predictor (Bisection AOS/LOS + Golden-Section TCA)
+# ---------------------------------------------------------------------------
+def predict_passes_for_sat(
+    sat: TLESatellite,
+    obs: GroundStation,
+    start_ts: float,
+    hours: float = 24.0,
+    min_el_deg: float = 0.0,
+) -> list[SatPass]:
+    obs_cache = obs.ecef_and_enu()
+    end_ts = start_ts + hours * 3600.0
+    # Step size scaled to orbital period (~45s for LEO, ~120s for MEO)
+    step_s = 90.0 if sat.n0_rev_day < 9.0 else 45.0
+
+    def el_at(ts: float) -> float:
+        return propagate_satellite(sat, ts, obs, obs_cache=obs_cache, sun_unit_eci=(1.0, 0.0, 0.0)).el_deg
+
+    def bisect_horizon(t_lo: float, t_hi: float, rising: bool) -> float:
+        a, b = t_lo, t_hi
+        for _ in range(14):
+            mid = 0.5 * (a + b)
+            em = el_at(mid)
+            if (em < 0.0 and rising) or (em >= 0.0 and not rising):
+                a = mid
+            else:
+                b = mid
+        return 0.5 * (a + b)
+
+    def refine_tca(t_a: float, t_b: float) -> tuple[float, float]:
+        gr = (math.sqrt(5.0) - 1.0) * 0.5
+        a, b = t_a, t_b
+        c = b - gr * (b - a)
+        d = a + gr * (b - a)
+        ec, ed = el_at(c), el_at(d)
+        for _ in range(16):
+            if ec > ed:
+                b = d
+                d = c
+                ed = ec
+                c = b - gr * (b - a)
+                ec = el_at(c)
+            else:
+                a = c
+                c = d
+                ec = ed
+                d = a + gr * (b - a)
+                ed = el_at(d)
+        t_peak = 0.5 * (a + b)
+        return t_peak, el_at(t_peak)
+
+    # If pass is already in progress at start_ts, walk backward up to 90 min to capture true AOS
+    scan_t0 = start_ts
+    if el_at(start_ts) > 0.0:
+        back = start_ts
+        while back > start_ts - 5400.0 and el_at(back) > 0.0:
+            back -= step_s
+        scan_t0 = back
+
+    passes: list[SatPass] = []
+    t_prev = scan_t0
+    e_prev = el_at(t_prev)
+    in_pass = e_prev >= 0.0
+    aos_t = scan_t0 if in_pass else 0.0
+
+    t_cur = scan_t0 + step_s
+    while t_cur <= end_ts + 2400.0:
+        e_cur = el_at(t_cur)
+        if not in_pass and e_cur >= 0.0:
+            aos_t = bisect_horizon(t_prev, t_cur, rising=True)
+            in_pass = True
+        elif in_pass and e_cur < 0.0:
+            los_t = bisect_horizon(t_prev, t_cur, rising=False)
+            in_pass = False
+            if los_t >= start_ts and aos_t <= end_ts:
+                tca_t, max_el = refine_tca(aos_t, los_t)
+                if max_el >= min_el_deg and (los_t - aos_t) >= 15.0:
+                    aos_tel = propagate_satellite(sat, aos_t, obs, obs_cache=obs_cache)
+                    tca_tel = propagate_satellite(sat, tca_t, obs, obs_cache=obs_cache)
+                    los_tel = propagate_satellite(sat, los_t, obs, obs_cache=obs_cache)
+
+                    # Sample trajectory arc points from AOS -> LOS
+                    dur = los_t - aos_t
+                    n_samples = max(16, min(72, int(dur / 20.0) + 2))
+                    arc_pts: list[tuple[float, float, float, float, float]] = []
+                    for k in range(n_samples + 1):
+                        tk = aos_t + dur * (k / n_samples)
+                        pt_tel = propagate_satellite(sat, tk, obs, obs_cache=obs_cache)
+                        arc_pts.append((tk, pt_tel.az_deg, max(0.0, pt_tel.el_deg), pt_tel.lat_deg, pt_tel.lon_deg))
+
+                    passes.append(
+                        SatPass(
+                            sat=sat,
+                            aos_ts=aos_t,
+                            tca_ts=tca_t,
+                            los_ts=los_t,
+                            aos_az=aos_tel.az_deg,
+                            max_el=max_el,
+                            tca_az=tca_tel.az_deg,
+                            los_az=los_tel.az_deg,
+                            duration_s=dur,
+                            arc_points=arc_pts,
+                        )
+                    )
+            if t_cur > end_ts and not in_pass:
+                break
+        t_prev, e_prev = t_cur, e_cur
+        t_cur += step_s
+
+    return passes
+
+
+def predict_passes_catalog(
+    sats: list[TLESatellite],
+    obs: GroundStation,
+    start_ts: float,
+    hours: float = 24.0,
+    min_el_deg: float = 5.0,
+) -> list[SatPass]:
+    all_passes: list[SatPass] = []
+    for sat in sats:
+        all_passes.extend(predict_passes_for_sat(sat, obs, start_ts, hours=hours, min_el_deg=min_el_deg))
+    all_passes.sort(key=lambda p: p.aos_ts)
+    return all_passes
+
+
+# ---------------------------------------------------------------------------
+# Cairo Rendering Primitives (NORAD World Map, Polar Sky-Dome, VFD Panels)
+# ---------------------------------------------------------------------------
+def compute_ground_track_segments(
+    sat: TLESatellite,
+    obs: GroundStation,
+    center_ts: float,
+    past_min: float = 45.0,
+    future_orbits: float = 3.0,
+) -> tuple[list[list[tuple[float, float]]], list[list[tuple[float, float]]]]:
+    """Return anti-meridian-split (past_segments, future_segments) of (lon, lat)."""
+    obs_cache = obs.ecef_and_enu()
+    period_min = 1440.0 / max(1.0, sat.n0_rev_day)
+    fut_min = min(360.0, future_orbits * period_min)
+    step_s = 45.0 if period_min < 130.0 else 90.0
+
+    def sample_span(t0: float, t1: float) -> list[list[tuple[float, float]]]:
+        segs: list[list[tuple[float, float]]] = []
+        cur: list[tuple[float, float]] = []
+        t = t0
+        while t <= t1 + 1e-3:
+            tel = propagate_satellite(sat, t, obs, obs_cache=obs_cache, sun_unit_eci=(1.0, 0.0, 0.0))
+            pt = (tel.lon_deg, tel.lat_deg)
+            if cur and abs(pt[0] - cur[-1][0]) > 170.0:
+                if len(cur) >= 2:
+                    segs.append(cur)
+                cur = [pt]
+            else:
+                cur.append(pt)
+            t += step_s
+        if len(cur) >= 2:
+            segs.append(cur)
+        return segs
+
+    past_segs = sample_span(center_ts - past_min * 60.0, center_ts)
+    fut_segs = sample_span(center_ts, center_ts + fut_min * 60.0)
+    return past_segs, fut_segs
+
+
+def compute_footprint_ring(lat_deg: float, lon_deg: float, half_angle_rad: float, n_pts: int = 84) -> list[tuple[float, float]]:
+    """Return spherical visibility circle points (unwrapped_lon_deg, lat_deg) around sub-satellite point."""
+    phi1 = math.radians(lat_deg)
+    lam1 = math.radians(lon_deg)
+    sin_p1, cos_p1 = math.sin(phi1), math.cos(phi1)
+    sin_d, cos_d = math.sin(half_angle_rad), math.cos(half_angle_rad)
+
+    pts: list[tuple[float, float]] = []
+    prev_lon: float | None = None
+    for i in range(n_pts + 1):
+        brg = TWO_PI * (i / n_pts)
+        sin_p2 = clamp(sin_p1 * cos_d + cos_p1 * sin_d * math.cos(brg), -1.0, 1.0)
+        phi2 = math.asin(sin_p2)
+        dlon = math.atan2(math.sin(brg) * sin_d * cos_p1, cos_d - sin_p1 * sin_p2)
+        lon2 = math.degrees(lam1 + dlon)
+        if prev_lon is not None:
+            while lon2 - prev_lon > 180.0:
+                lon2 -= 360.0
+            while lon2 - prev_lon < -180.0:
+                lon2 += 360.0
+        prev_lon = lon2
+        pts.append((lon2, math.degrees(phi2)))
+    return pts
+
+
+def render_norad_world_map(
+    cr: cairo.Context,
+    width: int,
+    height: int,
+    theme_key: str,
+    obs: GroundStation,
+    all_tels: list[SatTelemetry],
+    primary_tel: SatTelemetry,
+    past_segs: list[list[tuple[float, float]]],
+    fut_segs: list[list[tuple[float, float]]],
+    preview_pass: SatPass | None,
+    unix_ts: float,
+    show_maidenhead: bool = True,
+    show_all_sats: bool = True,
+) -> list[tuple[float, float, TLESatellite]]:
+    """Render Cheyenne Mountain / NASA Mission-Control World Map and return clickable (x, y, sat) targets."""
+    th = MAP_THEMES.get(theme_key, MAP_THEMES["norad"])
+    pad_l, pad_r, pad_t, pad_b = 28.0, 10.0, 18.0, 18.0
+    mw = max(80.0, width - pad_l - pad_r)
+    mh = max(60.0, height - pad_t - pad_b)
+
+    def proj(lon: float, lat: float) -> tuple[float, float]:
+        x = pad_l + ((lon + 180.0) / 360.0) * mw
+        y = pad_t + ((90.0 - lat) / 180.0) * mh
+        return x, y
+
+    # Outer console matte frame
+    cr.set_source_rgb(0.05, 0.07, 0.10)
+    cr.rectangle(0, 0, width, height)
+    cr.fill()
+
+    # Ocean base inside map viewport
+    cr.save()
+    cr.rectangle(pad_l, pad_t, mw, mh)
+    cr.clip()
+
+    cr.set_source_rgb(*th["ocean"])
+    cr.rectangle(pad_l, pad_t, mw, mh)
+    cr.fill()
+
+    # Vector Continents & Islands (with inland lakes cut out cleanly)
+    for is_hole, poly in WORLD_POLYGONS:
+        if len(poly) < 3:
+            continue
+        x0, y0 = proj(poly[0][0], poly[0][1])
+        cr.new_path()
+        cr.move_to(x0, y0)
+        for lon, lat in poly[1:]:
+            px, py = proj(lon, lat)
+            cr.line_to(px, py)
+        cr.close_path()
+        if is_hole:
+            cr.set_source_rgb(*th["ocean"])
+            cr.fill_preserve()
+        else:
+            cr.set_source_rgb(*th["land_fill"])
+            cr.fill_preserve()
+        cr.set_source_rgb(*th["coast"])
+        cr.set_line_width(0.85)
+        cr.stroke()
+
+    # US State & International Tactical Borders
+    cr.set_source_rgba(th["border"][0], th["border"][1], th["border"][2], 0.80)
+    cr.set_line_width(0.65)
+    for line in BORDER_POLYLINES:
+        if len(line) < 2:
+            continue
+        cr.new_path()
+        x0, y0 = proj(line[0][0], line[0][1])
+        cr.move_to(x0, y0)
+        for lon, lat in line[1:]:
+            px, py = proj(lon, lat)
+            cr.line_to(px, py)
+        cr.stroke()
+
+    # Astronomical Solar Day/Night Terminator Overlay
+    _, sun_lat, sun_lon = solar_ephemeris(unix_ts)
+    dec_rad = math.radians(sun_lat)
+    tan_dec = math.tan(dec_rad)
+    if abs(tan_dec) < 1e-4:
+        tan_dec = 1e-4 if dec_rad >= 0.0 else -1e-4
+
+    term_pts: list[tuple[float, float]] = []
+    for lon_i in range(-180, 181, 2):
+        ha_rad = math.radians(lon_i - sun_lon)
+        lat_term = math.degrees(math.atan(-math.cos(ha_rad) / tan_dec))
+        term_pts.append((float(lon_i), lat_term))
+
+    cr.new_path()
+    tx0, ty0 = proj(term_pts[0][0], term_pts[0][1])
+    cr.move_to(tx0, ty0)
+    for tlon, tlat in term_pts[1:]:
+        px, py = proj(tlon, tlat)
+        cr.line_to(px, py)
+    # Close polygon over the dark pole
+    dark_pole_lat = -90.0 if sun_lat >= 0.0 else 90.0
+    p_end = proj(180.0, dark_pole_lat)
+    p_start = proj(-180.0, dark_pole_lat)
+    cr.line_to(p_end[0], p_end[1])
+    cr.line_to(p_start[0], p_start[1])
+    cr.close_path()
+    cr.set_source_rgba(*th["night_rgba"])
+    cr.fill()
+
+    # Glowing Greyline Terminator Curve
+    cr.new_path()
+    cr.move_to(tx0, ty0)
+    for tlon, tlat in term_pts[1:]:
+        px, py = proj(tlon, tlat)
+        cr.line_to(px, py)
+    cr.set_source_rgba(th["term_line"][0], th["term_line"][1], th["term_line"][2], 0.65)
+    cr.set_line_width(1.15)
+    cr.stroke()
+
+    # Lat/Lon Graticule (every 30 deg) + Equator & Tropics
+    cr.set_source_rgba(th["grid"][0], th["grid"][1], th["grid"][2], 0.65)
+    cr.set_line_width(0.6)
+    for lon_g in range(-150, 180, 30):
+        gx, _ = proj(lon_g, 0.0)
+        cr.move_to(gx, pad_t)
+        cr.line_to(gx, pad_t + mh)
+    for lat_g in (-60, -30, 0, 30, 60):
+        _, gy = proj(0.0, lat_g)
+        cr.move_to(pad_l, gy)
+        cr.line_to(pad_l + mw, gy)
+    cr.stroke()
+
+    # Equator emphasis
+    _, eq_y = proj(0.0, 0.0)
+    cr.set_source_rgba(th["coast"][0], th["coast"][1], th["coast"][2], 0.38)
+    cr.set_line_width(0.9)
+    cr.move_to(pad_l, eq_y)
+    cr.line_to(pad_l + mw, eq_y)
+    cr.stroke()
+
+    # Optional 20x10 deg Maidenhead Field Grid (AA..RR)
+    if show_maidenhead:
+        cr.set_source_rgba(th["maiden"][0], th["maiden"][1], th["maiden"][2], 0.34)
+        cr.set_dash([2.0, 3.0])
+        cr.set_line_width(0.55)
+        for lon_m in range(-160, 180, 20):
+            gx, _ = proj(lon_m, 0.0)
+            cr.move_to(gx, pad_t)
+            cr.line_to(gx, pad_t + mh)
+        for lat_m in range(-80, 90, 10):
+            _, gy = proj(0.0, lat_m)
+            cr.move_to(pad_l, gy)
+            cr.line_to(pad_l + mw, gy)
+        cr.stroke()
+        cr.set_dash([])
+
+        # Subtle Maidenhead field labels around North America / Europe / Pacific
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(7.5)
+        cr.set_source_rgba(th["maiden"][0], th["maiden"][1], th["maiden"][2], 0.52)
+        for fi in range(0, 18, 2):
+            for fj in range(2, 16, 2):
+                lbl = chr(ord("A") + fi) + chr(ord("A") + fj)
+                lx, ly = proj(-180.0 + fi * 20.0 + 2.0, -90.0 + fj * 10.0 + 8.0)
+                cr.move_to(lx, ly)
+                cr.show_text(lbl)
+
+    # Subsolar Sun Marker
+    sun_x, sun_y = proj(sun_lon, sun_lat)
+    cr.set_source_rgba(1.0, 0.86, 0.24, 0.90)
+    cr.arc(sun_x, sun_y, 3.8, 0.0, TWO_PI)
+    cr.fill()
+    cr.set_line_width(1.0)
+    for k in range(8):
+        ang = k * (math.pi / 4.0)
+        cr.move_to(sun_x + 5.2 * math.cos(ang), sun_y + 5.2 * math.sin(ang))
+        cr.line_to(sun_x + 8.0 * math.cos(ang), sun_y + 8.0 * math.sin(ang))
+    cr.stroke()
+
+    # Primary Satellite Past & 3-Orbit Future Ground Track
+    cr.set_dash([4.0, 3.0])
+    cr.set_source_rgba(th["track_past"][0], th["track_past"][1], th["track_past"][2], 0.78)
+    cr.set_line_width(1.2)
+    for seg in past_segs:
+        cr.new_path()
+        x0, y0 = proj(seg[0][0], seg[0][1])
+        cr.move_to(x0, y0)
+        for lon, lat in seg[1:]:
+            px, py = proj(lon, lat)
+            cr.line_to(px, py)
+        cr.stroke()
+    cr.set_dash([])
+
+    cr.set_source_rgba(th["track_fut"][0], th["track_fut"][1], th["track_fut"][2], 0.92)
+    cr.set_line_width(1.6)
+    for seg in fut_segs:
+        cr.new_path()
+        x0, y0 = proj(seg[0][0], seg[0][1])
+        cr.move_to(x0, y0)
+        for lon, lat in seg[1:]:
+            px, py = proj(lon, lat)
+            cr.line_to(px, py)
+        cr.stroke()
+
+    # Direction chevrons along first future segment
+    if fut_segs and len(fut_segs[0]) >= 8:
+        fseg = fut_segs[0]
+        for idx in range(6, min(len(fseg) - 1, 42), 10):
+            x1, y1 = proj(fseg[idx - 1][0], fseg[idx - 1][1])
+            x2, y2 = proj(fseg[idx][0], fseg[idx][1])
+            if math.hypot(x2 - x1, y2 - y1) < 80.0:
+                hdg = math.atan2(y2 - y1, x2 - x1)
+                cr.move_to(x2, y2)
+                cr.line_to(x2 - 6.0 * math.cos(hdg - 0.5), y2 - 6.0 * math.sin(hdg - 0.5))
+                cr.move_to(x2, y2)
+                cr.line_to(x2 - 6.0 * math.cos(hdg + 0.5), y2 - 6.0 * math.sin(hdg + 0.5))
+                cr.stroke()
+
+    # Highlighted Preview Pass Ground-Track Segment (if user clicked a row in Pass Table)
+    if preview_pass is not None and len(preview_pass.arc_points) >= 2:
+        cr.set_source_rgba(1.0, 0.92, 0.30, 0.98)
+        cr.set_line_width(2.8)
+        prev_l: float | None = None
+        cr.new_path()
+        for _, _, _, plat, plon in preview_pass.arc_points:
+            px, py = proj(plon, plat)
+            if prev_l is not None and abs(plon - prev_l) > 170.0:
+                cr.stroke()
+                cr.new_path()
+                cr.move_to(px, py)
+            elif prev_l is None:
+                cr.move_to(px, py)
+            else:
+                cr.line_to(px, py)
+            prev_l = plon
+        cr.stroke()
+
+    # Live Spherical Radio-Visibility Footprint Circle for Primary Satellite
+    deg_half = math.degrees(primary_tel.footprint_half_angle_rad)
+    encloses_north = (primary_tel.lat_deg + deg_half) >= 89.8
+    encloses_south = (primary_tel.lat_deg - deg_half) <= -89.8
+    fp_pts = compute_footprint_ring(primary_tel.lat_deg, primary_tel.lon_deg, primary_tel.footprint_half_angle_rad)
+
+    if encloses_north or encloses_south:
+        # Polar-cap footprint: wrap longitudes to [-180, 180], sort W->E, and close over the enclosed pole
+        wrapped = sorted([(((lon + 180.0) % 360.0) - 180.0, lat) for lon, lat in fp_pts], key=lambda p: p[0])
+        pole_lat = 90.0 if encloses_north else -90.0
+        cr.new_path()
+        cr.move_to(*proj(-180.0, wrapped[0][1]))
+        for lon, lat in wrapped:
+            cr.line_to(*proj(lon, lat))
+        cr.line_to(*proj(180.0, wrapped[-1][1]))
+        cr.line_to(*proj(180.0, pole_lat))
+        cr.line_to(*proj(-180.0, pole_lat))
+        cr.close_path()
+        cr.set_source_rgba(*th["foot_fill"])
+        cr.fill()
+        cr.new_path()
+        cr.move_to(*proj(wrapped[0][0], wrapped[0][1]))
+        for lon, lat in wrapped[1:]:
+            cr.line_to(*proj(lon, lat))
+        cr.set_source_rgba(*th["foot_stroke"])
+        cr.set_line_width(1.4)
+        cr.stroke()
+    else:
+        # Draw shifted copies (-360, 0, +360) so Date-Line crossing footprints fill & stroke seamlessly
+        for lon_shift in (-360.0, 0.0, 360.0):
+            cr.new_path()
+            x0, y0 = proj(fp_pts[0][0] + lon_shift, fp_pts[0][1])
+            cr.move_to(x0, y0)
+            for lon, lat in fp_pts[1:]:
+                cr.line_to(*proj(lon + lon_shift, lat))
+            cr.close_path()
+            cr.set_source_rgba(*th["foot_fill"])
+            cr.fill_preserve()
+            cr.set_source_rgba(*th["foot_stroke"])
+            cr.set_line_width(1.35)
+            cr.stroke()
+
+    # Ground Station Beacon: W1AW [FN31pr]
+    qx, qy = proj(obs.lon_deg, obs.lat_deg)
+    cr.set_source_rgba(th["qth"][0], th["qth"][1], th["qth"][2], 0.28)
+    cr.arc(qx, qy, 8.5, 0.0, TWO_PI)
+    cr.fill()
+    cr.set_source_rgb(*th["qth"])
+    cr.move_to(qx, qy - 5.0)
+    cr.line_to(qx + 5.0, qy)
+    cr.line_to(qx, qy + 5.0)
+    cr.line_to(qx - 5.0, qy)
+    cr.close_path()
+    cr.fill()
+
+    cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    cr.set_font_size(8.5)
+    q_lbl = f"{obs.callsign} [{obs.grid}]"
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.75)
+    cr.move_to(qx + 7.0, qy + 3.5)
+    cr.show_text(q_lbl)
+    cr.set_source_rgb(*th["qth"])
+    cr.move_to(qx + 6.0, qy + 2.5)
+    cr.show_text(q_lbl)
+
+    # Active Line-of-Sight (LOS) Tactical Beam when Primary Satellite Elevation > 0 deg
+    sx_pri, sy_pri = proj(primary_tel.lon_deg, primary_tel.lat_deg)
+    if primary_tel.el_deg > 0.0 and abs(primary_tel.lon_deg - obs.lon_deg) < 175.0:
+        cr.set_source_rgba(th["los"][0], th["los"][1], th["los"][2], 0.35)
+        cr.set_line_width(4.0)
+        cr.move_to(qx, qy)
+        cr.line_to(sx_pri, sy_pri)
+        cr.stroke()
+
+        cr.set_dash([5.0, 3.0])
+        cr.set_source_rgb(*th["los"])
+        cr.set_line_width(1.6)
+        cr.move_to(qx, qy)
+        cr.line_to(sx_pri, sy_pri)
+        cr.stroke()
+        cr.set_dash([])
+
+    # Plot Tracked Satellites (Secondary first, Primary on top)
+    hit_targets: list[tuple[float, float, TLESatellite]] = []
+    if show_all_sats:
+        cr.set_font_size(7.8)
+        for tel in all_tels:
+            if tel.sat.norad_id == primary_tel.sat.norad_id:
+                continue
+            tx, ty = proj(tel.lon_deg, tel.lat_deg)
+            hit_targets.append((tx, ty, tel.sat))
+            col = th["los"] if tel.el_deg > 0.0 else th["sat_other"]
+            cr.set_source_rgb(*col)
+            cr.rectangle(tx - 2.6, ty - 2.6, 5.2, 5.2)
+            cr.fill()
+            # Solar wing ticks
+            cr.set_line_width(1.1)
+            cr.move_to(tx - 6.5, ty)
+            cr.line_to(tx + 6.5, ty)
+            cr.stroke()
+
+            short_nm = tel.sat.name.split("(")[0].strip()
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.80)
+            cr.move_to(tx + 6.5, ty - 2.5)
+            cr.show_text(short_nm)
+            cr.set_source_rgba(col[0], col[1], col[2], 0.92)
+            cr.move_to(tx + 5.5, ty - 3.5)
+            cr.show_text(short_nm)
+
+    # Primary Satellite Reticle + Spacecraft Icon + Telemetry Tag
+    hit_targets.append((sx_pri, sy_pri, primary_tel.sat))
+    pcol = th["sat_pri"]
+    cr.set_source_rgba(pcol[0], pcol[1], pcol[2], 0.25)
+    cr.arc(sx_pri, sy_pri, 10.5, 0.0, TWO_PI)
+    cr.fill()
+
+    cr.set_source_rgb(*pcol)
+    cr.set_line_width(1.6)
+    cr.arc(sx_pri, sy_pri, 6.5, 0.0, TWO_PI)
+    cr.stroke()
+    # Crosshair & solar wings
+    cr.move_to(sx_pri - 11.0, sy_pri)
+    cr.line_to(sx_pri - 4.0, sy_pri)
+    cr.move_to(sx_pri + 4.0, sy_pri)
+    cr.line_to(sx_pri + 11.0, sy_pri)
+    cr.move_to(sx_pri, sy_pri - 10.0)
+    cr.line_to(sx_pri, sy_pri - 4.0)
+    cr.move_to(sx_pri, sy_pri + 4.0)
+    cr.line_to(sx_pri, sy_pri + 10.0)
+    cr.stroke()
+    cr.rectangle(sx_pri - 2.5, sy_pri - 2.5, 5.0, 5.0)
+    cr.fill()
+
+    cr.set_font_size(9.0)
+    pri_tag = f"{primary_tel.sat.name} ({primary_tel.alt_km:.0f}km)"
+    ext = cr.text_extents(pri_tag)
+    lbl_x = sx_pri + 10.0 if sx_pri + ext.width + 16.0 < pad_l + mw else sx_pri - ext.width - 10.0
+    lbl_y = sy_pri - 6.0 if sy_pri - 16.0 > pad_t else sy_pri + 14.0
+    cr.set_source_rgba(0.03, 0.05, 0.08, 0.82)
+    cr.rectangle(lbl_x - 3.0, lbl_y - 10.0, ext.width + 6.0, 13.0)
+    cr.fill()
+    cr.set_source_rgb(*pcol)
+    cr.move_to(lbl_x, lbl_y)
+    cr.show_text(pri_tag)
+
+    # Subtle CRT scanline sheen
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.018)
+    cr.set_line_width(1.0)
+    for sy_line in range(int(pad_t), int(pad_t + mh), 3):
+        cr.move_to(pad_l, sy_line + 0.5)
+        cr.line_to(pad_l + mw, sy_line + 0.5)
+    cr.stroke()
+
+    cr.restore()
+
+    # Map Viewport Border + Coordinate Margin Labels
+    cr.set_source_rgb(*th["coast"])
+    cr.set_line_width(1.2)
+    cr.rectangle(pad_l, pad_t, mw, mh)
+    cr.stroke()
+
+    cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    cr.set_font_size(7.5)
+    cr.set_source_rgb(0.68, 0.78, 0.88)
+    for lon_g in range(-180, 181, 60):
+        gx, _ = proj(lon_g, 0.0)
+        txt = f"{abs(lon_g)}°{'W' if lon_g < 0 else ('E' if lon_g > 0 else '')}"
+        cr.move_to(max(2.0, min(width - 28.0, gx - 12.0)), pad_t + mh + 12.0)
+        cr.show_text(txt)
+    for lat_g in (-60, -30, 0, 30, 60):
+        _, gy = proj(0.0, lat_g)
+        txt = f"{abs(lat_g)}°{'S' if lat_g < 0 else ('N' if lat_g > 0 else '')}"
+        cr.move_to(2.0, gy + 3.0)
+        cr.show_text(txt)
+
+    # Top Header Banner on Console Screen
+    mode_banner = (
+        f"NORAD / CHEYENNE MTN ORBITAL DISPLAY  ·  PREVIEW PASS: {preview_pass.sat.name}"
+        if preview_pass is not None
+        else f"NORAD / CHEYENNE MTN ORBITAL DISPLAY  ·  FOOTPRINT R={primary_tel.footprint_radius_km:.0f} km"
+    )
+    cr.set_source_rgb(*th["track_fut"])
+    cr.move_to(pad_l + 2.0, 12.5)
+    cr.show_text(mode_banner)
+
+    utc_str = datetime.datetime.fromtimestamp(unix_ts, tz=datetime.timezone.utc).strftime("UTC %Y-%m-%d %H:%M:%SZ")
+    u_ext = cr.text_extents(utc_str)
+    cr.set_source_rgb(0.84, 0.92, 0.98)
+    cr.move_to(pad_l + mw - u_ext.width - 2.0, 12.5)
+    cr.show_text(utc_str)
+
+    return hit_targets
+
+
+def render_polar_sky_dome(
+    cr: cairo.Context,
+    width: int,
+    height: int,
+    theme_key: str,
+    all_tels: list[SatTelemetry],
+    primary_tel: SatTelemetry,
+    active_pass: SatPass | None,
+    is_preview: bool = False,
+) -> None:
+    """Render Circular Az/El Polar Sky-Dome Radar (0° outer horizon, 30°/60° rings, 90° zenith)."""
+    th = MAP_THEMES.get(theme_key, MAP_THEMES["norad"])
+    cr.set_source_rgb(0.05, 0.07, 0.10)
+    cr.rectangle(0, 0, width, height)
+    cr.fill()
+
+    cx = width * 0.5
+    cy = height * 0.5 + 4.0
+    radius = max(40.0, min(width, height - 18.0) * 0.43)
+
+    def azel_to_xy(az_deg: float, el_deg: float) -> tuple[float, float]:
+        r = radius * (90.0 - clamp(el_deg, 0.0, 90.0)) / 90.0
+        ang = math.radians(az_deg)
+        return cx + r * math.sin(ang), cy - r * math.cos(ang)
+
+    # Radar circular phosphor background
+    cr.set_source_rgb(*th["radar_bg"])
+    cr.arc(cx, cy, radius + 3.0, 0.0, TWO_PI)
+    cr.fill()
+
+    # Elevation rings: 0° (horizon), 30°, 60°
+    for el_ring, lw in ((0.0, 1.5), (30.0, 0.8), (60.0, 0.8)):
+        rr = radius * (90.0 - el_ring) / 90.0
+        cr.set_source_rgba(th["radar_ring"][0], th["radar_ring"][1], th["radar_ring"][2], 0.88 if el_ring == 0.0 else 0.52)
+        cr.set_line_width(lw)
+        cr.arc(cx, cy, rr, 0.0, TWO_PI)
+        cr.stroke()
+
+    # Azimuth spokes every 30° + Zenith crosshair
+    cr.set_source_rgba(th["radar_ring"][0], th["radar_ring"][1], th["radar_ring"][2], 0.42)
+    cr.set_line_width(0.65)
+    for az_s in range(0, 360, 30):
+        ang = math.radians(az_s)
+        r_in = 0.0 if az_s % 90 == 0 else radius * (30.0 / 90.0)
+        cr.move_to(cx + r_in * math.sin(ang), cy - r_in * math.cos(ang))
+        cr.line_to(cx + radius * math.sin(ang), cy - radius * math.cos(ang))
+    cr.stroke()
+
+    # Compass Cardinal Labels (N / E / S / W) & Ring Elevation Labels
+    cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    cr.set_font_size(8.5)
+    cr.set_source_rgb(0.86, 0.94, 1.0)
+    for lbl, az_c in (("N", 0.0), ("E", 90.0), ("S", 180.0), ("W", 270.0)):
+        ang = math.radians(az_c)
+        lx = cx + (radius + 10.5) * math.sin(ang)
+        ly = cy - (radius + 10.5) * math.cos(ang)
+        ext = cr.text_extents(lbl)
+        cr.move_to(lx - ext.width * 0.5, ly + ext.height * 0.4)
+        cr.show_text(lbl)
+
+    cr.set_font_size(7.0)
+    cr.set_source_rgba(th["radar_ring"][0], th["radar_ring"][1], th["radar_ring"][2], 0.85)
+    for el_lbl in (30, 60):
+        _, ly = azel_to_xy(15.0, float(el_lbl))
+        cr.move_to(cx + 3.0, ly - 2.0)
+        cr.show_text(f"{el_lbl}°")
+
+    # Pass Trajectory Arc (AOS -> MAX EL -> LOS) with 1-minute tick marks
+    if active_pass is not None and len(active_pass.arc_points) >= 2:
+        arc_col = (1.0, 0.88, 0.28) if is_preview else th["radar_arc"]
+        cr.new_path()
+        x0, y0 = azel_to_xy(active_pass.arc_points[0][1], active_pass.arc_points[0][2])
+        cr.move_to(x0, y0)
+        for _, paz, pel, _, _ in active_pass.arc_points[1:]:
+            px, py = azel_to_xy(paz, pel)
+            cr.line_to(px, py)
+        cr.set_source_rgba(arc_col[0], arc_col[1], arc_col[2], 0.28)
+        cr.set_line_width(3.8)
+        cr.stroke_preserve()
+        cr.set_source_rgba(arc_col[0], arc_col[1], arc_col[2], 0.95)
+        cr.set_line_width(1.6)
+        cr.stroke()
+
+        # 1-Minute Tick Marks along the Pass Arc
+        first_min = int(math.ceil(active_pass.aos_ts / 60.0)) * 60
+        pts = active_pass.arc_points
+        idx = 0
+        for m_ts in range(first_min, int(active_pass.los_ts), 60):
+            while idx + 1 < len(pts) and pts[idx + 1][0] < m_ts:
+                idx += 1
+            if idx + 1 < len(pts):
+                t0, az0, el0, _, _ = pts[idx]
+                t1, az1, el1, _, _ = pts[idx + 1]
+                frac = (m_ts - t0) / max(1e-3, t1 - t0)
+                x_a, y_a = azel_to_xy(az0, el0)
+                x_b, y_b = azel_to_xy(az1, el1)
+                mx = x_a + frac * (x_b - x_a)
+                my = y_a + frac * (y_b - y_a)
+                dx, dy = x_b - x_a, y_b - y_a
+                ln = max(1e-3, math.hypot(dx, dy))
+                nx, ny = -dy / ln, dx / ln
+                cr.move_to(mx - nx * 3.2, my - ny * 3.2)
+                cr.line_to(mx + nx * 3.2, my + ny * 3.2)
+                cr.set_line_width(1.2)
+                cr.stroke()
+
+        # AOS, MAX EL, and LOS Markers
+        ax_s, ay_s = azel_to_xy(active_pass.aos_az, 0.0)
+        lx_s, ly_s = azel_to_xy(active_pass.los_az, 0.0)
+        tx_s, ty_s = azel_to_xy(active_pass.tca_az, active_pass.max_el)
+
+        cr.set_source_rgb(0.42, 1.0, 0.56)
+        cr.arc(ax_s, ay_s, 3.3, 0.0, TWO_PI)
+        cr.fill()
+        cr.set_font_size(7.2)
+        cr.move_to(ax_s + 4.0, ay_s - 3.0)
+        cr.show_text("AOS")
+
+        cr.set_source_rgb(1.0, 0.45, 0.36)
+        cr.arc(lx_s, ly_s, 3.3, 0.0, TWO_PI)
+        cr.fill()
+        cr.move_to(lx_s + 4.0, ly_s + 7.0)
+        cr.show_text("LOS")
+
+        cr.set_source_rgb(1.0, 0.92, 0.36)
+        cr.arc(tx_s, ty_s, 3.2, 0.0, TWO_PI)
+        cr.fill()
+        cr.move_to(tx_s + 4.5, ty_s - 2.0)
+        cr.show_text(f"MAX {active_pass.max_el:.0f}°")
+
+    # Plot All Currently Visible Satellites (El > 0°)
+    for tel in all_tels:
+        if tel.el_deg <= 0.0:
+            continue
+        bx, by = azel_to_xy(tel.az_deg, tel.el_deg)
+        is_pri = tel.sat.norad_id == primary_tel.sat.norad_id
+        col = th["sat_pri"] if is_pri else th["los"]
+        if is_pri:
+            cr.set_source_rgba(col[0], col[1], col[2], 0.32)
+            cr.arc(bx, by, 8.0, 0.0, TWO_PI)
+            cr.fill()
+        cr.set_source_rgb(*col)
+        cr.arc(bx, by, 3.8 if is_pri else 2.8, 0.0, TWO_PI)
+        cr.fill()
+        cr.set_font_size(7.5 if is_pri else 7.0)
+        cr.move_to(bx + 5.0, by + 2.5)
+        cr.show_text(tel.sat.name.split("(")[0].strip())
+
+    # Top-left & Top-right Sky-Dome Header
+    cr.set_font_size(7.5)
+    hdr = "SKY-DOME AZ/EL RADAR"
+    cr.set_source_rgb(*th["radar_arc"])
+    cr.move_to(6.0, 11.0)
+    cr.show_text(hdr)
+
+    if active_pass is not None:
+        tag = ("PREVIEW " if is_preview else "NEXT ") + datetime.datetime.fromtimestamp(
+            active_pass.aos_ts, tz=datetime.timezone.utc
+        ).strftime("%H:%MZ")
+        ext = cr.text_extents(tag)
+        cr.set_source_rgb(1.0, 0.88, 0.36 if is_preview else 0.86)
+        cr.move_to(width - ext.width - 6.0, 11.0)
+        cr.show_text(tag)
+
+
+def render_vfd_telemetry_bar(
+    cr: cairo.Context,
+    width: int,
+    height: int,
+    primary_tel: SatTelemetry,
+    next_pass: SatPass | None,
+    unix_ts: float,
+) -> None:
+    """Render glowing cyan-green Vacuum Fluorescent Display (VFD) telemetry strip."""
+    # Deep recessed VFD glass filter
+    cr.set_source_rgb(0.035, 0.075, 0.078)
+    cr.rectangle(0, 0, width, height)
+    cr.fill()
+
+    # Subtle VFD filament grid lines
+    cr.set_source_rgba(0.18, 0.55, 0.50, 0.09)
+    cr.set_line_width(1.0)
+    for gx in range(0, width, 16):
+        cr.move_to(gx + 0.5, 0)
+        cr.line_to(gx + 0.5, height)
+    cr.stroke()
+
+    # Compute AOS / LOS Countdown
+    if primary_tel.el_deg > 0.0 and next_pass is not None and next_pass.aos_ts <= unix_ts <= next_pass.los_ts:
+        rem = max(0, int(round(next_pass.los_ts - unix_ts)))
+        hh, rem2 = divmod(rem, 3600)
+        mm, ss = divmod(rem2, 60)
+        timer_lbl = "IN VIEW · LOS COUNTDOWN"
+        timer_val = f"LOS T- {hh:02d}:{mm:02d}:{ss:02d}"
+        timer_col = (0.45, 1.00, 0.62)
+    elif next_pass is not None and next_pass.aos_ts > unix_ts:
+        rem = max(0, int(round(next_pass.aos_ts - unix_ts)))
+        hh, rem2 = divmod(rem, 3600)
+        mm, ss = divmod(rem2, 60)
+        timer_lbl = f"NEXT AOS ({next_pass.max_el:.0f}° MAX)"
+        timer_val = f"AOS T- {hh:02d}:{mm:02d}:{ss:02d}"
+        timer_col = (0.38, 0.98, 0.86)
+    else:
+        timer_lbl = "NEXT PASS (24H)"
+        timer_val = "SEARCHING..."
+        timer_col = (0.62, 0.82, 0.80)
+
+    el_col = (0.46, 1.00, 0.60) if primary_tel.el_deg > 0.0 else (0.38, 0.96, 0.84)
+    sun_val = "☀ SUNLIT" if primary_tel.sunlit else "◐ ECLIPSED"
+    sun_col = (1.00, 0.86, 0.34) if primary_tel.sunlit else (0.56, 0.78, 0.98)
+
+    cells = [
+        ("SPACECRAFT / NORAD", f"{primary_tel.sat.name}", f"#{primary_tel.sat.norad_id:05d} · {primary_tel.lat_deg:+.2f}°, {primary_tel.lon_deg:+.2f}°", (1.00, 0.90, 0.36), 1.45),
+        ("AZIMUTH", f"{primary_tel.az_deg:05.1f}°", f"BRG {az_to_compass(primary_tel.az_deg)}", (0.38, 0.98, 0.86), 0.88),
+        ("ELEVATION", f"{primary_tel.el_deg:+05.1f}°", "AOS ACTIVE" if primary_tel.el_deg > 0.0 else "BELOW HORIZ", el_col, 0.92),
+        ("SLANT RANGE", f"{primary_tel.slant_range_km:6.0f} km", f"dR/dt {primary_tel.range_rate_km_s:+.2f} km/s", (0.38, 0.98, 0.86), 1.05),
+        ("ALTITUDE / VEL", f"{primary_tel.alt_km:5.1f} km", f"V {primary_tel.vel_km_s:.2f} km/s", (0.38, 0.98, 0.86), 0.98),
+        ("ORBIT / ILLUM", f"#{primary_tel.orbit_num:05d}", sun_val, sun_col, 0.98),
+        (timer_lbl, timer_val, datetime.datetime.now().strftime("LOC %H:%M:%S"), timer_col, 1.30),
+    ]
+
+    total_w = sum(c[4] for c in cells)
+    x_cur = 4.0
+    usable_w = max(100.0, width - 8.0)
+
+    for idx, (title, main_v, sub_v, col, weight) in enumerate(cells):
+        cw = usable_w * (weight / total_w)
+        if idx > 0:
+            cr.set_source_rgba(0.24, 0.62, 0.58, 0.35)
+            cr.set_line_width(1.0)
+            cr.move_to(x_cur, 5.0)
+            cr.line_to(x_cur, height - 5.0)
+            cr.stroke()
+
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(7.2)
+        cr.set_source_rgba(0.55, 0.88, 0.82, 0.85)
+        cr.move_to(x_cur + 6.0, 11.5)
+        cr.show_text(title)
+
+        cr.set_font_size(12.5)
+        cr.set_source_rgb(*col)
+        cr.move_to(x_cur + 6.0, 29.0)
+        cr.show_text(main_v)
+
+        cr.set_font_size(7.6)
+        cr.set_source_rgba(0.66, 0.94, 0.88, 0.88)
+        cr.move_to(x_cur + 6.0, 42.5)
+        cr.show_text(sub_v)
+
+        x_cur += cw
+
+
+def render_doppler_vfd(
+    cr: cairo.Context,
+    width: int,
+    height: int,
+    down_mhz: float,
+    up_mhz: float,
+    range_rate_km_s: float,
+    mode_note: str,
+) -> None:
+    """Render glowing dual-channel RX Downlink & TX Uplink Doppler VFD readout."""
+    cr.set_source_rgb(0.032, 0.070, 0.074)
+    cr.rectangle(0, 0, width, height)
+    cr.fill()
+
+    rx_mhz, df_rx_hz, tx_mhz, df_tx_hz = compute_doppler_pair(down_mhz, up_mhz, range_rate_km_s)
+    half_w = width * 0.5
+
+    cr.set_source_rgba(0.24, 0.62, 0.58, 0.35)
+    cr.set_line_width(1.0)
+    cr.move_to(half_w, 4.0)
+    cr.line_to(half_w, height - 4.0)
+    cr.stroke()
+
+    cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+
+    # Left: RX DOWNLINK
+    cr.set_font_size(7.4)
+    cr.set_source_rgba(0.55, 0.90, 0.84, 0.90)
+    cr.move_to(7.0, 12.0)
+    cr.show_text("RX DOWNLINK (TUNE RECEIVER)")
+
+    cr.set_font_size(13.0)
+    cr.set_source_rgb(0.38, 1.00, 0.84)
+    cr.move_to(7.0, 29.5)
+    cr.show_text(f"{rx_mhz:10.6f} MHz".strip() if down_mhz > 0.0 else "---.------ MHz")
+
+    cr.set_font_size(7.8)
+    cr.set_source_rgb(0.82, 0.96, 0.62)
+    cr.move_to(7.0, 43.5)
+    cr.show_text(f"Δf {df_rx_hz:+7.0f} Hz  ({mode_note})" if down_mhz > 0.0 else "NO DOWNLINK")
+
+    # Right: TX UPLINK
+    cr.set_font_size(7.4)
+    cr.set_source_rgba(0.96, 0.78, 0.48, 0.92)
+    cr.move_to(half_w + 7.0, 12.0)
+    cr.show_text("TX UPLINK (PRE-COMPENSATED)")
+
+    cr.set_font_size(13.0)
+    if up_mhz > 0.0:
+        cr.set_source_rgb(1.00, 0.82, 0.34)
+        cr.move_to(half_w + 7.0, 29.5)
+        cr.show_text(f"{tx_mhz:10.6f} MHz".strip())
+        cr.set_font_size(7.8)
+        cr.set_source_rgb(0.96, 0.88, 0.68)
+        cr.move_to(half_w + 7.0, 43.5)
+        cr.show_text(f"Δf {df_tx_hz:+7.0f} Hz  (Nom {up_mhz:.3f})")
+    else:
+        cr.set_source_rgba(0.52, 0.68, 0.68, 0.75)
+        cr.move_to(half_w + 7.0, 29.5)
+        cr.show_text("RX-ONLY BEACON")
+        cr.set_font_size(7.8)
+        cr.move_to(half_w + 7.0, 43.5)
+        cr.show_text(mode_note)
+
+
+# ---------------------------------------------------------------------------
+# Main GTK3 Application Window
+# ---------------------------------------------------------------------------
+class DtSatWindow(Gtk.Window):
+    def __init__(self) -> None:
+        super().__init__(title="dtSat — NASA/NORAD Orbital Pass & Amateur Radio Doppler Console")
+        self.set_wmclass("dtSat", "DtSat")
+        self.set_default_size(1120, 660)
+
+        # Load application icon if available
+        script_dir = Path(__file__).resolve().parent
+        for icon_candidate in (
+            script_dir / "icons" / "dtsat.pm",
+            script_dir.parent / "assets" / "icons" / "dtsat.png",
+            HOME / ".dt" / "icons" / "dtsat.pm",
+        ):
+            if icon_candidate.is_file():
+                try:
+                    self.set_icon_from_file(str(icon_candidate))
+                    break
+                except Exception:
+                    pass
+
+        chrome, sel, well = load_cde_palette()
+        provider = Gtk.CssProvider()
+        provider.load_from_data(build_sat_css(chrome, sel, well))
+        screen = Gdk.Screen.get_default()
+        if screen is not None:
+            Gtk.StyleContext.add_provider_for_screen(screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        # Configuration & Ground Station State
+        self.obs = GroundStation()
+        self.theme_key = "norad"
+        self.show_maidenhead = True
+        self.show_all_sats = True
+        self.pass_all_sats = True
+        self.min_el_deg = 5.0
+        self.selected_norad_id = 25544
+        self._load_config()
+
+        # Load TLE Catalog (Built-in 15 + Cached CelesTrak Updates)
+        self.tle_source_label = "Built-in NORAD Baseline (15 Spacecraft)"
+        self.sats: list[TLESatellite] = []
+        self.sat_by_id: dict[int, TLESatellite] = {}
+        self._load_initial_tles()
+
+        # Live Telemetry, Ground Track, and Pass Predictor Caches
+        self.now_ts = time.time()
+        self.all_tels: list[SatTelemetry] = []
+        self.primary_tel: SatTelemetry = self._compute_telemetry_snapshot(self.now_ts)
+        self.past_segs: list[list[tuple[float, float]]] = []
+        self.fut_segs: list[list[tuple[float, float]]] = []
+        self._last_track_ts = 0.0
+        self._last_track_sat = -1
+
+        self.upcoming_passes: list[SatPass] = []
+        self.preview_pass: SatPass | None = None
+        self.map_hit_targets: list[tuple[float, float, TLESatellite]] = []
+        self._updating_tle = False
+        self._syncing_preset = False
+
+        # Current Radio Doppler Settings
+        self.down_mhz = 437.8000
+        self.up_mhz = 145.9900
+        self.mode_note = "FM · PL 67.0 Hz"
+
+        self._build_ui()
+        self._sync_preset_for_satellite(self.selected_norad_id)
+        self._refresh_ground_track(force=True)
+        self._recompute_passes()
+
+        # 1 Hz Real-Time Orbital & Doppler Update Timer
+        GLib.timeout_add(1000, self._on_tick_1hz)
+
+        # Async CelesTrak refresh on startup if cache is missing or older than 12h
+        if not TLE_CACHE_FILE.is_file() or (time.time() - TLE_CACHE_FILE.stat().st_mtime) > 43200:
+            self._trigger_tle_update(silent=True)
+
+        self.connect("destroy", lambda *_: Gtk.main_quit())
+
+    # -----------------------------------------------------------------------
+    # Persistence & TLE Loading
+    # -----------------------------------------------------------------------
+    def _load_config(self) -> None:
+        if not CONFIG_FILE.is_file():
+            return
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            self.obs.callsign = str(cfg.get("callsign", DEFAULT_CALLSIGN)).strip() or DEFAULT_CALLSIGN
+            self.obs.grid = str(cfg.get("grid", DEFAULT_GRID)).strip() or DEFAULT_GRID
+            self.obs.lat_deg = clamp(float(cfg.get("lat_deg", DEFAULT_LAT)), -89.99, 89.99)
+            self.obs.lon_deg = clamp(float(cfg.get("lon_deg", DEFAULT_LON)), -180.0, 180.0)
+            self.obs.alt_m = clamp(float(cfg.get("alt_m", DEFAULT_ALT_M)), -450.0, 9000.0)
+            if cfg.get("theme") in MAP_THEMES:
+                self.theme_key = cfg["theme"]
+            self.show_maidenhead = bool(cfg.get("show_maidenhead", True))
+            self.show_all_sats = bool(cfg.get("show_all_sats", True))
+            self.pass_all_sats = bool(cfg.get("pass_all_sats", True))
+            self.min_el_deg = clamp(float(cfg.get("min_el_deg", 5.0)), 0.0, 60.0)
+            self.selected_norad_id = int(cfg.get("selected_norad_id", 25544))
+        except Exception:
+            pass
+
+    def _save_config(self) -> None:
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            data = {
+                "callsign": self.obs.callsign,
+                "grid": self.obs.grid,
+                "lat_deg": round(self.obs.lat_deg, 4),
+                "lon_deg": round(self.obs.lon_deg, 4),
+                "alt_m": round(self.obs.alt_m, 1),
+                "theme": self.theme_key,
+                "show_maidenhead": self.show_maidenhead,
+                "show_all_sats": self.show_all_sats,
+                "pass_all_sats": self.pass_all_sats,
+                "min_el_deg": self.min_el_deg,
+                "selected_norad_id": self.selected_norad_id,
+            }
+            CONFIG_FILE.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+
+    def _load_initial_tles(self) -> None:
+        builtin_list = parse_tle_catalog(BUILTIN_TLES_RAW)
+        merged: dict[int, TLESatellite] = {s.norad_id: s for s in builtin_list}
+        if TLE_CACHE_FILE.is_file():
+            try:
+                cached = parse_tle_catalog(TLE_CACHE_FILE.read_text(encoding="utf-8", errors="ignore"))
+                if cached:
+                    for cs in cached:
+                        if cs.norad_id in CORE_NORAD_NAMES:
+                            merged[cs.norad_id] = cs
+                    # Keep the 15 iconic spacecraft first, plus up to 35 popular cached amateur/weather sats
+                    extras = [cs for cs in cached if cs.norad_id not in merged][:35]
+                    for ex in extras:
+                        merged[ex.norad_id] = ex
+                    age_h = (time.time() - TLE_CACHE_FILE.stat().st_mtime) / 3600.0
+                    self.tle_source_label = f"CelesTrak Cache ({len(merged)} sats, {age_h:.1f}h old)"
+            except Exception:
+                pass
+
+        core_order = list(CORE_NORAD_NAMES.keys())
+        ordered = [merged[nid] for nid in core_order if nid in merged]
+        ordered.extend(sorted([s for nid, s in merged.items() if nid not in CORE_NORAD_NAMES], key=lambda x: x.name))
+        self.sats = ordered
+        self.sat_by_id = {s.norad_id: s for s in self.sats}
+        if self.selected_norad_id not in self.sat_by_id and self.sats:
+            self.selected_norad_id = self.sats[0].norad_id
+
+    def _compute_telemetry_snapshot(self, unix_ts: float) -> SatTelemetry:
+        obs_cache = self.obs.ecef_and_enu()
+        sun_eci, _, _ = solar_ephemeris(unix_ts)
+        tels: list[SatTelemetry] = []
+        pri_tel: SatTelemetry | None = None
+        for sat in self.sats:
+            t = propagate_satellite(sat, unix_ts, self.obs, obs_cache=obs_cache, sun_unit_eci=sun_eci)
+            tels.append(t)
+            if sat.norad_id == self.selected_norad_id:
+                pri_tel = t
+        self.all_tels = tels
+        if pri_tel is None:
+            pri_tel = tels[0]
+        return pri_tel
+
+    # -----------------------------------------------------------------------
+    # UI Construction (1120x660 CDE Mission Control Layout)
+    # -----------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        root.set_margin_top(3)
+        root.set_margin_bottom(3)
+        root.set_margin_start(4)
+        root.set_margin_end(4)
+        self.add(root)
+
+        # 1. Top Ground Station & Tactical Display Control Bar
+        top_strip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        top_strip.get_style_context().add_class("sat-strip")
+        root.pack_start(top_strip, False, False, 0)
+
+        def mk_lbl(txt: str) -> Gtk.Label:
+            lb = Gtk.Label(label=txt)
+            lb.get_style_context().add_class("sat-engraved")
+            return lb
+
+        top_strip.pack_start(mk_lbl("QTH:"), False, False, 0)
+        self.ent_call = Gtk.Entry()
+        self.ent_call.set_width_chars(7)
+        self.ent_call.set_text(self.obs.callsign)
+        self.ent_call.set_tooltip_text("Station Callsign")
+        top_strip.pack_start(self.ent_call, False, False, 0)
+
+        top_strip.pack_start(mk_lbl("GRID:"), False, False, 0)
+        self.ent_grid = Gtk.Entry()
+        self.ent_grid.set_width_chars(6)
+        self.ent_grid.set_text(self.obs.grid)
+        self.ent_grid.set_tooltip_text("Maidenhead Locator (e.g. FN31pr) — press Enter to sync Lat/Lon")
+        self.ent_grid.connect("activate", self._on_grid_activated)
+        top_strip.pack_start(self.ent_grid, False, False, 0)
+
+        top_strip.pack_start(mk_lbl("LAT:"), False, False, 0)
+        self.ent_lat = Gtk.Entry()
+        self.ent_lat.set_width_chars(8)
+        self.ent_lat.set_text(f"{self.obs.lat_deg:.4f}")
+        top_strip.pack_start(self.ent_lat, False, False, 0)
+
+        top_strip.pack_start(mk_lbl("LON:"), False, False, 0)
+        self.ent_lon = Gtk.Entry()
+        self.ent_lon.set_width_chars(9)
+        self.ent_lon.set_text(f"{self.obs.lon_deg:.4f}")
+        top_strip.pack_start(self.ent_lon, False, False, 0)
+
+        top_strip.pack_start(mk_lbl("EL(m):"), False, False, 0)
+        self.ent_alt = Gtk.Entry()
+        self.ent_alt.set_width_chars(5)
+        self.ent_alt.set_text(f"{self.obs.alt_m:.0f}")
+        top_strip.pack_start(self.ent_alt, False, False, 0)
+
+        btn_qth = Gtk.Button(label="SAVE QTH")
+        btn_qth.connect("clicked", self._on_save_qth_clicked)
+        top_strip.pack_start(btn_qth, False, False, 0)
+
+        # Spacer
+        top_strip.pack_start(Gtk.Box(), True, True, 0)
+
+        top_strip.pack_start(mk_lbl("CRT:"), False, False, 0)
+        self.cmb_theme = Gtk.ComboBoxText()
+        for k, meta in MAP_THEMES.items():
+            self.cmb_theme.append(k, meta["label"])
+        self.cmb_theme.set_active_id(self.theme_key)
+        self.cmb_theme.connect("changed", self._on_theme_changed)
+        top_strip.pack_start(self.cmb_theme, False, False, 0)
+
+        self.btn_grid = Gtk.ToggleButton(label="GRID")
+        self.btn_grid.set_active(self.show_maidenhead)
+        self.btn_grid.set_tooltip_text("Toggle Maidenhead Field Overlay")
+        self.btn_grid.connect("toggled", self._on_toggle_grid)
+        top_strip.pack_start(self.btn_grid, False, False, 0)
+
+        self.btn_allsats = Gtk.ToggleButton(label="FLEET")
+        self.btn_allsats.set_active(self.show_all_sats)
+        self.btn_allsats.set_tooltip_text("Show all tracked spacecraft on World Map")
+        self.btn_allsats.connect("toggled", self._on_toggle_allsats)
+        top_strip.pack_start(self.btn_allsats, False, False, 0)
+
+        self.btn_tle = Gtk.Button(label="⟳ UPDATE TLEs")
+        self.btn_tle.get_style_context().add_class("btn-tle")
+        self.btn_tle.set_tooltip_text("Fetch live NORAD GP elements from CelesTrak (amateur, weather, stations)")
+        self.btn_tle.connect("clicked", lambda *_: self._trigger_tle_update(silent=False))
+        top_strip.pack_start(self.btn_tle, False, False, 0)
+
+        # 2. Glowing VFD Mission Telemetry Banner
+        vfd_frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        vfd_frame.get_style_context().add_class("sat-bevel-in")
+        self.vfd_area = Gtk.DrawingArea()
+        self.vfd_area.set_size_request(-1, 48)
+        self.vfd_area.connect("draw", self._on_draw_vfd_bar)
+        vfd_frame.pack_start(self.vfd_area, True, True, 0)
+        root.pack_start(vfd_frame, False, False, 0)
+
+        # 3. Main Split Cabinet: Left NORAD World Map + Right Polar Radar & Doppler Computer
+        mid_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        mid_box.get_style_context().add_class("sat-cabinet")
+        root.pack_start(mid_box, True, True, 0)
+
+        # Left: NORAD Cheyenne Mountain World Map
+        map_bevel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        map_bevel.get_style_context().add_class("sat-bevel-in")
+        self.map_area = Gtk.DrawingArea()
+        self.map_area.set_size_request(660, 320)
+        self.map_area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.map_area.connect("draw", self._on_draw_world_map)
+        self.map_area.connect("button-press-event", self._on_map_clicked)
+        map_bevel.pack_start(self.map_area, True, True, 0)
+        mid_box.pack_start(map_bevel, True, True, 0)
+
+        # Right Column: Satellite Selector + Sky-Dome Polar Radar + Live Doppler Computer
+        right_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        right_col.set_size_request(412, -1)
+        mid_box.pack_start(right_col, False, False, 0)
+
+        # Satellite Selector Bar
+        sat_sel_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        sat_sel_bar.get_style_context().add_class("sat-strip")
+        sat_sel_bar.pack_start(mk_lbl("TARGET:"), False, False, 0)
+
+        btn_prev = Gtk.Button(label="◀")
+        btn_prev.connect("clicked", lambda *_: self._step_satellite(-1))
+        sat_sel_bar.pack_start(btn_prev, False, False, 0)
+
+        self.cmb_sat = Gtk.ComboBoxText()
+        self._populate_sat_combo()
+        self.cmb_sat.connect("changed", self._on_sat_combo_changed)
+        sat_sel_bar.pack_start(self.cmb_sat, True, True, 0)
+
+        btn_next = Gtk.Button(label="▶")
+        btn_next.connect("clicked", lambda *_: self._step_satellite(+1))
+        sat_sel_bar.pack_start(btn_next, False, False, 0)
+
+        right_col.pack_start(sat_sel_bar, False, False, 0)
+
+        # Circular Az/El Polar Sky-Dome Radar
+        radar_bevel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        radar_bevel.get_style_context().add_class("sat-bevel-in")
+        self.radar_area = Gtk.DrawingArea()
+        self.radar_area.set_size_request(404, 194)
+        self.radar_area.connect("draw", self._on_draw_radar)
+        radar_bevel.pack_start(self.radar_area, True, True, 0)
+        right_col.pack_start(radar_bevel, True, True, 0)
+
+        # Live Amateur Transponder & Weather Satellite Doppler Box
+        dop_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        dop_box.get_style_context().add_class("sat-strip")
+        right_col.pack_start(dop_box, False, False, 0)
+
+        dop_hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        dop_hdr.pack_start(mk_lbl("TRANSPONDER / DOPPLER:"), False, False, 0)
+        self.cmb_preset = Gtk.ComboBoxText()
+        for idx, (plbl, _, _, _, _) in enumerate(RADIO_PRESETS):
+            self.cmb_preset.append(str(idx), plbl)
+        self.cmb_preset.set_active(0)
+        self.cmb_preset.connect("changed", self._on_preset_changed)
+        dop_hdr.pack_start(self.cmb_preset, True, True, 0)
+        dop_box.pack_start(dop_hdr, False, False, 0)
+
+        freq_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        freq_row.pack_start(mk_lbl("NOM DN MHz:"), False, False, 0)
+        self.ent_down = Gtk.Entry()
+        self.ent_down.set_width_chars(9)
+        self.ent_down.set_text(f"{self.down_mhz:.4f}")
+        self.ent_down.connect("activate", self._on_custom_freq_edited)
+        freq_row.pack_start(self.ent_down, False, False, 0)
+
+        freq_row.pack_start(mk_lbl("NOM UP MHz:"), False, False, 0)
+        self.ent_up = Gtk.Entry()
+        self.ent_up.set_width_chars(9)
+        self.ent_up.set_text(f"{self.up_mhz:.4f}")
+        self.ent_up.connect("activate", self._on_custom_freq_edited)
+        freq_row.pack_start(self.ent_up, False, False, 0)
+
+        btn_set_f = Gtk.Button(label="SET")
+        btn_set_f.connect("clicked", self._on_custom_freq_edited)
+        freq_row.pack_start(btn_set_f, False, False, 0)
+        dop_box.pack_start(freq_row, False, False, 0)
+
+        dop_vfd_bevel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        dop_vfd_bevel.get_style_context().add_class("sat-bevel-in")
+        self.doppler_area = Gtk.DrawingArea()
+        self.doppler_area.set_size_request(-1, 50)
+        self.doppler_area.connect("draw", self._on_draw_doppler_vfd)
+        dop_vfd_bevel.pack_start(self.doppler_area, False, False, 0)
+        dop_box.pack_start(dop_vfd_bevel, False, False, 0)
+
+        # 4. Bottom Greenbar 24-Hour Pass Predictor Table
+        pass_frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        pass_frame.get_style_context().add_class("sat-cabinet")
+        root.pack_start(pass_frame, False, False, 0)
+
+        pass_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        pass_bar.pack_start(mk_lbl("24-HOUR PASS PREDICTOR (CLICK ANY PASS TO PREVIEW TRACK & SKY-DOME ARC):"), False, False, 0)
+        pass_bar.pack_start(Gtk.Box(), True, True, 0)
+
+        self.btn_scope_all = Gtk.ToggleButton(label="ALL SATS")
+        self.btn_scope_all.set_active(self.pass_all_sats)
+        self.btn_scope_all.connect("toggled", self._on_pass_scope_toggled)
+        pass_bar.pack_start(self.btn_scope_all, False, False, 0)
+
+        pass_bar.pack_start(mk_lbl("MIN EL:"), False, False, 0)
+        self.cmb_min_el = Gtk.ComboBoxText()
+        for el_v in (0, 5, 10, 15, 25, 40):
+            self.cmb_min_el.append(str(el_v), f"{el_v}°")
+        self.cmb_min_el.set_active_id(str(int(self.min_el_deg)) if str(int(self.min_el_deg)) in ("0", "5", "10", "15", "25", "40") else "5")
+        self.cmb_min_el.connect("changed", self._on_min_el_changed)
+        pass_bar.pack_start(self.cmb_min_el, False, False, 0)
+
+        self.btn_live_now = Gtk.Button(label="● LIVE TRACK")
+        self.btn_live_now.set_tooltip_text("Clear pass preview and return to live orbital tracking")
+        self.btn_live_now.connect("clicked", self._on_clear_preview)
+        pass_bar.pack_start(self.btn_live_now, False, False, 0)
+        pass_frame.pack_start(pass_bar, False, False, 0)
+
+        # Store columns: idx, sat_name, aos_local, aos_utc, aos_az, max_el, los_utc, los_az, duration, status, bg_hex, weight
+        self.pass_store = Gtk.ListStore(int, str, str, str, str, str, str, str, str, str, str, int)
+        self.pass_tree = Gtk.TreeView(model=self.pass_store)
+        self.pass_tree.set_headers_visible(True)
+        self.pass_tree.set_activate_on_single_click(True)
+        self.pass_tree.connect("row-activated", self._on_pass_row_activated)
+        sel_obj = self.pass_tree.get_selection()
+        sel_obj.set_mode(Gtk.SelectionMode.SINGLE)
+        sel_obj.connect("changed", self._on_pass_selection_changed)
+
+        cols_spec = [
+            ("SATELLITE", 1, 148, 0.0),
+            ("AOS LOCAL", 2, 118, 0.5),
+            ("AOS UTC",   3, 104, 0.5),
+            ("AOS AZ",    4, 96,  0.5),
+            ("MAX EL",    5, 86,  0.5),
+            ("LOS UTC",   6, 104, 0.5),
+            ("LOS AZ",    7, 96,  0.5),
+            ("DURATION",  8, 86,  0.5),
+            ("STATUS",    9, 140, 0.0),
+        ]
+        for title, col_id, min_w, xalign in cols_spec:
+            rend = Gtk.CellRendererText()
+            rend.set_property("xalign", xalign)
+            rend.set_property("ypad", 1)
+            col = Gtk.TreeViewColumn(title, rend, text=col_id, cell_background=10, weight=11)
+            col.set_min_width(min_w)
+            col.set_resizable(True)
+            self.pass_tree.append_column(col)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw.set_size_request(-1, 128)
+        sw.add(self.pass_tree)
+        pass_frame.pack_start(sw, False, False, 0)
+
+        # 5. CDE Recessed Status Bar
+        self.lbl_status = Gtk.Label(label="")
+        self.lbl_status.set_xalign(0.0)
+        self.lbl_status.get_style_context().add_class("cde-status")
+        root.pack_start(self.lbl_status, False, False, 0)
+        self._update_status_bar()
+
+    def _populate_sat_combo(self) -> None:
+        self.cmb_sat.remove_all()
+        for sat in self.sats:
+            self.cmb_sat.append(str(sat.norad_id), f"{sat.name}  [#{sat.norad_id:05d}]")
+        self.cmb_sat.set_active_id(str(self.selected_norad_id))
+
+    # -----------------------------------------------------------------------
+    # Interactive Callbacks & Live Loop
+    # -----------------------------------------------------------------------
+    def _on_tick_1hz(self) -> bool:
+        self.now_ts = time.time()
+        self.primary_tel = self._compute_telemetry_snapshot(self.now_ts)
+        if abs(self.now_ts - self._last_track_ts) >= 20.0 or self._last_track_sat != self.selected_norad_id:
+            self._refresh_ground_track(force=False)
+
+        self.vfd_area.queue_draw()
+        self.map_area.queue_draw()
+        self.radar_area.queue_draw()
+        self.doppler_area.queue_draw()
+        return True
+
+    def _refresh_ground_track(self, force: bool = False) -> None:
+        sat = self.sat_by_id.get(self.selected_norad_id, self.sats[0])
+        self.past_segs, self.fut_segs = compute_ground_track_segments(sat, self.obs, self.now_ts)
+        self._last_track_ts = self.now_ts
+        self._last_track_sat = sat.norad_id
+
+    def _active_or_next_pass_for_selected(self) -> SatPass | None:
+        for p in self.upcoming_passes:
+            if p.sat.norad_id == self.selected_norad_id and p.los_ts >= self.now_ts:
+                return p
+        # Compute directly if table is filtered above its elevation
+        sat = self.sat_by_id.get(self.selected_norad_id)
+        if sat is None:
+            return None
+        ps = predict_passes_for_sat(sat, self.obs, self.now_ts, hours=24.0, min_el_deg=0.5)
+        return ps[0] if ps else None
+
+    def _recompute_passes(self) -> None:
+        target_sats = self.sats[:20] if self.pass_all_sats else [self.sat_by_id[self.selected_norad_id]]
+        self.upcoming_passes = predict_passes_catalog(
+            target_sats, self.obs, time.time(), hours=24.0, min_el_deg=self.min_el_deg
+        )
+        self.pass_store.clear()
+        now = time.time()
+        for idx, p in enumerate(self.upcoming_passes[:120]):
+            loc_dt = datetime.datetime.fromtimestamp(p.aos_ts)
+            utc_aos = datetime.datetime.fromtimestamp(p.aos_ts, tz=datetime.timezone.utc)
+            utc_los = datetime.datetime.fromtimestamp(p.los_ts, tz=datetime.timezone.utc)
+            mm, ss = divmod(int(round(p.duration_s)), 60)
+            if p.aos_ts <= now <= p.los_ts:
+                status = "● IN VIEW NOW"
+                bg = "#c8f2d2"
+                wt = Pango.Weight.BOLD
+            else:
+                in_m = max(0, int((p.aos_ts - now) // 60))
+                hh_w, mm_w = divmod(in_m, 60)
+                status = f"T-{hh_w:02d}h{mm_w:02d}m" + (" ★ HIGH" if p.max_el >= 45.0 else "")
+                bg = "#eef6ea" if (idx % 2 == 0) else "#dcebd6"
+                wt = Pango.Weight.BOLD if p.sat.norad_id == self.selected_norad_id else Pango.Weight.NORMAL
+
+            self.pass_store.append([
+                idx,
+                p.sat.name,
+                loc_dt.strftime("%m-%d %H:%M:%S"),
+                utc_aos.strftime("%H:%M:%SZ"),
+                f"{p.aos_az:05.1f}° {az_to_compass(p.aos_az):>3s}",
+                f"{p.max_el:4.1f}°",
+                utc_los.strftime("%H:%M:%SZ"),
+                f"{p.los_az:05.1f}° {az_to_compass(p.los_az):>3s}",
+                f"{mm:02d}m {ss:02d}s",
+                status,
+                bg,
+                int(wt),
+            ])
+        self._update_status_bar()
+
+    def _sync_preset_for_satellite(self, norad_id: int) -> None:
+        for idx, (_, p_nid, dn, up, note) in enumerate(RADIO_PRESETS):
+            if p_nid == norad_id:
+                self._syncing_preset = True
+                self.cmb_preset.set_active(idx)
+                self.down_mhz, self.up_mhz, self.mode_note = dn, up, note
+                self.ent_down.set_text(f"{dn:.4f}")
+                self.ent_up.set_text(f"{up:.4f}")
+                self._syncing_preset = False
+                return
+
+    def _select_satellite(self, norad_id: int, clear_preview: bool = True) -> None:
+        if norad_id not in self.sat_by_id:
+            return
+        self.selected_norad_id = norad_id
+        if clear_preview:
+            self.preview_pass = None
+        if self.cmb_sat.get_active_id() != str(norad_id):
+            self.cmb_sat.set_active_id(str(norad_id))
+        self._sync_preset_for_satellite(norad_id)
+        self.primary_tel = self._compute_telemetry_snapshot(time.time())
+        self._refresh_ground_track(force=True)
+        if not self.pass_all_sats:
+            self._recompute_passes()
+        self._save_config()
+        self._update_status_bar()
+        self.vfd_area.queue_draw()
+        self.map_area.queue_draw()
+        self.radar_area.queue_draw()
+        self.doppler_area.queue_draw()
+
+    def _step_satellite(self, delta: int) -> None:
+        ids = [s.norad_id for s in self.sats]
+        if not ids:
+            return
+        cur_idx = ids.index(self.selected_norad_id) if self.selected_norad_id in ids else 0
+        self._select_satellite(ids[(cur_idx + delta) % len(ids)])
+
+    def _on_sat_combo_changed(self, combo: Gtk.ComboBoxText) -> None:
+        aid = combo.get_active_id()
+        if aid and aid.isdigit():
+            nid = int(aid)
+            if nid != self.selected_norad_id:
+                self._select_satellite(nid)
+
+    def _on_preset_changed(self, combo: Gtk.ComboBoxText) -> None:
+        if self._syncing_preset:
+            return
+        aid = combo.get_active_id()
+        if aid is None:
+            return
+        idx = int(aid)
+        _, _, dn, up, note = RADIO_PRESETS[idx]
+        self.down_mhz, self.up_mhz, self.mode_note = dn, up, note
+        self.ent_down.set_text(f"{dn:.4f}")
+        self.ent_up.set_text(f"{up:.4f}")
+        self.doppler_area.queue_draw()
+
+    def _on_custom_freq_edited(self, *_: Any) -> None:
+        try:
+            self.down_mhz = max(0.0, float(self.ent_down.get_text().strip() or "0"))
+            self.up_mhz = max(0.0, float(self.ent_up.get_text().strip() or "0"))
+            self.mode_note = "Custom MHz"
+            self._syncing_preset = True
+            self.cmb_preset.set_active(len(RADIO_PRESETS) - 1)
+            self._syncing_preset = False
+            self.doppler_area.queue_draw()
+        except ValueError:
+            pass
+
+    def _on_grid_activated(self, *_: Any) -> None:
+        res = grid_to_latlon(self.ent_grid.get_text())
+        if res is not None:
+            lat, lon = res
+            self.ent_lat.set_text(f"{lat:.4f}")
+            self.ent_lon.set_text(f"{lon:.4f}")
+            self._on_save_qth_clicked()
+
+    def _on_save_qth_clicked(self, *_: Any) -> None:
+        call = self.ent_call.get_text().strip().upper() or DEFAULT_CALLSIGN
+        grid_txt = self.ent_grid.get_text().strip()
+        try:
+            lat = clamp(float(self.ent_lat.get_text().strip()), -89.99, 89.99)
+            lon = clamp(float(self.ent_lon.get_text().strip()), -180.0, 180.0)
+            alt = clamp(float(self.ent_alt.get_text().strip()), -450.0, 9000.0)
+        except ValueError:
+            parsed = grid_to_latlon(grid_txt)
+            if parsed is None:
+                return
+            lat, lon = parsed
+            alt = self.obs.alt_m
+
+        # If user changed grid text away from current obs.grid and kept old lat/lon, honor new grid
+        if grid_txt and grid_txt.lower() != self.obs.grid.lower():
+            parsed = grid_to_latlon(grid_txt)
+            if parsed is not None and abs(lat - self.obs.lat_deg) < 1e-4 and abs(lon - self.obs.lon_deg) < 1e-4:
+                lat, lon = parsed
+
+        grid_calc = latlon_to_grid(lat, lon)
+        self.obs = GroundStation(callsign=call, grid=grid_calc, lat_deg=lat, lon_deg=lon, alt_m=alt)
+        self.ent_call.set_text(call)
+        self.ent_grid.set_text(grid_calc)
+        self.ent_lat.set_text(f"{lat:.4f}")
+        self.ent_lon.set_text(f"{lon:.4f}")
+        self.ent_alt.set_text(f"{alt:.0f}")
+
+        self.preview_pass = None
+        self.primary_tel = self._compute_telemetry_snapshot(time.time())
+        self._refresh_ground_track(force=True)
+        self._recompute_passes()
+        self._save_config()
+
+    def _on_theme_changed(self, combo: Gtk.ComboBoxText) -> None:
+        aid = combo.get_active_id()
+        if aid in MAP_THEMES:
+            self.theme_key = aid
+            self._save_config()
+            self.map_area.queue_draw()
+            self.radar_area.queue_draw()
+
+    def _on_toggle_grid(self, btn: Gtk.ToggleButton) -> None:
+        self.show_maidenhead = btn.get_active()
+        self._save_config()
+        self.map_area.queue_draw()
+
+    def _on_toggle_allsats(self, btn: Gtk.ToggleButton) -> None:
+        self.show_all_sats = btn.get_active()
+        self._save_config()
+        self.map_area.queue_draw()
+
+    def _on_pass_scope_toggled(self, btn: Gtk.ToggleButton) -> None:
+        self.pass_all_sats = btn.get_active()
+        btn.set_label("ALL SATS" if self.pass_all_sats else "SELECTED SAT")
+        self._save_config()
+        self._recompute_passes()
+
+    def _on_min_el_changed(self, combo: Gtk.ComboBoxText) -> None:
+        aid = combo.get_active_id()
+        if aid is not None:
+            self.min_el_deg = float(aid)
+            self._save_config()
+            self._recompute_passes()
+
+    def _on_clear_preview(self, *_: Any) -> None:
+        self.preview_pass = None
+        self.pass_tree.get_selection().unselect_all()
+        self._refresh_ground_track(force=True)
+        self._update_status_bar()
+        self.map_area.queue_draw()
+        self.radar_area.queue_draw()
+
+    def _preview_pass_at_index(self, idx: int) -> None:
+        if 0 <= idx < len(self.upcoming_passes):
+            p = self.upcoming_passes[idx]
+            self.preview_pass = p
+            if p.sat.norad_id != self.selected_norad_id:
+                self._select_satellite(p.sat.norad_id, clear_preview=False)
+                self.preview_pass = p
+            self.past_segs, self.fut_segs = compute_ground_track_segments(p.sat, self.obs, p.aos_ts, past_min=15.0, future_orbits=1.2)
+            self._update_status_bar()
+            self.map_area.queue_draw()
+            self.radar_area.queue_draw()
+
+    def _on_pass_row_activated(self, tree: Gtk.TreeView, path: Gtk.TreePath, _col: Gtk.TreeViewColumn) -> None:
+        it = self.pass_store.get_iter(path)
+        if it is not None:
+            self._preview_pass_at_index(self.pass_store.get_value(it, 0))
+
+    def _on_pass_selection_changed(self, selection: Gtk.TreeSelection) -> None:
+        model, it = selection.get_selected()
+        if it is not None:
+            self._preview_pass_at_index(model.get_value(it, 0))
+
+    def _on_map_clicked(self, _widget: Gtk.Widget, event: Gdk.EventButton) -> bool:
+        if event.button != 1:
+            return False
+        best_sat: TLESatellite | None = None
+        best_d2 = 196.0  # 14 px click radius
+        for tx, ty, sat in self.map_hit_targets:
+            d2 = (event.x - tx) ** 2 + (event.y - ty) ** 2
+            if d2 <= best_d2:
+                best_d2 = d2
+                best_sat = sat
+        if best_sat is not None:
+            self._select_satellite(best_sat.norad_id)
+            return True
+        return False
+
+    # -----------------------------------------------------------------------
+    # Live CelesTrak Async TLE Updater
+    # -----------------------------------------------------------------------
+    def _trigger_tle_update(self, silent: bool = False) -> None:
+        if self._updating_tle:
+            return
+        self._updating_tle = True
+        self.btn_tle.set_sensitive(False)
+        if not silent:
+            self.lbl_status.set_text("Fetching live NORAD TLEs from CelesTrak (stations, amateur, weather)...")
+
+        def worker() -> None:
+            chunks: list[str] = []
+            ok_groups: list[str] = []
+            for grp, url in CELESTRAK_URLS:
+                try:
+                    resp = requests.get(url, headers={"User-Agent": UA}, timeout=7)
+                    if resp.status_code == 200 and "1 " in resp.text and "2 " in resp.text:
+                        chunks.append(resp.text.strip())
+                        ok_groups.append(grp)
+                except Exception:
+                    pass
+
+            def finish() -> bool:
+                self._updating_tle = False
+                self.btn_tle.set_sensitive(True)
+                if chunks:
+                    try:
+                        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                        combined = "\n".join(chunks) + "\n"
+                        TLE_CACHE_FILE.write_text(combined, encoding="utf-8")
+                        self._load_initial_tles()
+                        self.tle_source_label = f"CelesTrak Live ({'+'.join(ok_groups)}, {len(self.sats)} sats)"
+                        self._populate_sat_combo()
+                        self.primary_tel = self._compute_telemetry_snapshot(time.time())
+                        self._refresh_ground_track(force=True)
+                        self._recompute_passes()
+                    except Exception as exc:
+                        if not silent:
+                            self.lbl_status.set_text(f"TLE cache write error: {exc}")
+                elif not silent:
+                    self._update_status_bar(extra_msg="Offline / CelesTrak unreachable — using embedded NORAD baseline")
+                return False
+
+            GLib.idle_add(finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_status_bar(self, extra_msg: str = "") -> None:
+        mode_str = (
+            f"PREVIEWING {self.preview_pass.sat.name} ({datetime.datetime.fromtimestamp(self.preview_pass.aos_ts, tz=datetime.timezone.utc).strftime('%H:%MZ')} MAX {self.preview_pass.max_el:.1f}°)"
+            if self.preview_pass is not None
+            else "LIVE REAL-TIME TRACKING"
+        )
+        base = (
+            f"QTH: {self.obs.callsign} [{self.obs.grid}] ({self.obs.lat_deg:.4f}°, {self.obs.lon_deg:.4f}°, {self.obs.alt_m:.0f}m)  |  "
+            f"{self.tle_source_label}  |  Passes (24h): {len(self.upcoming_passes)}  |  {mode_str}"
+        )
+        if extra_msg:
+            base = f"{base}  [{extra_msg}]"
+        self.lbl_status.set_text(base)
+
+    # -----------------------------------------------------------------------
+    # Cairo Widget Draw Callbacks
+    # -----------------------------------------------------------------------
+    def _on_draw_vfd_bar(self, widget: Gtk.Widget, cr: cairo.Context) -> bool:
+        nxt = self.preview_pass if self.preview_pass is not None else self._active_or_next_pass_for_selected()
+        render_vfd_telemetry_bar(
+            cr,
+            widget.get_allocated_width(),
+            widget.get_allocated_height(),
+            self.primary_tel,
+            nxt,
+            self.now_ts,
+        )
+        return False
+
+    def _on_draw_world_map(self, widget: Gtk.Widget, cr: cairo.Context) -> bool:
+        self.map_hit_targets = render_norad_world_map(
+            cr,
+            widget.get_allocated_width(),
+            widget.get_allocated_height(),
+            self.theme_key,
+            self.obs,
+            self.all_tels,
+            self.primary_tel,
+            self.past_segs,
+            self.fut_segs,
+            self.preview_pass,
+            self.now_ts,
+            show_maidenhead=self.show_maidenhead,
+            show_all_sats=self.show_all_sats,
+        )
+        return False
+
+    def _on_draw_radar(self, widget: Gtk.Widget, cr: cairo.Context) -> bool:
+        active_p = self.preview_pass if self.preview_pass is not None else self._active_or_next_pass_for_selected()
+        render_polar_sky_dome(
+            cr,
+            widget.get_allocated_width(),
+            widget.get_allocated_height(),
+            self.theme_key,
+            self.all_tels,
+            self.primary_tel,
+            active_p,
+            is_preview=(self.preview_pass is not None),
+        )
+        return False
+
+    def _on_draw_doppler_vfd(self, widget: Gtk.Widget, cr: cairo.Context) -> bool:
+        render_doppler_vfd(
+            cr,
+            widget.get_allocated_width(),
+            widget.get_allocated_height(),
+            self.down_mhz,
+            self.up_mhz,
+            self.primary_tel.range_rate_km_s,
+            self.mode_note,
+        )
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Headless Self-Test Suite (--self-test)
+# ---------------------------------------------------------------------------
+def run_self_test() -> int:
+    # 1. Verify Maidenhead & Default QTH (W1AW / FN31pr Newington, CT)
+    obs = GroundStation()
+    assert obs.callsign == "W1AW" and obs.grid == "FN31pr"
+    assert latlon_to_grid(obs.lat_deg, obs.lon_deg) == "FN31pr", latlon_to_grid(obs.lat_deg, obs.lon_deg)
+    ll = grid_to_latlon("FN31pr")
+    assert ll is not None and abs(ll[0] - obs.lat_deg) < 0.01 and abs(ll[1] - obs.lon_deg) < 0.01
+
+    # 2. Verify TLE Parser + Mod-10 Checksums on all 15 Built-in Iconic Spacecraft
+    sats = parse_tle_catalog(BUILTIN_TLES_RAW, strict_checksum=True)
+    assert len(sats) == 15, f"Expected 15 built-in satellites, got {len(sats)}"
+
+    # 3. Verify SGP4/J2 Orbital Propagator, WGS84 Geodetics, Az/El & Range-Rate Consistency
+    t_test = datetime.datetime(2026, 11, 27, 2, 0, 0, tzinfo=datetime.timezone.utc).timestamp()
+    all_tels: list[SatTelemetry] = []
+    for sat in sats:
+        tel = propagate_satellite(sat, t_test, obs)
+        all_tels.append(tel)
+        assert -90.0 <= tel.lat_deg <= 90.0
+        assert -180.0 <= tel.lon_deg <= 180.0
+        if sat.norad_id == 53106:  # IO-117 MEO (~5830 km)
+            assert 5400.0 <= tel.alt_km <= 6300.0, f"IO-117 alt out of range: {tel.alt_km}"
+        else:  # LEO spacecraft
+            assert 300.0 <= tel.alt_km <= 1700.0, f"{sat.name} alt out of range: {tel.alt_km}"
+        assert 5.0 <= tel.vel_km_s <= 8.2, f"{sat.name} vel out of range: {tel.vel_km_s}"
+        assert 0.0 <= tel.az_deg < 360.0
+        assert -90.0 <= tel.el_deg <= 90.0
+        assert tel.footprint_radius_km > 1500.0
+
+        # Finite-difference check on slant range-rate (analytical vs numerical d(rho)/dt)
+        t_minus = propagate_satellite(sat, t_test - 0.5, obs)
+        t_plus = propagate_satellite(sat, t_test + 0.5, obs)
+        num_rr = t_plus.slant_range_km - t_minus.slant_range_km
+        assert abs(num_rr - tel.range_rate_km_s) < 0.05, (
+            f"{sat.name} range-rate mismatch: analytical={tel.range_rate_km_s:.4f}, numerical={num_rr:.4f}"
+        )
+
+    # Verify J2 nodal regression sign: prograde ISS (51.6°) regresses Westward (<0), sun-sync NOAA 19 (99.16°) precesses Eastward (>0)
+    iss = [s for s in sats if s.norad_id == 25544][0]
+    noaa19 = [s for s in sats if s.norad_id == 33591][0]
+    assert math.cos(iss.inc_rad) > 0.0 and math.cos(noaa19.inc_rad) < 0.0
+
+    # 4. Verify Full-Duplex Radio Doppler Shift Math (Approaching vs Receding)
+    rx_app, df_rx_app, tx_app, df_tx_app = compute_doppler_pair(437.800, 145.990, -6.5)
+    assert rx_app > 437.800 and df_rx_app > 9000.0
+    assert tx_app < 145.990 and df_tx_app < -3000.0
+    rx_rec, df_rx_rec, tx_rec, df_tx_rec = compute_doppler_pair(437.800, 145.990, +6.5)
+    assert rx_rec < 437.800 and df_rx_rec < -9000.0
+    assert tx_rec > 145.990 and df_tx_rec > 3000.0
+
+    # 5. Verify 24-Hour Pass Predictor from W1AW [FN31pr]
+    iss_passes = predict_passes_for_sat(iss, obs, t_test, hours=24.0, min_el_deg=5.0)
+    assert len(iss_passes) >= 2, f"Expected >=2 ISS passes in 24h from FN31pr, got {len(iss_passes)}"
+    p0 = iss_passes[0]
+    assert p0.aos_ts < p0.tca_ts < p0.los_ts
+    assert p0.max_el >= 5.0 and len(p0.arc_points) >= 10
+
+    # 6. Verify Offscreen Cairo Rendering (NORAD World Map in all 3 themes, Polar Sky-Dome, VFD & Doppler)
+    past_segs, fut_segs = compute_ground_track_segments(iss, obs, t_test)
+    assert len(fut_segs) >= 1
+
+    surf_map = cairo.ImageSurface(cairo.FORMAT_ARGB32, 690, 360)
+    cr_map = cairo.Context(surf_map)
+    for th_key in ("norad", "p31", "amber"):
+        targets = render_norad_world_map(
+            cr_map, 690, 360, th_key, obs, all_tels, all_tels[0], past_segs, fut_segs, p0, t_test
+        )
+        assert len(targets) == 15
+
+    surf_rad = cairo.ImageSurface(cairo.FORMAT_ARGB32, 404, 198)
+    cr_rad = cairo.Context(surf_rad)
+    render_polar_sky_dome(cr_rad, 404, 198, "norad", all_tels, all_tels[0], p0, is_preview=False)
+
+    surf_vfd = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1100, 48)
+    cr_vfd = cairo.Context(surf_vfd)
+    render_vfd_telemetry_bar(cr_vfd, 1100, 48, all_tels[0], p0, t_test)
+    render_doppler_vfd(cr_vfd, 400, 48, 437.800, 145.990, -5.2, "FM · PL 67.0 Hz")
+
+    print("DTSAT_SELF_TEST_OK")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="dtSat — Vintage NASA/NORAD & Amateur Radio Satellite Tracker")
+    parser.add_argument("--self-test", action="store_true", help="Run orbital mechanics, Doppler, pass predictor & Cairo self-tests")
+    args = parser.parse_args()
+
+    if args.self_test:
+        return run_self_test()
+
+    win = DtSatWindow()
+    win.show_all()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

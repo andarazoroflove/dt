@@ -147,7 +147,7 @@ static XmFontList     g_ui_norm_fl    = NULL;
 static Pixmap         g_icon_pix      = None;
 static Pixmap         g_icon_mask     = None;
 
-static char           g_self_exe[PATH_MAX]    = "/home/adam/.local/bin/dtterm";
+static char           g_self_exe[PATH_MAX]    = "dtterm";
 static char           g_init_cwd[PATH_MAX]    = "";
 static char           g_fixed_win_title[256]  = "";
 static char          *g_init_cmd_prog         = NULL;

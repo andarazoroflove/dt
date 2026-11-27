@@ -1,0 +1,12 @@
+set DtDbVersion=1.0
+
+ACTION dtMaps
+{
+     LABEL         dtMaps
+     ARG_COUNT     0
+     ICON          dtmaps
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtmaps
+     DESCRIPTION   dtMaps — CDE Amateur Radio GridTracker, Slippy Atlas & PSKReporter Live Propagation Map.
+}

@@ -1,0 +1,47 @@
+set DtDbVersion=1.0
+
+DATA_ATTRIBUTES TORRENT_FILE
+{
+     ACTIONS         Open,dtDeluge
+     ICON            dtdeluge
+     NAME_TEMPLATE   %s.torrent
+     MIME_TYPE       application/x-bittorrent
+     DESCRIPTION     BitTorrent Metainfo (.torrent) file opened with dtDeluge.
+     TYPE_LABEL      TORRENT_FILE
+}
+
+DATA_CRITERIA TORRENT_FILE1
+{
+     DATA_ATTRIBUTES_NAME TORRENT_FILE
+     MODE                 f
+     NAME_PATTERN         *.torrent
+}
+
+ACTION Open
+{
+     LABEL           Open
+     ARG_TYPE        TORRENT_FILE
+     TYPE            MAP
+     MAP_ACTION      dtDeluge
+}
+
+ACTION dtDeluge
+{
+     LABEL         dtDeluge
+     ICON          dtdeluge
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtdeluge "%(File)Arg_1%"
+     DESCRIPTION   dtDeluge — CDE BitTorrent Client (.torrent & Magnet URI transfers).
+}
+
+ACTION dtDeluge
+{
+     LABEL         dtDeluge
+     ARG_COUNT     0
+     ICON          dtdeluge
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtdeluge
+     DESCRIPTION   dtDeluge — CDE BitTorrent Client (.torrent & Magnet URI transfers).
+}

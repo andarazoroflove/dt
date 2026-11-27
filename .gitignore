@@ -4,6 +4,8 @@ __pycache__/
 cde-mail
 cde-calendar
 cde-term
+cde-calc
+libdtwm_subpanel_cols.so
 tokens.json
 config.json
 *.db

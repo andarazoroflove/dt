@@ -1,0 +1,12 @@
+set DtDbVersion=1.0
+
+ACTION dtRadar
+{
+     LABEL         dtRadar
+     ARG_COUNT     0
+     ICON          dtradar
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtradar
+     DESCRIPTION   dtRadar — Vintage NWS NEXRAD Doppler Radar, GOES Satellite & HF Solar Space-Weather Console.
+}

@@ -1,0 +1,12 @@
+set DtDbVersion=1.0
+
+ACTION dtSys
+{
+     LABEL         dtSys
+     ARG_COUNT     0
+     ICON          dtsys
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtsys
+     DESCRIPTION   dtSys — Vintage Analog Dial & Strip-Chart System Telemetry Console.
+}

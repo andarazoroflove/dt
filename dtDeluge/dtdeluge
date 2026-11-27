@@ -1,0 +1,4914 @@
+#!/usr/bin/env python3
+"""
+dtDeluge — Common Desktop Environment (CDE) BitTorrent Client
+Transmission GTK UX & Layout in Authentic OSF/Motif Livery
+
+Features:
+  - Self-contained pure-Python 3 BitTorrent engine (no libtorrent dependency):
+      * Bencode encoder/decoder with exact raw info-slice SHA-1 hashing
+      * Single-file & multi-file .torrent reader and creator
+      * Magnet URI parser (40-hex & 32-char Base32 btih, trackers, peer hints)
+      * HTTP/HTTPS and BEP-15 UDP tracker announce clients (IPv4 & IPv6)
+      * TCP BitTorrent Peer Wire protocol + incoming peer listener (port 51413)
+      * BEP-10 Extension Protocol + BEP-9 ut_metadata magnet resolution & serving
+      * Pipelined 16 KiB block transfers, priority/rarest piece picker, SHA-1 verify
+      * Multi-file assembly in ~/Downloads, piece-cached seeding, token-bucket limits
+  - Faithful Transmission GTK UX styled from CDE's active xrdb Motif palette:
+      * Chiseled 3D Motif toolbar, drag-and-drop .torrent / magnet support
+      * Status & Tracker filter bar + live search
+      * Custom Cairo 3-line Transmission transfer cards (plus Compact View)
+      * 5-tab Transmission Inspector: Activity/Info, Peers, Trackers, Files, Pieces
+      * Bottom status bar with Turtle [Alt Speed] toggle, sparkline, free space, port
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import collections
+import dataclasses
+import datetime
+import hashlib
+import json
+import math
+import os
+import random
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+import cairo
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gdk, GLib, Gtk, Pango, PangoCairo
+
+HOME = Path.home()
+CONFIG_DIR = HOME / ".config" / "dtdeluge"
+TORRENT_CACHE_DIR = CONFIG_DIR / "torrents"
+SETTINGS_FILE = CONFIG_DIR / "settings.json"
+SESSION_FILE = CONFIG_DIR / "torrents.json"
+IPC_SOCK_PATH = CONFIG_DIR / "ipc.sock"
+
+APP_VERSION = "1.0"
+CLIENT_BANNER = f"dtDeluge {APP_VERSION} (CDE)"
+HTTP_UA = f"dtDeluge/{APP_VERSION} (Transmission-CDE; Linux)"
+BLOCK_SIZE = 16384  # 16 KiB standard BitTorrent block
+PIPELINE_DEPTH = 8
+METADATA_PIECE_SIZE = 16384
+
+DEFAULT_SETTINGS: dict[str, Any] = {
+    "download_dir": str(HOME / "Downloads"),
+    "listen_port": 51413,
+    "max_peers_per_torrent": 40,
+    "auto_start": True,
+    "speed_limit_down_enabled": False,
+    "speed_limit_down_kbps": 2048,
+    "speed_limit_up_enabled": False,
+    "speed_limit_up_kbps": 512,
+    "alt_speed_enabled": False,
+    "alt_speed_down_kbps": 250,
+    "alt_speed_up_kbps": 100,
+    "compact_view": False,
+    "show_inspector": True,
+}
+
+
+# ---------------------------------------------------------------------------
+# CDE Active Motif Palette Loader & GTK3 CSS
+# ---------------------------------------------------------------------------
+def _hex_to_rgb(hex_col: str) -> tuple[float, float, float]:
+    h = hex_col.lstrip("#")
+    if len(h) != 6:
+        return (0.68, 0.70, 0.76)
+    return (
+        int(h[0:2], 16) / 255.0,
+        int(h[2:4], 16) / 255.0,
+        int(h[4:6], 16) / 255.0,
+    )
+
+
+def _shade_hex(hex_col: str, factor: float) -> str:
+    h = hex_col.lstrip("#")
+    if len(h) != 6:
+        return hex_col
+    r = max(0, min(255, int(int(h[0:2], 16) * factor)))
+    g = max(0, min(255, int(int(h[2:4], 16) * factor)))
+    b = max(0, min(255, int(int(h[4:6], 16) * factor)))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _compute_greenbar_hex(well_hex: str) -> str:
+    """Match CDE dtMail / dtPod subtle greenbar alternating row shade."""
+    h = well_hex.lstrip("#")
+    if len(h) != 6:
+        return "#eef4db"
+    r = max(0, int(h[0:2], 16) - 17)
+    g = max(0, int(h[2:4], 16) - 3)
+    b = max(0, int(h[4:6], 16) - 14)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def load_cde_palette() -> tuple[str, str, str, str]:
+    chrome, sel, well = "#aeb2c3", "#2c567e", "#fff7e9"
+    try:
+        out = subprocess.check_output(
+            ["xrdb", "-query"], text=True, stderr=subprocess.DEVNULL, timeout=1.5
+        )
+        pal_name = "Crimson.dp"
+        for ln in out.splitlines():
+            if "ColorPalette:" in ln:
+                pal_name = ln.split(":", 1)[1].strip()
+                break
+        for pdir in (HOME / ".dt/palettes", Path("/usr/dt/palettes")):
+            pf = pdir / pal_name
+            if pf.is_file():
+                hexes = [
+                    l.strip()
+                    for l in pf.read_text(errors="ignore").splitlines()
+                    if l.strip().startswith("#")
+                ]
+                if len(hexes) >= 4:
+                    def norm16(h: str) -> str:
+                        h = h.lstrip("#")
+                        return (
+                            f"#{h[0:2]}{h[4:6]}{h[8:10]}"
+                            if len(h) == 12
+                            else "#" + h[:6]
+                        )
+                    chrome, sel, well = (
+                        norm16(hexes[1]),
+                        norm16(hexes[2]),
+                        norm16(hexes[3]),
+                    )
+                break
+    except Exception:
+        pass
+    well_alt = _compute_greenbar_hex(well)
+    return chrome, sel, well, well_alt
+
+
+def build_cde_css(chrome: str, sel: str, well: str, well_alt: str) -> bytes:
+    chrome_hi = _shade_hex(chrome, 1.07)
+    chrome_lo = _shade_hex(chrome, 0.89)
+    bevel_light = _shade_hex(chrome, 1.32)
+    bevel_dark = _shade_hex(chrome, 0.48)
+    css = f"""
+    window, dialog, .background {{
+        background-color: {chrome};
+        color: #101216;
+        font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+        font-size: 9pt;
+    }}
+    menubar {{
+        background-color: {chrome};
+        border-top: 1px solid {bevel_light};
+        border-bottom: 2px solid {bevel_dark};
+        padding: 1px 2px;
+    }}
+    menu {{
+        background-color: {chrome};
+        color: #101216;
+        border-top: 2px solid {bevel_light};
+        border-left: 2px solid {bevel_light};
+        border-right: 2px solid {bevel_dark};
+        border-bottom: 2px solid {bevel_dark};
+    }}
+    menuitem {{
+        padding: 3px 8px;
+        color: #101216;
+    }}
+    menuitem:hover {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    menuitem:hover label {{
+        color: #ffffff;
+    }}
+    .cde-toolbar {{
+        background-color: {chrome};
+        padding: 4px 6px;
+        border-top: 2px solid {bevel_light};
+        border-left: 2px solid {bevel_light};
+        border-right: 2px solid {bevel_dark};
+        border-bottom: 2px solid {bevel_dark};
+    }}
+    .cde-filterbar {{
+        background-color: {chrome_lo};
+        padding: 3px 6px;
+        border-top: 1px solid {bevel_light};
+        border-left: 1px solid {bevel_light};
+        border-right: 1px solid {bevel_dark};
+        border-bottom: 2px solid {bevel_dark};
+    }}
+    .cde-well-frame {{
+        background-color: {well};
+        border-top: 2px solid {bevel_dark};
+        border-left: 2px solid {bevel_dark};
+        border-right: 2px solid {bevel_light};
+        border-bottom: 2px solid {bevel_light};
+    }}
+    .cde-inspector-card {{
+        background-color: {well};
+        color: #101216;
+        padding: 6px 8px;
+        border-top: 2px solid {bevel_dark};
+        border-left: 2px solid {bevel_dark};
+        border-right: 2px solid {bevel_light};
+        border-bottom: 2px solid {bevel_light};
+    }}
+    .cde-status {{
+        background-color: {chrome};
+        padding: 3px 6px;
+        border-top: 2px solid {bevel_dark};
+        border-left: 2px solid {bevel_dark};
+        border-right: 2px solid {bevel_light};
+        border-bottom: 2px solid {bevel_light};
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8.5pt;
+    }}
+    button {{
+        background-image: none;
+        background-color: {chrome};
+        color: #101216;
+        border-top: 2px solid {bevel_light};
+        border-left: 2px solid {bevel_light};
+        border-right: 2px solid {bevel_dark};
+        border-bottom: 2px solid {bevel_dark};
+        border-radius: 0px;
+        padding: 3px 7px;
+        box-shadow: none;
+    }}
+    button label {{
+        color: #101216;
+    }}
+    button:hover {{
+        background-color: {chrome_hi};
+    }}
+    button:active, button:checked {{
+        background-color: {chrome_lo};
+        border-top: 2px solid {bevel_dark};
+        border-left: 2px solid {bevel_dark};
+        border-right: 2px solid {bevel_light};
+        border-bottom: 2px solid {bevel_light};
+        font-weight: bold;
+    }}
+    button:disabled {{
+        opacity: 0.55;
+    }}
+    button.pill-active {{
+        background-color: {sel};
+        color: #ffffff;
+        border-top: 2px solid {bevel_dark};
+        border-left: 2px solid {bevel_dark};
+        border-right: 2px solid {bevel_light};
+        border-bottom: 2px solid {bevel_light};
+        font-weight: bold;
+    }}
+    button.pill-active label {{
+        color: #ffffff;
+    }}
+    button.turtle-active {{
+        background-color: #1f5e3b;
+        color: #e8fff1;
+        border-top: 2px solid #0e301d;
+        border-left: 2px solid #0e301d;
+        border-right: 2px solid #68c992;
+        border-bottom: 2px solid #68c992;
+        font-weight: bold;
+    }}
+    button.turtle-active label {{
+        color: #e8fff1;
+    }}
+    button.cde-accent {{
+        background-color: #265985;
+        color: #ffffff;
+        border-top: 2px solid #6ca3d4;
+        border-left: 2px solid #6ca3d4;
+        border-right: 2px solid #122c42;
+        border-bottom: 2px solid #122c42;
+        font-weight: bold;
+    }}
+    button.cde-accent label {{
+        color: #ffffff;
+    }}
+    entry, spinbutton {{
+        background-color: {well};
+        color: #101216;
+        border-top: 2px solid {bevel_dark};
+        border-left: 2px solid {bevel_dark};
+        border-right: 2px solid {bevel_light};
+        border-bottom: 2px solid {bevel_light};
+        border-radius: 0px;
+        padding: 2px 5px;
+    }}
+    combobox button.combo {{
+        background-color: {well};
+        color: #101216;
+        border-top: 2px solid {bevel_dark};
+        border-left: 2px solid {bevel_dark};
+        border-right: 2px solid {bevel_light};
+        border-bottom: 2px solid {bevel_light};
+        padding: 2px 6px;
+    }}
+    treeview {{
+        background-color: {well};
+        color: #101216;
+        font-size: 8.5pt;
+    }}
+    treeview:selected {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    treeview header button {{
+        background-color: {chrome};
+        font-weight: bold;
+        padding: 2px 5px;
+    }}
+    notebook {{
+        background-color: {chrome};
+    }}
+    notebook header {{
+        background-color: {chrome};
+    }}
+    notebook tab {{
+        background-color: {chrome_lo};
+        padding: 3px 8px;
+        border-top: 2px solid {bevel_light};
+        border-left: 2px solid {bevel_light};
+        border-right: 2px solid {bevel_dark};
+        border-radius: 0px;
+    }}
+    notebook tab:checked {{
+        background-color: {chrome};
+        font-weight: bold;
+    }}
+    paned > separator {{
+        background-color: {chrome_lo};
+        min-width: 6px;
+        min-height: 6px;
+    }}
+    """
+    return css.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Formatting Helpers
+# ---------------------------------------------------------------------------
+def fmt_bytes(num_bytes: float) -> str:
+    n = float(max(0.0, num_bytes))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024.0 or unit == "TB":
+            if unit == "B":
+                return f"{int(n)} B"
+            return f"{n:.2f} {unit}" if n < 100 else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.2f} TB"
+
+
+def fmt_rate(bps: float) -> str:
+    if bps <= 0.5:
+        return "0.0 KB/s"
+    kbps = bps / 1024.0
+    if kbps < 1024.0:
+        return f"{kbps:.1f} KB/s"
+    mbps = kbps / 1024.0
+    return f"{mbps:.2f} MB/s"
+
+
+def fmt_eta(seconds: Optional[float]) -> str:
+    if seconds is None or seconds < 0 or math.isinf(seconds):
+        return "∞"
+    s = int(round(seconds))
+    if s < 60:
+        return f"{s}s remaining"
+    m, sec = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {sec:02d}s remaining"
+    h, m = divmod(m, 60)
+    if h < 48:
+        return f"{h}h {m:02d}m remaining"
+    d, h = divmod(h, 24)
+    return f"{d}d {h}h remaining"
+
+
+def _bstr(val: Any, default: str = "") -> str:
+    if isinstance(val, bytes):
+        return val.decode("utf-8", errors="replace")
+    if isinstance(val, str):
+        return val
+    return default
+
+
+# ---------------------------------------------------------------------------
+# Pure-Python Bencode Encoder & Decoder (with exact info-slice extraction)
+# ---------------------------------------------------------------------------
+class BencodeError(ValueError):
+    pass
+
+
+def bencode(obj: Any) -> bytes:
+    if isinstance(obj, bool):
+        return b"i1e" if obj else b"i0e"
+    if isinstance(obj, int):
+        return f"i{obj}e".encode("ascii")
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        b = bytes(obj)
+        return f"{len(b)}:".encode("ascii") + b
+    if isinstance(obj, str):
+        b = obj.encode("utf-8")
+        return f"{len(b)}:".encode("ascii") + b
+    if isinstance(obj, (list, tuple)):
+        return b"l" + b"".join(bencode(item) for item in obj) + b"e"
+    if isinstance(obj, dict):
+        norm_items: list[tuple[bytes, Any]] = []
+        for k, v in obj.items():
+            kb = k if isinstance(k, bytes) else str(k).encode("utf-8")
+            norm_items.append((kb, v))
+        norm_items.sort(key=lambda kv: kv[0])
+        out = [b"d"]
+        for kb, v in norm_items:
+            out.append(bencode(kb))
+            out.append(bencode(v))
+        out.append(b"e")
+        return b"".join(out)
+    raise BencodeError(f"Unsupported type for bencode: {type(obj)!r}")
+
+
+def bdecode_at(data: bytes, idx: int = 0) -> tuple[Any, int]:
+    n = len(data)
+    if idx >= n:
+        raise BencodeError("Unexpected EOF in bencoded data")
+    ch = data[idx : idx + 1]
+    if ch == b"i":
+        end = data.find(b"e", idx + 1)
+        if end == -1:
+            raise BencodeError("Unterminated integer")
+        num_s = data[idx + 1 : end]
+        if not num_s or (num_s.startswith(b"0") and len(num_s) > 1) or num_s == b"-0":
+            raise BencodeError(f"Invalid bencode integer: {num_s!r}")
+        return int(num_s), end + 1
+    if ch == b"l":
+        idx += 1
+        arr: list[Any] = []
+        while idx < n and data[idx : idx + 1] != b"e":
+            val, idx = bdecode_at(data, idx)
+            arr.append(val)
+        if idx >= n:
+            raise BencodeError("Unterminated list")
+        return arr, idx + 1
+    if ch == b"d":
+        idx += 1
+        dct: dict[bytes, Any] = {}
+        while idx < n and data[idx : idx + 1] != b"e":
+            key, idx = bdecode_at(data, idx)
+            if not isinstance(key, bytes):
+                raise BencodeError("Dictionary key must be byte string")
+            val, idx = bdecode_at(data, idx)
+            dct[key] = val
+        if idx >= n:
+            raise BencodeError("Unterminated dict")
+        return dct, idx + 1
+    if b"0" <= ch <= b"9":
+        colon = data.find(b":", idx)
+        if colon == -1:
+            raise BencodeError("Missing colon in byte string")
+        slen = int(data[idx:colon])
+        start = colon + 1
+        end = start + slen
+        if end > n:
+            raise BencodeError("Byte string truncated")
+        return data[start:end], end
+    raise BencodeError(f"Invalid token {ch!r} at offset {idx}")
+
+
+def bdecode(data: bytes) -> Any:
+    val, end = bdecode_at(data, 0)
+    if end != len(data):
+        # Some tracker/extension payloads have trailing bytes (e.g. BEP-9 data);
+        # use bdecode_at when trailing payload is expected.
+        raise BencodeError(f"Trailing {len(data) - end} bytes after bencoded value")
+    return val
+
+
+def extract_top_info_slice(torrent_bytes: bytes) -> tuple[dict[bytes, Any], bytes]:
+    """Decode top-level .torrent dict and return (root_dict, exact_raw_info_bytes)."""
+    if not torrent_bytes.startswith(b"d"):
+        raise BencodeError("Not a bencoded .torrent dictionary")
+    idx = 1
+    n = len(torrent_bytes)
+    root: dict[bytes, Any] = {}
+    raw_info = b""
+    while idx < n and torrent_bytes[idx : idx + 1] != b"e":
+        key, idx = bdecode_at(torrent_bytes, idx)
+        if not isinstance(key, bytes):
+            raise BencodeError("Invalid key in .torrent")
+        val_start = idx
+        val, idx = bdecode_at(torrent_bytes, idx)
+        if key == b"info":
+            raw_info = torrent_bytes[val_start:idx]
+        root[key] = val
+    if not raw_info or b"info" not in root:
+        raise BencodeError("Missing 'info' dictionary in .torrent")
+    return root, raw_info
+
+
+# ---------------------------------------------------------------------------
+# Metainfo (.torrent & Magnet URI) Structures, Parser, and Creator
+# ---------------------------------------------------------------------------
+@dataclasses.dataclass
+class TorrentFileEntry:
+    index: int
+    path_parts: list[str]
+    rel_path: str
+    length: int
+    offset: int
+    wanted: bool = True
+    priority: str = "Normal"  # "High", "Normal", "Low"
+    completed_bytes: int = 0
+
+
+@dataclasses.dataclass
+class TrackerState:
+    tier: int
+    url: str
+    status: str = "Waiting to announce"
+    last_announce: float = 0.0
+    next_announce: float = 0.0
+    interval: int = 900
+    seeders: int = 0
+    leechers: int = 0
+
+    @property
+    def host(self) -> str:
+        try:
+            u = urllib.parse.urlparse(self.url)
+            return u.hostname or self.url
+        except Exception:
+            return self.url
+
+
+@dataclasses.dataclass
+class TorrentMeta:
+    info_hash: bytes
+    name: str
+    piece_length: int = 0
+    pieces_hashes: list[bytes] = dataclasses.field(default_factory=list)
+    files: list[TorrentFileEntry] = dataclasses.field(default_factory=list)
+    total_size: int = 0
+    is_multi_file: bool = False
+    trackers: list[tuple[int, str]] = dataclasses.field(default_factory=list)
+    comment: str = ""
+    created_by: str = ""
+    creation_date: int = 0
+    raw_info_bytes: bytes = b""
+    has_metadata: bool = False
+    peer_hints: list[tuple[str, int]] = dataclasses.field(default_factory=list)
+
+    @property
+    def info_hash_hex(self) -> str:
+        return self.info_hash.hex()
+
+    @property
+    def num_pieces(self) -> int:
+        return len(self.pieces_hashes)
+
+    def piece_size(self, piece_idx: int) -> int:
+        if not self.has_metadata or self.num_pieces == 0:
+            return 0
+        if piece_idx < 0 or piece_idx >= self.num_pieces:
+            return 0
+        if piece_idx == self.num_pieces - 1:
+            rem = self.total_size - (self.num_pieces - 1) * self.piece_length
+            return rem if rem > 0 else self.piece_length
+        return self.piece_length
+
+    def to_magnet_uri(self) -> str:
+        q = [f"xt=urn:btih:{self.info_hash_hex}"]
+        if self.name:
+            q.append("dn=" + urllib.parse.quote(self.name))
+        for _tier, tr in self.trackers:
+            q.append("tr=" + urllib.parse.quote(tr, safe=""))
+        return "magnet:?" + "&".join(q)
+
+
+def _sanitize_part(part: str) -> str:
+    p = part.strip().replace("/", "_").replace("\\", "_").replace("\x00", "")
+    if p in ("", ".", ".."):
+        return "_"
+    return p
+
+
+def populate_meta_from_info_dict(
+    meta: TorrentMeta, info_dict: dict[bytes, Any], raw_info_bytes: bytes
+) -> None:
+    name = _sanitize_part(_bstr(info_dict.get(b"name"), meta.name or meta.info_hash_hex[:12]))
+    piece_len = int(info_dict.get(b"piece length", 0))
+    pieces_blob = info_dict.get(b"pieces", b"")
+    if piece_len <= 0 or not isinstance(pieces_blob, bytes) or len(pieces_blob) % 20 != 0:
+        raise BencodeError("Invalid piece length or pieces SHA-1 blob in info dict")
+    hashes = [pieces_blob[i : i + 20] for i in range(0, len(pieces_blob), 20)]
+
+    files: list[TorrentFileEntry] = []
+    offset = 0
+    is_multi = b"files" in info_dict
+    if is_multi:
+        raw_files = info_dict[b"files"]
+        if not isinstance(raw_files, list) or not raw_files:
+            raise BencodeError("Empty multi-file list in .torrent")
+        for idx, rf in enumerate(raw_files):
+            flen = max(0, int(rf.get(b"length", 0)))
+            raw_parts = rf.get(b"path", [])
+            parts = [_sanitize_part(_bstr(p)) for p in raw_parts if _bstr(p)]
+            if not parts:
+                parts = [f"file_{idx}"]
+            rel = "/".join(parts)
+            files.append(
+                TorrentFileEntry(
+                    index=idx,
+                    path_parts=parts,
+                    rel_path=rel,
+                    length=flen,
+                    offset=offset,
+                )
+            )
+            offset += flen
+    else:
+        flen = max(0, int(info_dict.get(b"length", 0)))
+        files.append(
+            TorrentFileEntry(
+                index=0,
+                path_parts=[name],
+                rel_path=name,
+                length=flen,
+                offset=0,
+            )
+        )
+        offset = flen
+
+    meta.name = name
+    meta.piece_length = piece_len
+    meta.pieces_hashes = hashes
+    meta.files = files
+    meta.total_size = offset
+    meta.is_multi_file = is_multi
+    meta.raw_info_bytes = raw_info_bytes
+    meta.has_metadata = True
+
+
+def parse_torrent_bytes(data: bytes) -> TorrentMeta:
+    root, raw_info = extract_top_info_slice(data)
+    info_hash = hashlib.sha1(raw_info).digest()
+    trackers: list[tuple[int, str]] = []
+    seen_tr: set[str] = set()
+
+    ann_list = root.get(b"announce-list")
+    if isinstance(ann_list, list):
+        for tier_idx, tier_group in enumerate(ann_list):
+            if isinstance(tier_group, list):
+                for item in tier_group:
+                    u = _bstr(item).strip()
+                    if u and u not in seen_tr:
+                        seen_tr.add(u)
+                        trackers.append((tier_idx, u))
+    ann = _bstr(root.get(b"announce")).strip()
+    if ann and ann not in seen_tr:
+        trackers.insert(0, (0, ann))
+
+    meta = TorrentMeta(
+        info_hash=info_hash,
+        name=info_hash.hex()[:12],
+        trackers=trackers,
+        comment=_bstr(root.get(b"comment")),
+        created_by=_bstr(root.get(b"created by")),
+        creation_date=int(root.get(b"creation date", 0) or 0),
+    )
+    populate_meta_from_info_dict(meta, root[b"info"], raw_info)
+    return meta
+
+
+def parse_torrent_file(path: Path | str) -> TorrentMeta:
+    return parse_torrent_bytes(Path(path).read_bytes())
+
+
+def parse_magnet_uri(uri: str) -> TorrentMeta:
+    s = uri.strip()
+    if not s.lower().startswith("magnet:?"):
+        raise ValueError("Not a valid magnet:? URI")
+    qs = urllib.parse.parse_qs(s[8:], keep_blank_values=False)
+    xts = qs.get("xt", [])
+    info_hash: Optional[bytes] = None
+    for xt in xts:
+        m = re.match(r"(?i)^urn:btih:([A-Za-z0-9]+)$", xt.strip())
+        if not m:
+            continue
+        tok = m.group(1)
+        if len(tok) == 40:
+            info_hash = bytes.fromhex(tok)
+            break
+        if len(tok) == 32:
+            info_hash = base64.b32decode(tok.upper())
+            break
+    if not info_hash or len(info_hash) != 20:
+        raise ValueError("Magnet URI missing 20-byte urn:btih infohash (hex or base32)")
+
+    dn_list = qs.get("dn", [])
+    name = dn_list[0].strip() if dn_list else f"Magnet {info_hash.hex()[:12]}"
+    trackers: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for idx, tr in enumerate(qs.get("tr", [])):
+        u = tr.strip()
+        if u and u not in seen:
+            seen.add(u)
+            trackers.append((idx, u))
+
+    peer_hints: list[tuple[str, int]] = []
+    for pe in qs.get("x.pe", []):
+        if ":" in pe:
+            host, port_s = pe.rsplit(":", 1)
+            try:
+                peer_hints.append((host.strip("[]"), int(port_s)))
+            except ValueError:
+                pass
+
+    return TorrentMeta(
+        info_hash=info_hash,
+        name=name,
+        trackers=trackers,
+        has_metadata=False,
+        peer_hints=peer_hints,
+    )
+
+
+def choose_auto_piece_length(total_bytes: int) -> int:
+    if total_bytes <= 2 * 1024 * 1024:
+        return 16384  # 16 KiB
+    if total_bytes <= 16 * 1024 * 1024:
+        return 32768
+    if total_bytes <= 128 * 1024 * 1024:
+        return 65536
+    if total_bytes <= 512 * 1024 * 1024:
+        return 262144
+    if total_bytes <= 2 * 1024 * 1024 * 1024:
+        return 524288
+    return 1048576
+
+
+def create_torrent_file(
+    source_path: Path | str,
+    out_torrent_path: Path | str,
+    trackers: list[str],
+    comment: str = "",
+    piece_length: int = 0,
+    private: bool = False,
+    progress_cb: Optional[Callable[[float], None]] = None,
+) -> TorrentMeta:
+    src = Path(source_path).resolve()
+    if not src.exists():
+        raise FileNotFoundError(f"Source path does not exist: {src}")
+
+    file_records: list[tuple[Path, list[str], int]] = []
+    is_dir = src.is_dir()
+    if is_dir:
+        for p in sorted(src.rglob("*")):
+            if p.is_file() and not p.is_symlink():
+                rel_parts = list(p.relative_to(src).parts)
+                file_records.append((p, rel_parts, p.stat().st_size))
+        if not file_records:
+            raise ValueError("Selected directory contains no regular files")
+    else:
+        file_records.append((src, [src.name], src.stat().st_size))
+
+    total_bytes = sum(sz for _, _, sz in file_records)
+    plen = piece_length if piece_length > 0 else choose_auto_piece_length(total_bytes)
+
+    pieces_out = bytearray()
+    hasher = hashlib.sha1()
+    buffered = 0
+    processed = 0
+
+    for fpath, _parts, _sz in file_records:
+        with fpath.open("rb") as fp:
+            while True:
+                need = plen - buffered
+                chunk = fp.read(min(need, 262144))
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                buffered += len(chunk)
+                processed += len(chunk)
+                if buffered == plen:
+                    pieces_out.extend(hasher.digest())
+                    hasher = hashlib.sha1()
+                    buffered = 0
+                if progress_cb and total_bytes > 0:
+                    progress_cb(processed / total_bytes)
+
+    if buffered > 0 or total_bytes == 0:
+        pieces_out.extend(hasher.digest())
+
+    info: dict[bytes, Any] = {
+        b"name": src.name.encode("utf-8"),
+        b"piece length": plen,
+        b"pieces": bytes(pieces_out),
+    }
+    if private:
+        info[b"private"] = 1
+
+    if is_dir:
+        info[b"files"] = [
+            {
+                b"length": sz,
+                b"path": [pt.encode("utf-8") for pt in parts],
+            }
+            for _fp, parts, sz in file_records
+        ]
+    else:
+        info[b"length"] = total_bytes
+
+    clean_tr = [t.strip() for t in trackers if t.strip()]
+    root: dict[bytes, Any] = {
+        b"created by": CLIENT_BANNER.encode("utf-8"),
+        b"creation date": int(time.time()),
+        b"info": info,
+    }
+    if clean_tr:
+        root[b"announce"] = clean_tr[0].encode("utf-8")
+        if len(clean_tr) > 1:
+            root[b"announce-list"] = [[t.encode("utf-8")] for t in clean_tr]
+    if comment.strip():
+        root[b"comment"] = comment.strip().encode("utf-8")
+
+    encoded = bencode(root)
+    out_p = Path(out_torrent_path)
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+    out_p.write_bytes(encoded)
+    if progress_cb:
+        progress_cb(1.0)
+    return parse_torrent_bytes(encoded)
+
+
+# ---------------------------------------------------------------------------
+# Token-Bucket Bandwidth Rate Limiter
+# ---------------------------------------------------------------------------
+class TokenBucket:
+    def __init__(self, rate_kbps: int = 0) -> None:
+        self._lock = threading.Lock()
+        self._rate_bps: float = max(0, rate_kbps) * 1024.0
+        self._tokens: float = self._rate_bps
+        self._last_ts: float = time.monotonic()
+
+    def set_rate_kbps(self, rate_kbps: int) -> None:
+        with self._lock:
+            self._rate_bps = max(0, rate_kbps) * 1024.0
+            self._tokens = min(self._tokens, max(self._rate_bps, float(BLOCK_SIZE * 2)))
+            self._last_ts = time.monotonic()
+
+    def throttle(self, nbytes: int, stop_event: Optional[threading.Event] = None) -> None:
+        if nbytes <= 0:
+            return
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return
+            with self._lock:
+                if self._rate_bps <= 0:
+                    return
+                now = time.monotonic()
+                dt = max(0.0, now - self._last_ts)
+                self._last_ts = now
+                burst = max(self._rate_bps * 1.5, float(BLOCK_SIZE * 2))
+                self._tokens = min(burst, self._tokens + dt * self._rate_bps)
+                if self._tokens >= nbytes:
+                    self._tokens -= nbytes
+                    return
+                deficit = nbytes - self._tokens
+                wait_s = min(0.25, deficit / max(1.0, self._rate_bps))
+            if stop_event is not None:
+                stop_event.wait(wait_s)
+            else:
+                time.sleep(wait_s)
+
+
+# ---------------------------------------------------------------------------
+# HTTP/HTTPS & BEP-15 UDP Tracker Announce Client
+# ---------------------------------------------------------------------------
+@dataclasses.dataclass
+class AnnounceResult:
+    ok: bool
+    peers: list[tuple[str, int]] = dataclasses.field(default_factory=list)
+    seeders: int = 0
+    leechers: int = 0
+    interval: int = 900
+    message: str = "OK"
+
+
+def _parse_compact_peers_v4(blob: bytes) -> list[tuple[str, int]]:
+    peers: list[tuple[str, int]] = []
+    for i in range(0, len(blob) - (len(blob) % 6), 6):
+        ip = socket.inet_ntoa(blob[i : i + 4])
+        (port,) = struct.unpack("!H", blob[i + 4 : i + 6])
+        if port > 0 and ip != "0.0.0.0":
+            peers.append((ip, port))
+    return peers
+
+
+def _parse_compact_peers_v6(blob: bytes) -> list[tuple[str, int]]:
+    peers: list[tuple[str, int]] = []
+    for i in range(0, len(blob) - (len(blob) % 18), 18):
+        ip = socket.inet_ntop(socket.AF_INET6, blob[i : i + 16])
+        (port,) = struct.unpack("!H", blob[i + 16 : i + 18])
+        if port > 0:
+            peers.append((ip, port))
+    return peers
+
+
+def announce_http_tracker(
+    url: str,
+    info_hash: bytes,
+    peer_id: bytes,
+    listen_port: int,
+    uploaded: int,
+    downloaded: int,
+    left: int,
+    event: str = "",
+) -> AnnounceResult:
+    sep = "&" if "?" in url else "?"
+    ih_q = urllib.parse.quote_from_bytes(info_hash)
+    pid_q = urllib.parse.quote_from_bytes(peer_id)
+    params = [
+        f"info_hash={ih_q}",
+        f"peer_id={pid_q}",
+        f"port={listen_port}",
+        f"uploaded={max(0, uploaded)}",
+        f"downloaded={max(0, downloaded)}",
+        f"left={max(0, left)}",
+        "compact=1",
+        "numwant=80",
+    ]
+    if event:
+        params.append(f"event={event}")
+    full_url = url + sep + "&".join(params)
+    req = urllib.request.Request(full_url, headers={"User-Agent": HTTP_UA})
+    with urllib.request.urlopen(req, timeout=8.0) as resp:
+        raw = resp.read(524288)
+    data, _ = bdecode_at(raw, 0)
+    if not isinstance(data, dict):
+        return AnnounceResult(ok=False, message="Malformed tracker response")
+    if b"failure reason" in data:
+        return AnnounceResult(ok=False, message=_bstr(data[b"failure reason"], "Tracker error"))
+
+    peers: list[tuple[str, int]] = []
+    raw_peers = data.get(b"peers", b"")
+    if isinstance(raw_peers, bytes):
+        peers.extend(_parse_compact_peers_v4(raw_peers))
+    elif isinstance(raw_peers, list):
+        for p in raw_peers:
+            if isinstance(p, dict):
+                ip = _bstr(p.get(b"ip")).strip()
+                port = int(p.get(b"port", 0) or 0)
+                if ip and port > 0:
+                    peers.append((ip, port))
+
+    raw_peers6 = data.get(b"peers6", b"")
+    if isinstance(raw_peers6, bytes):
+        peers.extend(_parse_compact_peers_v6(raw_peers6))
+
+    interval = max(60, int(data.get(b"interval", 900) or 900))
+    seeders = max(0, int(data.get(b"complete", 0) or 0))
+    leechers = max(0, int(data.get(b"incomplete", 0) or 0))
+    return AnnounceResult(
+        ok=True,
+        peers=peers,
+        seeders=seeders,
+        leechers=leechers,
+        interval=interval,
+        message=f"OK ({len(peers)} peers)",
+    )
+
+
+def announce_udp_tracker(
+    url: str,
+    info_hash: bytes,
+    peer_id: bytes,
+    listen_port: int,
+    uploaded: int,
+    downloaded: int,
+    left: int,
+    event: str = "",
+) -> AnnounceResult:
+    """BEP-15 UDP Tracker Protocol client."""
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname
+    port = parsed.port or 80
+    if not host:
+        return AnnounceResult(ok=False, message="Invalid UDP tracker host")
+
+    ev_map = {"": 0, "completed": 1, "started": 2, "stopped": 3}
+    ev_code = ev_map.get(event, 0)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(4.5)
+    try:
+        addr_info = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)
+        if not addr_info:
+            return AnnounceResult(ok=False, message="DNS resolution failed")
+        target = addr_info[0][4]
+
+        # Step 1: Connect
+        tx1 = random.randint(1, 0x7FFFFFFF)
+        conn_req = struct.pack("!QII", 0x41727101980, 0, tx1)
+        sock.sendto(conn_req, target)
+        pkt1, _ = sock.recvfrom(2048)
+        if len(pkt1) < 16:
+            return AnnounceResult(ok=False, message="Short UDP connect reply")
+        act1, rx_tx1, conn_id = struct.unpack("!IIQ", pkt1[:16])
+        if act1 != 0 or rx_tx1 != tx1:
+            return AnnounceResult(ok=False, message="UDP connect handshake mismatch")
+
+        # Step 2: Announce (98 bytes)
+        tx2 = random.randint(1, 0x7FFFFFFF)
+        key = random.randint(1, 0x7FFFFFFF)
+        ann_req = struct.pack(
+            "!QII20s20sQQQIIIiH",
+            conn_id,
+            1,
+            tx2,
+            info_hash,
+            peer_id,
+            max(0, downloaded),
+            max(0, left),
+            max(0, uploaded),
+            ev_code,
+            0,
+            key,
+            80,
+            listen_port & 0xFFFF,
+        )
+        sock.sendto(ann_req, target)
+        pkt2, _ = sock.recvfrom(8192)
+        if len(pkt2) < 20:
+            if len(pkt2) >= 8:
+                act_err, _ = struct.unpack("!II", pkt2[:8])
+                if act_err == 3:
+                    return AnnounceResult(ok=False, message=_bstr(pkt2[8:], "UDP tracker error"))
+            return AnnounceResult(ok=False, message="Short UDP announce reply")
+        act2, rx_tx2, interval, leechers, seeders = struct.unpack("!IIIII", pkt2[:20])
+        if act2 != 1 or rx_tx2 != tx2:
+            return AnnounceResult(ok=False, message="UDP announce tx mismatch")
+        peers = _parse_compact_peers_v4(pkt2[20:])
+        return AnnounceResult(
+            ok=True,
+            peers=peers,
+            seeders=max(0, seeders),
+            leechers=max(0, leechers),
+            interval=max(60, interval),
+            message=f"OK ({len(peers)} peers)",
+        )
+    finally:
+        sock.close()
+
+
+def announce_tracker(
+    url: str,
+    info_hash: bytes,
+    peer_id: bytes,
+    listen_port: int,
+    uploaded: int,
+    downloaded: int,
+    left: int,
+    event: str = "",
+) -> AnnounceResult:
+    low = url.lower()
+    try:
+        if low.startswith("udp://"):
+            return announce_udp_tracker(
+                url, info_hash, peer_id, listen_port, uploaded, downloaded, left, event
+            )
+        if low.startswith(("http://", "https://")):
+            return announce_http_tracker(
+                url, info_hash, peer_id, listen_port, uploaded, downloaded, left, event
+            )
+        return AnnounceResult(ok=False, message="Unsupported tracker scheme")
+    except Exception as exc:
+        msg = str(exc).strip() or exc.__class__.__name__
+        if len(msg) > 64:
+            msg = msg[:61] + "..."
+        return AnnounceResult(ok=False, message=f"Error: {msg}")
+
+
+# ---------------------------------------------------------------------------
+# Disk Storage & Multi-File Piece Mapper
+# ---------------------------------------------------------------------------
+class DiskStorage:
+    """Thread-safe random-access piece storage over single or multi-file layouts."""
+
+    def __init__(self, download_dir: Path, meta: TorrentMeta) -> None:
+        self.download_dir = Path(download_dir)
+        self.meta = meta
+        self._lock = threading.Lock()
+        self._piece_cache: collections.OrderedDict[int, bytes] = collections.OrderedDict()
+        self._max_cache_pieces = 24
+
+    def root_target_path(self) -> Path:
+        return self.download_dir / _sanitize_part(self.meta.name)
+
+    def _file_disk_path(self, entry: TorrentFileEntry) -> Path:
+        if self.meta.is_multi_file:
+            base = self.download_dir / _sanitize_part(self.meta.name)
+            p = base
+            for pt in entry.path_parts:
+                p = p / _sanitize_part(pt)
+            return p
+        return self.download_dir / _sanitize_part(entry.path_parts[0])
+
+    def _piece_spans(self, piece_idx: int, length: int) -> list[tuple[TorrentFileEntry, int, int, int]]:
+        """Return list of (entry, buf_offset, file_offset, span_len)."""
+        p_start = piece_idx * self.meta.piece_length
+        p_end = p_start + length
+        spans: list[tuple[TorrentFileEntry, int, int, int]] = []
+        for entry in self.meta.files:
+            f_start = entry.offset
+            f_end = f_start + entry.length
+            if entry.length == 0:
+                if f_start == p_start:
+                    spans.append((entry, 0, 0, 0))
+                continue
+            ov_start = max(p_start, f_start)
+            ov_end = min(p_end, f_end)
+            if ov_start < ov_end:
+                buf_off = ov_start - p_start
+                file_off = ov_start - f_start
+                spans.append((entry, buf_off, file_off, ov_end - ov_start))
+        return spans
+
+    def write_piece(self, piece_idx: int, data: bytes) -> None:
+        with self._lock:
+            self.download_dir.mkdir(parents=True, exist_ok=True)
+            spans = self._piece_spans(piece_idx, len(data))
+            for entry, buf_off, file_off, span_len in spans:
+                fpath = self._file_disk_path(entry)
+                fpath.parent.mkdir(parents=True, exist_ok=True)
+                if span_len == 0:
+                    if not fpath.exists():
+                        fpath.touch()
+                    continue
+                mode = "r+b" if fpath.exists() else "w+b"
+                with fpath.open(mode) as fp:
+                    fp.seek(file_off)
+                    fp.write(data[buf_off : buf_off + span_len])
+            self._piece_cache[piece_idx] = data
+            self._piece_cache.move_to_end(piece_idx)
+            while len(self._piece_cache) > self._max_cache_pieces:
+                self._piece_cache.popitem(last=False)
+
+    def read_piece(self, piece_idx: int) -> Optional[bytes]:
+        plen = self.meta.piece_size(piece_idx)
+        if plen <= 0 and self.meta.total_size > 0:
+            return None
+        with self._lock:
+            if piece_idx in self._piece_cache:
+                self._piece_cache.move_to_end(piece_idx)
+                return self._piece_cache[piece_idx]
+            if plen == 0:
+                return b""
+            out = bytearray(plen)
+            spans = self._piece_spans(piece_idx, plen)
+            for entry, buf_off, file_off, span_len in spans:
+                if span_len == 0:
+                    continue
+                fpath = self._file_disk_path(entry)
+                if not fpath.is_file():
+                    return None
+                with fpath.open("rb") as fp:
+                    fp.seek(file_off)
+                    chunk = fp.read(span_len)
+                    if len(chunk) != span_len:
+                        return None
+                    out[buf_off : buf_off + span_len] = chunk
+            res = bytes(out)
+            self._piece_cache[piece_idx] = res
+            while len(self._piece_cache) > self._max_cache_pieces:
+                self._piece_cache.popitem(last=False)
+            return res
+
+    def read_block(self, piece_idx: int, begin: int, length: int) -> Optional[bytes]:
+        piece = self.read_piece(piece_idx)
+        if piece is None or begin < 0 or begin + length > len(piece):
+            return None
+        return piece[begin : begin + length]
+
+    def delete_data(self) -> None:
+        with self._lock:
+            self._piece_cache.clear()
+            target = self.root_target_path()
+            try:
+                if target.is_dir():
+                    shutil.rmtree(target, ignore_errors=True)
+                elif target.exists():
+                    target.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Peer Client Name Decoder & Sliding-Window Rate Meter
+# ---------------------------------------------------------------------------
+AZUREUS_CLIENTS: dict[str, str] = {
+    "TR": "Transmission",
+    "qB": "qBittorrent",
+    "DE": "Deluge",
+    "DD": "dtDeluge",
+    "LT": "libtorrent",
+    "lt": "rTorrent",
+    "UT": "µTorrent",
+    "UM": "µTorrent Mac",
+    "BT": "BitTorrent",
+    "AZ": "Vuze",
+    "AR": "aria2",
+    "KT": "KTorrent",
+    "WW": "WebTorrent",
+    "TL": "Tribler",
+    "FD": "Free Download Mgr",
+    "XF": "Xfplay",
+    "PI": "PicoTorrent",
+}
+
+
+def decode_peer_client(peer_id: bytes, ext_v: str = "") -> str:
+    if ext_v.strip():
+        return ext_v.strip()[:32]
+    if len(peer_id) == 20 and peer_id[0:1] == b"-" and peer_id[7:8] == b"-":
+        code = peer_id[1:3].decode("ascii", errors="ignore")
+        ver_raw = peer_id[3:7].decode("ascii", errors="ignore")
+        cname = AZUREUS_CLIENTS.get(code, f"Client {code}")
+        digits = [c for c in ver_raw if c.isalnum() and c != "0" or ver_raw.startswith(c)]
+        ver = ".".join(ver_raw.rstrip("0")[:3]) if ver_raw.isdigit() else ver_raw
+        return f"{cname} {ver}".strip()
+    if peer_id.startswith(b"M"):
+        return "BitTorrent Mainline"
+    return "BitTorrent Peer"
+
+
+class RateMeter:
+    """Thread-safe rolling 3.5-second byte throughput meter."""
+
+    def __init__(self, window_s: float = 3.5) -> None:
+        self._window = window_s
+        self._lock = threading.Lock()
+        self._samples: collections.deque[tuple[float, int]] = collections.deque()
+
+    def add(self, nbytes: int) -> None:
+        if nbytes <= 0:
+            return
+        now = time.monotonic()
+        with self._lock:
+            self._samples.append((now, nbytes))
+            cutoff = now - self._window
+            while self._samples and self._samples[0][0] < cutoff:
+                self._samples.popleft()
+
+    def rate(self) -> float:
+        now = time.monotonic()
+        with self._lock:
+            cutoff = now - self._window
+            while self._samples and self._samples[0][0] < cutoff:
+                self._samples.popleft()
+            if not self._samples:
+                return 0.0
+            total = sum(b for _, b in self._samples)
+            span = max(0.6, now - self._samples[0][0])
+            return total / min(self._window, span + 0.25)
+
+
+# ---------------------------------------------------------------------------
+# Piece Assembly Buffer & BitTorrent Peer Wire + BEP-9/BEP-10 Engine
+# ---------------------------------------------------------------------------
+class PieceAssembly:
+    def __init__(self, piece_idx: int, piece_size: int) -> None:
+        self.piece_idx = piece_idx
+        self.piece_size = piece_size
+        self.num_blocks = max(1, math.ceil(piece_size / BLOCK_SIZE))
+        self.buf = bytearray(piece_size)
+        # 0 = missing, 1 = in-flight, 2 = received
+        self.states = [0] * self.num_blocks
+        self.req_ts = [0.0] * self.num_blocks
+
+    def block_spec(self, blk_idx: int) -> tuple[int, int]:
+        begin = blk_idx * BLOCK_SIZE
+        length = min(BLOCK_SIZE, self.piece_size - begin)
+        return begin, max(0, length)
+
+    def next_requestable_block(self, now: float) -> Optional[tuple[int, int, int]]:
+        for i in range(self.num_blocks):
+            if self.states[i] == 0 or (self.states[i] == 1 and now - self.req_ts[i] > 10.0):
+                self.states[i] = 1
+                self.req_ts[i] = now
+                begin, length = self.block_spec(i)
+                return i, begin, length
+        return None
+
+    def put_block(self, begin: int, data: bytes) -> bool:
+        if begin % BLOCK_SIZE != 0:
+            return False
+        blk_idx = begin // BLOCK_SIZE
+        if blk_idx < 0 or blk_idx >= self.num_blocks:
+            return False
+        _, expected_len = self.block_spec(blk_idx)
+        if len(data) != expected_len:
+            return False
+        self.buf[begin : begin + len(data)] = data
+        self.states[blk_idx] = 2
+        return all(st == 2 for st in self.states)
+
+
+class PeerConnection:
+    """Single TCP BitTorrent Peer Wire session (supports BEP-10 & BEP-9 ut_metadata)."""
+
+    EXT_UT_METADATA_LOCAL_ID = 1
+
+    def __init__(
+        self,
+        transfer: "TorrentTransfer",
+        host: str,
+        port: int,
+        sock: Optional[socket.socket] = None,
+        incoming: bool = False,
+        remote_peer_id: bytes = b"",
+        remote_reserved: bytes = b"\x00" * 8,
+    ) -> None:
+        self.transfer = transfer
+        self.host = host
+        self.port = port
+        self.sock = sock
+        self.incoming = incoming
+        self.peer_id: bytes = remote_peer_id
+        self.reserved: bytes = remote_reserved
+        self.client_name: str = "Connecting..."
+        self.ext_version: str = ""
+
+        self.am_choking: bool = True
+        self.am_interested: bool = False
+        self.peer_choking: bool = True
+        self.peer_interested: bool = False
+        self.supports_extensions: bool = bool(
+            len(remote_reserved) == 8 and (remote_reserved[5] & 0x10)
+        )
+        self.peer_ut_metadata_id: int = 0
+
+        self.peer_bitfield: list[bool] = []
+        self.peer_have_count: int = 0
+        self.inflight: set[tuple[int, int, int]] = set()
+        self.down_meter = RateMeter()
+        self.up_meter = RateMeter()
+        self.alive: bool = True
+
+        self._send_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name=f"Peer-{host}:{port}", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.alive = False
+        s = self.sock
+        if s is not None:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    @property
+    def address_label(self) -> str:
+        return f"[{self.host}]:{self.port}" if ":" in self.host else f"{self.host}:{self.port}"
+
+    @property
+    def progress_pct(self) -> float:
+        np = self.transfer.meta.num_pieces
+        if np <= 0 or not self.peer_bitfield:
+            return 0.0
+        return 100.0 * min(np, self.peer_have_count) / np
+
+    @property
+    def flags_str(self) -> str:
+        fl = []
+        if not self.peer_choking and self.am_interested:
+            fl.append("D")
+        elif self.am_interested:
+            fl.append("d")
+        if not self.am_choking and self.peer_interested:
+            fl.append("U")
+        elif self.peer_interested:
+            fl.append("u")
+        if self.supports_extensions:
+            fl.append("E")
+        if self.incoming:
+            fl.append("I")
+        return "".join(fl) or "-"
+
+    def _recv_exact(self, n: int) -> bytes:
+        assert self.sock is not None
+        buf = bytearray()
+        while len(buf) < n:
+            if self._stop.is_set() or self.transfer.is_stopped_or_paused():
+                raise ConnectionError("Peer stopped")
+            try:
+                chunk = self.sock.recv(n - len(buf))
+            except socket.timeout:
+                # Periodic housekeeping while idle
+                self._tick_housekeeping()
+                continue
+            if not chunk:
+                raise EOFError("Peer closed connection")
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def _send_raw(self, payload: bytes) -> None:
+        s = self.sock
+        if s is None or self._stop.is_set():
+            return
+        with self._send_lock:
+            s.sendall(payload)
+
+    def send_msg(self, msg_id: int, body: bytes = b"") -> None:
+        pkt = struct.pack("!IB", 1 + len(body), msg_id) + body
+        self._send_raw(pkt)
+
+    def send_have(self, piece_idx: int) -> None:
+        try:
+            self.send_msg(4, struct.pack("!I", piece_idx))
+        except Exception:
+            pass
+
+    def _send_bitfield(self) -> None:
+        bf_bytes = self.transfer.pack_bitfield()
+        if bf_bytes and any(bf_bytes):
+            self.send_msg(5, bf_bytes)
+
+    def _send_ext_handshake(self) -> None:
+        d: dict[str, Any] = {
+            "m": {"ut_metadata": self.EXT_UT_METADATA_LOCAL_ID},
+            "p": self.transfer.engine.listen_port,
+            "v": CLIENT_BANNER,
+        }
+        if self.transfer.meta.has_metadata and self.transfer.meta.raw_info_bytes:
+            d["metadata_size"] = len(self.transfer.meta.raw_info_bytes)
+        self.send_msg(20, bytes([0]) + bencode(d))
+
+    def _unchoke_peer(self) -> None:
+        if self.am_choking:
+            self.am_choking = False
+            self.send_msg(1)
+
+    def _update_interest_and_pipeline(self) -> None:
+        if not self.transfer.meta.has_metadata:
+            self._request_next_metadata_piece()
+            return
+        np = self.transfer.meta.num_pieces
+        if len(self.peer_bitfield) < np:
+            self.peer_bitfield.extend([False] * (np - len(self.peer_bitfield)))
+
+        wants = self.transfer.peer_has_wanted_piece(self.peer_bitfield)
+        if wants and not self.am_interested:
+            self.am_interested = True
+            self.send_msg(2)  # interested
+        elif not wants and self.am_interested and not self.inflight:
+            self.am_interested = False
+            self.send_msg(3)  # not interested
+
+        if self.am_interested and not self.peer_choking:
+            while len(self.inflight) < PIPELINE_DEPTH:
+                req = self.transfer.checkout_block_for_peer(self.peer_bitfield, self.inflight)
+                if req is None:
+                    break
+                p_idx, begin, length = req
+                self.inflight.add(req)
+                self.send_msg(6, struct.pack("!III", p_idx, begin, length))
+
+    def _request_next_metadata_piece(self) -> None:
+        if self.peer_ut_metadata_id <= 0 or self.transfer.meta.has_metadata:
+            return
+        mp = self.transfer.checkout_metadata_piece()
+        if mp is not None:
+            payload = bencode({"msg_type": 0, "piece": mp})
+            self.send_msg(20, bytes([self.peer_ut_metadata_id]) + payload)
+
+    def _handle_extended(self, body: bytes) -> None:
+        if not body:
+            return
+        ext_id = body[0]
+        rest = body[1:]
+        if ext_id == 0:
+            hdr, _ = bdecode_at(rest, 0)
+            if isinstance(hdr, dict):
+                m_dict = hdr.get(b"m")
+                if isinstance(m_dict, dict):
+                    self.peer_ut_metadata_id = int(m_dict.get(b"ut_metadata", 0) or 0)
+                v_str = _bstr(hdr.get(b"v"))
+                if v_str:
+                    self.ext_version = v_str
+                    self.client_name = decode_peer_client(self.peer_id, self.ext_version)
+                meta_sz = int(hdr.get(b"metadata_size", 0) or 0)
+                if meta_sz > 0 and not self.transfer.meta.has_metadata:
+                    self.transfer.init_metadata_assembly(meta_sz)
+                    self._request_next_metadata_piece()
+        elif ext_id == self.EXT_UT_METADATA_LOCAL_ID:
+            msg_dict, end_idx = bdecode_at(rest, 0)
+            if not isinstance(msg_dict, dict):
+                return
+            msg_type = int(msg_dict.get(b"msg_type", -1))
+            piece = int(msg_dict.get(b"piece", -1))
+            if msg_type == 0:
+                # Peer requested metadata slice from us (BEP-9)
+                raw_info = self.transfer.meta.raw_info_bytes
+                if (
+                    self.peer_ut_metadata_id > 0
+                    and self.transfer.meta.has_metadata
+                    and raw_info
+                    and piece >= 0
+                ):
+                    start = piece * METADATA_PIECE_SIZE
+                    chunk = raw_info[start : start + METADATA_PIECE_SIZE]
+                    if chunk:
+                        resp = bencode(
+                            {
+                                "msg_type": 1,
+                                "piece": piece,
+                                "total_size": len(raw_info),
+                            }
+                        ) + chunk
+                        self.send_msg(20, bytes([self.peer_ut_metadata_id]) + resp)
+                    else:
+                        rej = bencode({"msg_type": 2, "piece": piece})
+                        self.send_msg(20, bytes([self.peer_ut_metadata_id]) + rej)
+            elif msg_type == 1 and piece >= 0:
+                # Received metadata slice!
+                slice_bytes = rest[end_idx:]
+                completed = self.transfer.put_metadata_piece(piece, slice_bytes)
+                if completed:
+                    self._update_interest_and_pipeline()
+                else:
+                    self._request_next_metadata_piece()
+
+    def _tick_housekeeping(self) -> None:
+        if not self.peer_choking and self.am_interested and len(self.inflight) < PIPELINE_DEPTH:
+            self._update_interest_and_pipeline()
+
+    def _run(self) -> None:
+        last_keepalive = time.monotonic()
+        try:
+            if not self.incoming:
+                fam = socket.AF_INET6 if ":" in self.host else socket.AF_INET
+                s = socket.socket(fam, socket.SOCK_STREAM)
+                s.settimeout(6.0)
+                s.connect((self.host, self.port))
+                self.sock = s
+
+                reserved = bytearray(8)
+                reserved[5] |= 0x10  # BEP-10 Extension Protocol
+                hs = (
+                    bytes([19])
+                    + b"BitTorrent protocol"
+                    + bytes(reserved)
+                    + self.transfer.meta.info_hash
+                    + self.transfer.engine.peer_id
+                )
+                self._send_raw(hs)
+                rx_hs = self._recv_exact(68)
+                if rx_hs[0] != 19 or rx_hs[1:20] != b"BitTorrent protocol":
+                    raise ConnectionError("Invalid BitTorrent protocol header")
+                if rx_hs[28:48] != self.transfer.meta.info_hash:
+                    raise ConnectionError("Infohash mismatch in peer handshake")
+                self.reserved = rx_hs[20:28]
+                self.peer_id = rx_hs[48:68]
+                self.supports_extensions = bool(self.reserved[5] & 0x10)
+
+            assert self.sock is not None
+            self.sock.settimeout(2.0)
+            self.client_name = decode_peer_client(self.peer_id, self.ext_version)
+            if self.peer_id == self.transfer.engine.peer_id:
+                raise ConnectionError("Self-connection ignored")
+
+            np = self.transfer.meta.num_pieces
+            self.peer_bitfield = [False] * np
+
+            if self.supports_extensions:
+                self._send_ext_handshake()
+            if self.transfer.meta.has_metadata:
+                self._send_bitfield()
+            self._unchoke_peer()
+            self._update_interest_and_pipeline()
+
+            while not self._stop.is_set() and not self.transfer.is_stopped_or_paused():
+                now = time.monotonic()
+                if now - last_keepalive > 90.0:
+                    self._send_raw(b"\x00\x00\x00\x00")
+                    last_keepalive = now
+
+                len_hdr = self._recv_exact(4)
+                (msg_len,) = struct.unpack("!I", len_hdr)
+                if msg_len == 0:
+                    continue
+                if msg_len > 2 * 1024 * 1024:
+                    raise ConnectionError("Oversized peer wire message")
+                payload = self._recv_exact(msg_len)
+                msg_id = payload[0]
+                body = payload[1:]
+
+                if msg_id == 0:  # choke
+                    self.peer_choking = True
+                    self.transfer.release_peer_inflight(self.inflight)
+                    self.inflight.clear()
+                elif msg_id == 1:  # unchoke
+                    self.peer_choking = False
+                    self._update_interest_and_pipeline()
+                elif msg_id == 2:  # interested
+                    self.peer_interested = True
+                    self._unchoke_peer()
+                elif msg_id == 3:  # not interested
+                    self.peer_interested = False
+                elif msg_id == 4 and len(body) == 4:  # have
+                    (p_idx,) = struct.unpack("!I", body)
+                    if p_idx < len(self.peer_bitfield) and not self.peer_bitfield[p_idx]:
+                        self.peer_bitfield[p_idx] = True
+                        self.peer_have_count += 1
+                    elif p_idx >= len(self.peer_bitfield) and p_idx < 65536:
+                        self.peer_bitfield.extend([False] * (p_idx + 1 - len(self.peer_bitfield)))
+                        self.peer_bitfield[p_idx] = True
+                        self.peer_have_count += 1
+                    self._update_interest_and_pipeline()
+                elif msg_id == 5:  # bitfield
+                    total_p = max(self.transfer.meta.num_pieces, len(body) * 8)
+                    bf = [False] * total_p
+                    cnt = 0
+                    for byte_i, bval in enumerate(body):
+                        for bit_i in range(8):
+                            pi = byte_i * 8 + bit_i
+                            if pi < total_p and (bval & (0x80 >> bit_i)):
+                                bf[pi] = True
+                                if pi < self.transfer.meta.num_pieces or not self.transfer.meta.has_metadata:
+                                    cnt += 1
+                    self.peer_bitfield = bf
+                    self.peer_have_count = cnt
+                    self._update_interest_and_pipeline()
+                elif msg_id == 6 and len(body) == 12:  # request (seeding!)
+                    req_idx, req_begin, req_len = struct.unpack("!III", body)
+                    if not self.am_choking and 0 < req_len <= 65536:
+                        blk = self.transfer.read_verified_block_for_upload(
+                            req_idx, req_begin, req_len, self._stop
+                        )
+                        if blk is not None:
+                            self.send_msg(7, struct.pack("!II", req_idx, req_begin) + blk)
+                            self.up_meter.add(len(blk))
+                elif msg_id == 7 and len(body) >= 8:  # piece
+                    p_idx, begin = struct.unpack("!II", body[:8])
+                    block = body[8:]
+                    self.inflight.discard((p_idx, begin, len(block)))
+                    self.transfer.engine.down_bucket.throttle(len(block), self._stop)
+                    self.down_meter.add(len(block))
+                    self.transfer.on_block_received(p_idx, begin, block)
+                    self._update_interest_and_pipeline()
+                elif msg_id == 20:  # BEP-10 extended
+                    self._handle_extended(body)
+        except Exception:
+            pass
+        finally:
+            self.alive = False
+            self.transfer.release_peer_inflight(self.inflight)
+            self.inflight.clear()
+            self.stop()
+            self.transfer.on_peer_disconnected(self)
+
+
+# ---------------------------------------------------------------------------
+# TorrentTransfer & Global TorrentEngine
+# ---------------------------------------------------------------------------
+class TorrentTransfer:
+    """Manages state, pieces, trackers, and peers for a single torrent."""
+
+    STATE_PAUSED = "Paused"
+    STATE_VERIFYING = "Verifying"
+    STATE_METADATA = "Metadata"
+    STATE_DOWNLOADING = "Downloading"
+    STATE_SEEDING = "Seeding"
+    STATE_FINISHED = "Finished"
+    STATE_ERROR = "Error"
+
+    def __init__(
+        self,
+        engine: "TorrentEngine",
+        meta: TorrentMeta,
+        download_dir: Path,
+        paused: bool = False,
+        uploaded_bytes: int = 0,
+        added_ts: Optional[float] = None,
+    ) -> None:
+        self.engine = engine
+        self.meta = meta
+        self.download_dir = Path(download_dir)
+        self.storage = DiskStorage(self.download_dir, self.meta)
+        self.added_ts = added_ts or time.time()
+
+        self._lock = threading.RLock()
+        self.paused: bool = paused
+        self.error_msg: str = ""
+        self.verify_progress: float = 0.0
+        self.verifying: bool = False
+
+        self.have_pieces: list[bool] = [False] * self.meta.num_pieces
+        self.wanted_pieces: list[bool] = [True] * self.meta.num_pieces
+        self.piece_priority: list[int] = [1] * self.meta.num_pieces  # 2=High, 1=Normal, 0=Low
+        self.active_assemblies: dict[int, PieceAssembly] = {}
+
+        # Magnet BEP-9 metadata assembly
+        self._meta_total_size: int = 0
+        self._meta_slices: dict[int, bytes] = {}
+        self._meta_requested: dict[int, float] = {}
+
+        self.downloaded_session: int = 0
+        self.uploaded_bytes: int = max(0, uploaded_bytes)
+        self.verified_bytes: int = 0
+        self.down_meter = RateMeter()
+        self.up_meter = RateMeter()
+
+        self.trackers: list[TrackerState] = [
+            TrackerState(tier=t, url=u) for t, u in self.meta.trackers
+        ]
+        self.known_peers: collections.OrderedDict[tuple[str, int], float] = (
+            collections.OrderedDict()
+        )
+        for hp in self.meta.peer_hints:
+            self.known_peers[hp] = 0.0
+        self.peers: dict[tuple[str, int], PeerConnection] = {}
+
+        self._stop_event = threading.Event()
+        self._completed_announced = False
+
+        if self.meta.has_metadata:
+            self._recompute_file_priorities_locked()
+
+    # ---- Lifecycle & State ----
+    def is_stopped_or_paused(self) -> bool:
+        return self._stop_event.is_set() or self.paused
+
+    @property
+    def state(self) -> str:
+        if self.error_msg:
+            return self.STATE_ERROR
+        if self.verifying:
+            return self.STATE_VERIFYING
+        if self.paused:
+            if self.meta.has_metadata and self.is_wanted_complete():
+                return self.STATE_FINISHED
+            return self.STATE_PAUSED
+        if not self.meta.has_metadata:
+            return self.STATE_METADATA
+        if self.is_wanted_complete():
+            return self.STATE_SEEDING
+        return self.STATE_DOWNLOADING
+
+    @property
+    def progress(self) -> float:
+        if self.verifying:
+            return self.verify_progress
+        if not self.meta.has_metadata:
+            with self._lock:
+                if self._meta_total_size > 0:
+                    need = math.ceil(self._meta_total_size / METADATA_PIECE_SIZE)
+                    return min(0.99, len(self._meta_slices) / max(1, need))
+            return 0.0
+        wanted_total = self.wanted_total_bytes()
+        if wanted_total <= 0:
+            return 1.0 if self.meta.total_size == 0 else 0.0
+        return max(0.0, min(1.0, self.wanted_completed_bytes() / wanted_total))
+
+    @property
+    def ratio(self) -> float:
+        denom = max(self.verified_bytes, self.downloaded_session)
+        if denom <= 0:
+            return 0.0
+        return self.uploaded_bytes / denom
+
+    @property
+    def down_rate(self) -> float:
+        return 0.0 if self.paused else self.down_meter.rate()
+
+    @property
+    def up_rate(self) -> float:
+        return 0.0 if self.paused else self.up_meter.rate()
+
+    @property
+    def eta_seconds(self) -> Optional[float]:
+        if self.state != self.STATE_DOWNLOADING:
+            return None
+        rem = max(0, self.wanted_total_bytes() - self.wanted_completed_bytes())
+        if rem == 0:
+            return 0.0
+        r = self.down_rate
+        if r < 64.0:
+            return None
+        return rem / r
+
+    def wanted_total_bytes(self) -> int:
+        with self._lock:
+            return sum(f.length for f in self.meta.files if f.wanted)
+
+    def wanted_completed_bytes(self) -> int:
+        with self._lock:
+            return sum(f.completed_bytes for f in self.meta.files if f.wanted)
+
+    def is_wanted_complete(self) -> bool:
+        with self._lock:
+            if not self.meta.has_metadata:
+                return False
+            if self.meta.num_pieces == 0:
+                return True
+            for i, w in enumerate(self.wanted_pieces):
+                if w and not self.have_pieces[i]:
+                    return False
+            return True
+
+    def availability_pct(self) -> float:
+        with self._lock:
+            np = self.meta.num_pieces
+            if np <= 0:
+                return 0.0
+            avail = 0
+            for i in range(np):
+                if self.have_pieces[i] or any(
+                    i < len(p.peer_bitfield) and p.peer_bitfield[i]
+                    for p in self.peers.values()
+                ):
+                    avail += 1
+            return 100.0 * avail / np
+
+    # ---- Actions ----
+    def start(self) -> None:
+        with self._lock:
+            self.error_msg = ""
+            self.paused = False
+        if self.meta.has_metadata and not any(self.have_pieces) and self._files_exist_on_disk():
+            self.verify_local_data(auto_resume=True)
+        else:
+            self.trigger_tracker_announce(event="started")
+
+    def pause(self) -> None:
+        with self._lock:
+            self.paused = True
+            peers_list = list(self.peers.values())
+            self.peers.clear()
+            self.active_assemblies.clear()
+        for p in peers_list:
+            p.stop()
+
+    def shutdown(self) -> None:
+        self._stop_event.set()
+        self.pause()
+
+    def _files_exist_on_disk(self) -> bool:
+        return self.storage.root_target_path().exists()
+
+    def verify_local_data(self, auto_resume: bool = False) -> None:
+        if not self.meta.has_metadata or self.verifying:
+            return
+
+        def _worker() -> None:
+            with self._lock:
+                was_paused = self.paused and not auto_resume
+                self.verifying = True
+                self.verify_progress = 0.0
+            # Disconnect peers while re-verifying
+            for p in list(self.peers.values()):
+                p.stop()
+            np = self.meta.num_pieces
+            new_have = [False] * np
+            for idx in range(np):
+                if self._stop_event.is_set():
+                    break
+                raw = self.storage.read_piece(idx)
+                if raw is not None and hashlib.sha1(raw).digest() == self.meta.pieces_hashes[idx]:
+                    new_have[idx] = True
+                with self._lock:
+                    self.verify_progress = (idx + 1) / max(1, np)
+            with self._lock:
+                self.have_pieces = new_have
+                self.active_assemblies.clear()
+                self._recompute_verified_bytes_locked()
+                self.verifying = False
+                self.paused = was_paused
+            if not was_paused and not self._stop_event.is_set():
+                self.trigger_tracker_announce(event="started")
+
+        threading.Thread(target=_worker, name="VerifyData", daemon=True).start()
+
+    def add_tracker(self, url: str) -> bool:
+        u = url.strip()
+        if not u.lower().startswith(("http://", "https://", "udp://")):
+            return False
+        with self._lock:
+            if any(t.url == u for t in self.trackers):
+                return False
+            tier = len(self.trackers)
+            self.trackers.append(TrackerState(tier=tier, url=u))
+            self.meta.trackers.append((tier, u))
+        if not self.paused:
+            self.trigger_tracker_announce()
+        return True
+
+    def add_peer_manual(self, host: str, port: int) -> None:
+        addr = (host.strip("[]"), int(port))
+        with self._lock:
+            self.known_peers[addr] = 0.0
+        if not self.paused:
+            self.connect_more_peers()
+
+    def set_file_wanted(self, file_idx: int, wanted: bool) -> None:
+        with self._lock:
+            if 0 <= file_idx < len(self.meta.files):
+                self.meta.files[file_idx].wanted = wanted
+                self._recompute_file_priorities_locked()
+
+    def set_file_priority(self, file_idx: int, priority: str) -> None:
+        with self._lock:
+            if 0 <= file_idx < len(self.meta.files) and priority in ("High", "Normal", "Low"):
+                self.meta.files[file_idx].priority = priority
+                self._recompute_file_priorities_locked()
+
+    def _recompute_file_priorities_locked(self) -> None:
+        np = self.meta.num_pieces
+        if np <= 0:
+            return
+        wanted_p = [False] * np
+        prio_p = [0] * np
+        pmap = {"Low": 0, "Normal": 1, "High": 2}
+        plen = max(1, self.meta.piece_length)
+
+        for entry in self.meta.files:
+            if not entry.wanted:
+                continue
+            p_start = entry.offset // plen
+            p_end = max(p_start, (max(entry.offset, entry.offset + entry.length - 1)) // plen)
+            ep = pmap.get(entry.priority, 1)
+            for pi in range(min(np, p_start), min(np, p_end + 1)):
+                wanted_p[pi] = True
+                if ep > prio_p[pi]:
+                    prio_p[pi] = ep
+        self.wanted_pieces = wanted_p
+        self.piece_priority = prio_p
+        self._recompute_verified_bytes_locked()
+
+    def _recompute_verified_bytes_locked(self) -> None:
+        if not self.meta.has_metadata:
+            return
+        total_v = 0
+        for f in self.meta.files:
+            f.completed_bytes = 0
+        for pi, ok in enumerate(self.have_pieces):
+            if not ok:
+                continue
+            psz = self.meta.piece_size(pi)
+            total_v += psz
+            for entry, _bo, _fo, slen in self.storage._piece_spans(pi, psz):
+                entry.completed_bytes += slen
+        self.verified_bytes = total_v
+
+    # ---- Bitfield & Piece Selection ----
+    def pack_bitfield(self) -> bytes:
+        with self._lock:
+            np = self.meta.num_pieces
+            if np <= 0:
+                return b""
+            out = bytearray(math.ceil(np / 8))
+            for i, has in enumerate(self.have_pieces):
+                if has:
+                    out[i >> 3] |= 0x80 >> (i & 7)
+            return bytes(out)
+
+    def peer_has_wanted_piece(self, peer_bf: list[bool]) -> bool:
+        with self._lock:
+            limit = min(len(peer_bf), self.meta.num_pieces)
+            for i in range(limit):
+                if peer_bf[i] and self.wanted_pieces[i] and not self.have_pieces[i]:
+                    return True
+            return False
+
+    def checkout_block_for_peer(
+        self, peer_bf: list[bool], peer_inflight: set[tuple[int, int, int]]
+    ) -> Optional[tuple[int, int, int]]:
+        now = time.monotonic()
+        with self._lock:
+            np = self.meta.num_pieces
+            limit = min(len(peer_bf), np)
+
+            # 1. Try active partial assemblies first so pieces finish rapidly
+            for p_idx, asm in list(self.active_assemblies.items()):
+                if p_idx < limit and peer_bf[p_idx] and not self.have_pieces[p_idx]:
+                    nxt = asm.next_requestable_block(now)
+                    if nxt is not None:
+                        _, begin, length = nxt
+                        cand = (p_idx, begin, length)
+                        if cand not in peer_inflight:
+                            return cand
+
+            # 2. Pick highest-priority, rarest missing piece available on this peer
+            candidates: list[tuple[int, int, int]] = []  # (-prio, rarity, piece_idx)
+            peers_vals = list(self.peers.values())
+            for i in range(limit):
+                if (
+                    peer_bf[i]
+                    and self.wanted_pieces[i]
+                    and not self.have_pieces[i]
+                    and i not in self.active_assemblies
+                ):
+                    rarity = sum(
+                        1 for p in peers_vals if i < len(p.peer_bitfield) and p.peer_bitfield[i]
+                    )
+                    candidates.append((-self.piece_priority[i], rarity, i))
+
+            if not candidates:
+                return None
+            candidates.sort()
+            # Slight randomness among top-tied pieces to spread swarm requests
+            top_tier = [c for c in candidates if c[:2] == candidates[0][:2]]
+            _, _, chosen_idx = random.choice(top_tier[:6])
+            asm = PieceAssembly(chosen_idx, self.meta.piece_size(chosen_idx))
+            self.active_assemblies[chosen_idx] = asm
+            nxt = asm.next_requestable_block(now)
+            if nxt is None:
+                return None
+            _, begin, length = nxt
+            return (chosen_idx, begin, length)
+
+    def release_peer_inflight(self, inflight: set[tuple[int, int, int]]) -> None:
+        with self._lock:
+            for p_idx, begin, _length in inflight:
+                asm = self.active_assemblies.get(p_idx)
+                if asm is not None:
+                    blk_i = begin // BLOCK_SIZE
+                    if 0 <= blk_i < asm.num_blocks and asm.states[blk_i] == 1:
+                        asm.states[blk_i] = 0
+                        asm.req_ts[blk_i] = 0.0
+
+    def on_block_received(self, piece_idx: int, begin: int, block: bytes) -> None:
+        self.down_meter.add(len(block))
+        self.engine.global_down_meter.add(len(block))
+        piece_data: Optional[bytes] = None
+        expected_hash: bytes = b""
+
+        with self._lock:
+            self.downloaded_session += len(block)
+            if piece_idx < 0 or piece_idx >= self.meta.num_pieces or self.have_pieces[piece_idx]:
+                return
+            asm = self.active_assemblies.get(piece_idx)
+            if asm is None:
+                asm = PieceAssembly(piece_idx, self.meta.piece_size(piece_idx))
+                self.active_assemblies[piece_idx] = asm
+            if asm.put_block(begin, block):
+                piece_data = bytes(asm.buf)
+                expected_hash = self.meta.pieces_hashes[piece_idx]
+                self.active_assemblies.pop(piece_idx, None)
+
+        if piece_data is None:
+            return
+
+        # Verify SHA-1 outside lock!
+        digest = hashlib.sha1(piece_data).digest()
+        if digest != expected_hash:
+            return
+
+        try:
+            self.storage.write_piece(piece_idx, piece_data)
+        except Exception as exc:
+            with self._lock:
+                self.error_msg = f"Disk write error: {exc}"
+            self.pause()
+            return
+
+        just_completed_all = False
+        peers_snapshot: list[PeerConnection] = []
+        with self._lock:
+            if not self.have_pieces[piece_idx]:
+                self.have_pieces[piece_idx] = True
+                psz = len(piece_data)
+                self.verified_bytes += psz
+                for entry, _bo, _fo, slen in self.storage._piece_spans(piece_idx, psz):
+                    entry.completed_bytes += slen
+                peers_snapshot = list(self.peers.values())
+                if self.is_wanted_complete() and not self._completed_announced:
+                    self._completed_announced = True
+                    just_completed_all = True
+
+        for p in peers_snapshot:
+            p.send_have(piece_idx)
+        if just_completed_all:
+            self.trigger_tracker_announce(event="completed")
+            self.engine.save_session_state()
+
+    def read_verified_block_for_upload(
+        self, piece_idx: int, begin: int, length: int, stop_ev: threading.Event
+    ) -> Optional[bytes]:
+        with self._lock:
+            if (
+                not self.meta.has_metadata
+                or piece_idx < 0
+                or piece_idx >= self.meta.num_pieces
+                or not self.have_pieces[piece_idx]
+            ):
+                return None
+        self.engine.up_bucket.throttle(length, stop_ev)
+        blk = self.storage.read_block(piece_idx, begin, length)
+        if blk is not None:
+            with self._lock:
+                self.uploaded_bytes += len(blk)
+            self.up_meter.add(len(blk))
+            self.engine.global_up_meter.add(len(blk))
+        return blk
+
+    # ---- BEP-9 Magnet Metadata Assembly ----
+    def init_metadata_assembly(self, total_size: int) -> None:
+        if total_size <= 0 or total_size > 8 * 1024 * 1024:
+            return
+        with self._lock:
+            if not self.meta.has_metadata and self._meta_total_size == 0:
+                self._meta_total_size = total_size
+
+    def checkout_metadata_piece(self) -> Optional[int]:
+        now = time.monotonic()
+        with self._lock:
+            if self.meta.has_metadata or self._meta_total_size <= 0:
+                return None
+            num = math.ceil(self._meta_total_size / METADATA_PIECE_SIZE)
+            for i in range(num):
+                if i not in self._meta_slices:
+                    last = self._meta_requested.get(i, 0.0)
+                    if now - last > 4.0:
+                        self._meta_requested[i] = now
+                        return i
+            return None
+
+    def put_metadata_piece(self, piece: int, data: bytes) -> bool:
+        with self._lock:
+            if self.meta.has_metadata or self._meta_total_size <= 0:
+                return True
+            self._meta_slices[piece] = data
+            num = math.ceil(self._meta_total_size / METADATA_PIECE_SIZE)
+            if len(self._meta_slices) < num:
+                return False
+            raw_info = b"".join(self._meta_slices[i] for i in range(num))
+
+        if hashlib.sha1(raw_info).digest() != self.meta.info_hash:
+            with self._lock:
+                self._meta_slices.clear()
+                self._meta_requested.clear()
+            return False
+
+        try:
+            info_dict, _ = bdecode_at(raw_info, 0)
+            if not isinstance(info_dict, dict):
+                return False
+            with self._lock:
+                populate_meta_from_info_dict(self.meta, info_dict, raw_info)
+                self.have_pieces = [False] * self.meta.num_pieces
+                self.wanted_pieces = [True] * self.meta.num_pieces
+                self.piece_priority = [1] * self.meta.num_pieces
+                self._recompute_file_priorities_locked()
+            self.engine.cache_torrent_metadata(self.meta)
+            self.engine.save_session_state()
+            return True
+        except Exception:
+            return False
+
+    # ---- Tracker & Peer Swarm Coordination ----
+    def trigger_tracker_announce(self, event: str = "") -> None:
+        with self._lock:
+            tr_list = list(self.trackers)
+            left = max(0, self.meta.total_size - self.verified_bytes)
+            up = self.uploaded_bytes
+            down = self.downloaded_session
+
+        for tr in tr_list:
+            def _ann(t: TrackerState = tr) -> None:
+                t.status = "Announcing..."
+                res = announce_tracker(
+                    url=t.url,
+                    info_hash=self.meta.info_hash,
+                    peer_id=self.engine.peer_id,
+                    listen_port=self.engine.listen_port,
+                    uploaded=up,
+                    downloaded=down,
+                    left=left,
+                    event=event,
+                )
+                now = time.time()
+                with self._lock:
+                    t.last_announce = now
+                    t.interval = res.interval
+                    t.next_announce = now + res.interval
+                    t.status = res.message
+                    if res.ok:
+                        t.seeders = res.seeders
+                        t.leechers = res.leechers
+                        for addr in res.peers:
+                            if addr not in self.known_peers and len(self.known_peers) < 400:
+                                self.known_peers[addr] = 0.0
+                if res.ok and not self.paused:
+                    self.connect_more_peers()
+
+            threading.Thread(target=_ann, name="TrackerAnnounce", daemon=True).start()
+
+    def connect_more_peers(self) -> None:
+        if self.is_stopped_or_paused() or self.verifying:
+            return
+        max_peers = int(self.engine.settings.get("max_peers_per_torrent", 40))
+        now = time.monotonic()
+        to_start: list[PeerConnection] = []
+        with self._lock:
+            if len(self.peers) >= max_peers:
+                return
+            for addr, last_try in list(self.known_peers.items()):
+                if len(self.peers) + len(to_start) >= max_peers:
+                    break
+                if addr in self.peers or now - last_try < 15.0:
+                    continue
+                self.known_peers[addr] = now
+                pc = PeerConnection(self, addr[0], addr[1], incoming=False)
+                self.peers[addr] = pc
+                to_start.append(pc)
+        for pc in to_start:
+            pc.start()
+
+    def accept_incoming_peer(
+        self, sock: socket.socket, addr: tuple[str, int], peer_id: bytes, reserved: bytes
+    ) -> None:
+        max_peers = int(self.engine.settings.get("max_peers_per_torrent", 40))
+        with self._lock:
+            if self.is_stopped_or_paused() or self.verifying or len(self.peers) >= max_peers:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                return
+            key = (addr[0], addr[1])
+            pc = PeerConnection(
+                self,
+                addr[0],
+                addr[1],
+                sock=sock,
+                incoming=True,
+                remote_peer_id=peer_id,
+                remote_reserved=reserved,
+            )
+            self.peers[key] = pc
+        pc.start()
+
+    def on_peer_disconnected(self, pc: PeerConnection) -> None:
+        with self._lock:
+            for k, v in list(self.peers.items()):
+                if v is pc:
+                    self.peers.pop(k, None)
+
+    def periodic_tick(self) -> None:
+        if self.is_stopped_or_paused() or self.verifying:
+            return
+        now = time.time()
+        due = [t for t in self.trackers if t.next_announce > 0 and now >= t.next_announce]
+        if due:
+            self.trigger_tracker_announce()
+        self.connect_more_peers()
+
+
+class TorrentEngine:
+    """Top-level pure-Python BitTorrent session & incoming peer TCP listener."""
+
+    def __init__(
+        self,
+        config_dir: Path = CONFIG_DIR,
+        listen_port: Optional[int] = None,
+        persist: bool = True,
+    ) -> None:
+        self.config_dir = Path(config_dir)
+        self.cache_dir = self.config_dir / "torrents"
+        self.settings_file = self.config_dir / "settings.json"
+        self.session_file = self.config_dir / "torrents.json"
+        self.persist = persist
+
+        rand_tail = "".join(
+            random.choices("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", k=12)
+        ).encode("ascii")
+        self.peer_id: bytes = b"-DD0100-" + rand_tail
+        self.settings: dict[str, Any] = dict(DEFAULT_SETTINGS)
+        if self.persist:
+            self._load_settings()
+        if listen_port is not None:
+            self.settings["listen_port"] = int(listen_port)
+
+        self.listen_port: int = int(self.settings["listen_port"])
+        self.port_open: bool = False
+
+        self.down_bucket = TokenBucket(0)
+        self.up_bucket = TokenBucket(0)
+        self.global_down_meter = RateMeter()
+        self.global_up_meter = RateMeter()
+        self._apply_speed_limits()
+
+        self._lock = threading.RLock()
+        self.transfers: collections.OrderedDict[str, TorrentTransfer] = collections.OrderedDict()
+        self._stop_event = threading.Event()
+        self._server_sock: Optional[socket.socket] = None
+
+        self._start_listener()
+        self._sched_thread = threading.Thread(
+            target=self._scheduler_loop, name="EngineScheduler", daemon=True
+        )
+        self._sched_thread.start()
+
+        if self.persist:
+            self._load_session_state()
+
+    # ---- Settings & Persistence ----
+    def _load_settings(self) -> None:
+        try:
+            if self.settings_file.is_file():
+                loaded = json.loads(self.settings_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    self.settings.update(loaded)
+        except Exception:
+            pass
+
+    def save_settings(self) -> None:
+        self._apply_speed_limits()
+        if not self.persist:
+            return
+        try:
+            self.config_dir.mkdir(parents=True, exist_ok=True)
+            self.settings_file.write_text(
+                json.dumps(self.settings, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+    def _apply_speed_limits(self) -> None:
+        if self.settings.get("alt_speed_enabled"):
+            dk = int(self.settings.get("alt_speed_down_kbps", 250))
+            uk = int(self.settings.get("alt_speed_up_kbps", 100))
+        else:
+            dk = (
+                int(self.settings.get("speed_limit_down_kbps", 2048))
+                if self.settings.get("speed_limit_down_enabled")
+                else 0
+            )
+            uk = (
+                int(self.settings.get("speed_limit_up_kbps", 512))
+                if self.settings.get("speed_limit_up_enabled")
+                else 0
+            )
+        self.down_bucket.set_rate_kbps(dk)
+        self.up_bucket.set_rate_kbps(uk)
+
+    def cache_torrent_metadata(self, meta: TorrentMeta) -> Optional[Path]:
+        if not self.persist or not meta.has_metadata or not meta.raw_info_bytes:
+            return None
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            info_obj, _ = bdecode_at(meta.raw_info_bytes, 0)
+            root: dict[bytes, Any] = {b"info": info_obj}
+            if meta.trackers:
+                root[b"announce"] = meta.trackers[0][1].encode("utf-8")
+                root[b"announce-list"] = [[u.encode("utf-8")] for _, u in meta.trackers]
+            p = self.cache_dir / f"{meta.info_hash_hex}.torrent"
+            p.write_bytes(bencode(root))
+            return p
+        except Exception:
+            return None
+
+    def save_session_state(self) -> None:
+        if not self.persist:
+            return
+        try:
+            self.config_dir.mkdir(parents=True, exist_ok=True)
+            items = []
+            with self._lock:
+                for ih, tr in self.transfers.items():
+                    items.append(
+                        {
+                            "info_hash": ih,
+                            "name": tr.meta.name,
+                            "magnet": tr.meta.to_magnet_uri(),
+                            "download_dir": str(tr.download_dir),
+                            "paused": tr.paused,
+                            "uploaded_bytes": tr.uploaded_bytes,
+                            "added_ts": tr.added_ts,
+                            "have_hex": tr.pack_bitfield().hex(),
+                            "files_prefs": [
+                                {"wanted": f.wanted, "priority": f.priority}
+                                for f in tr.meta.files
+                            ],
+                        }
+                    )
+            self.session_file.write_text(json.dumps(items, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _load_session_state(self) -> None:
+        if not self.session_file.is_file():
+            return
+        try:
+            items = json.loads(self.session_file.read_text(encoding="utf-8"))
+            if not isinstance(items, list):
+                return
+            for entry in items:
+                ih = str(entry.get("info_hash", ""))
+                cached_t = self.cache_dir / f"{ih}.torrent"
+                if cached_t.is_file():
+                    meta = parse_torrent_file(cached_t)
+                else:
+                    meta = parse_magnet_uri(entry["magnet"])
+                dl_dir = Path(entry.get("download_dir") or self.settings["download_dir"])
+                paused = bool(entry.get("paused", False))
+                tr = TorrentTransfer(
+                    self,
+                    meta,
+                    dl_dir,
+                    paused=True,
+                    uploaded_bytes=int(entry.get("uploaded_bytes", 0)),
+                    added_ts=float(entry.get("added_ts", time.time())),
+                )
+                fprefs = entry.get("files_prefs", [])
+                for idx, fp in enumerate(fprefs):
+                    if idx < len(tr.meta.files) and isinstance(fp, dict):
+                        tr.meta.files[idx].wanted = bool(fp.get("wanted", True))
+                        tr.meta.files[idx].priority = str(fp.get("priority", "Normal"))
+                if tr.meta.has_metadata:
+                    have_hex = entry.get("have_hex", "")
+                    if have_hex:
+                        bf = bytes.fromhex(have_hex)
+                        for pi in range(tr.meta.num_pieces):
+                            if (pi >> 3) < len(bf) and (bf[pi >> 3] & (0x80 >> (pi & 7))):
+                                tr.have_pieces[pi] = True
+                    tr._recompute_file_priorities_locked()
+                with self._lock:
+                    self.transfers[meta.info_hash_hex] = tr
+                if not paused:
+                    tr.start()
+        except Exception:
+            pass
+
+    # ---- TCP Incoming Listener ----
+    def _start_listener(self, new_port: Optional[int] = None) -> None:
+        if self._server_sock is not None:
+            try:
+                self._server_sock.close()
+            except Exception:
+                pass
+            self._server_sock = None
+            self.port_open = False
+
+        desired = new_port if new_port is not None else int(self.settings["listen_port"])
+        ports_to_try = [desired] if desired == 0 else [desired, 0]
+        for p in ports_to_try:
+            try:
+                srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                srv.bind(("0.0.0.0", p))
+                srv.listen(32)
+                srv.settimeout(1.0)
+                self._server_sock = srv
+                self.listen_port = srv.getsockname()[1]
+                self.port_open = True
+                threading.Thread(
+                    target=self._accept_loop,
+                    args=(srv,),
+                    name="BTListener",
+                    daemon=True,
+                ).start()
+                break
+            except Exception:
+                continue
+
+    def rebind_port(self, port: int) -> None:
+        self.settings["listen_port"] = int(port)
+        self._start_listener(int(port))
+        self.save_settings()
+
+    def _accept_loop(self, srv: socket.socket) -> None:
+        while not self._stop_event.is_set() and srv is self._server_sock:
+            try:
+                conn, addr = srv.accept()
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+            threading.Thread(
+                target=self._handshake_incoming,
+                args=(conn, addr),
+                name="BTIncomingHS",
+                daemon=True,
+            ).start()
+
+    def _handshake_incoming(self, conn: socket.socket, addr: tuple[str, int]) -> None:
+        try:
+            conn.settimeout(5.0)
+            hdr = bytearray()
+            while len(hdr) < 48:
+                ch = conn.recv(48 - len(hdr))
+                if not ch:
+                    conn.close()
+                    return
+                hdr.extend(ch)
+            if hdr[0] != 19 or hdr[1:20] != b"BitTorrent protocol":
+                conn.close()
+                return
+            remote_reserved = bytes(hdr[20:28])
+            info_hash = bytes(hdr[28:48])
+            with self._lock:
+                tr = self.transfers.get(info_hash.hex())
+            if tr is None or tr.is_stopped_or_paused():
+                conn.close()
+                return
+
+            our_res = bytearray(8)
+            our_res[5] |= 0x10
+            reply_hs = (
+                bytes([19])
+                + b"BitTorrent protocol"
+                + bytes(our_res)
+                + info_hash
+                + self.peer_id
+            )
+            conn.sendall(reply_hs)
+
+            pid_buf = bytearray()
+            while len(pid_buf) < 20:
+                ch = conn.recv(20 - len(pid_buf))
+                if not ch:
+                    conn.close()
+                    return
+                pid_buf.extend(ch)
+            tr.accept_incoming_peer(conn, addr, bytes(pid_buf), remote_reserved)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _scheduler_loop(self) -> None:
+        ticks = 0
+        while not self._stop_event.is_set():
+            self._stop_event.wait(2.5)
+            if self._stop_event.is_set():
+                break
+            ticks += 1
+            with self._lock:
+                trs = list(self.transfers.values())
+            for tr in trs:
+                tr.periodic_tick()
+            if ticks % 12 == 0:
+                self.save_session_state()
+
+    # ---- High-Level Torrent Management ----
+    def add_meta(
+        self,
+        meta: TorrentMeta,
+        download_dir: Optional[Path] = None,
+        start_immediately: Optional[bool] = None,
+    ) -> TorrentTransfer:
+        with self._lock:
+            existing = self.transfers.get(meta.info_hash_hex)
+            if existing is not None:
+                for tier, u in meta.trackers:
+                    existing.add_tracker(u)
+                for h, p in meta.peer_hints:
+                    existing.add_peer_manual(h, p)
+                return existing
+
+            dl_dir = Path(download_dir or self.settings["download_dir"])
+            auto = (
+                bool(self.settings.get("auto_start", True))
+                if start_immediately is None
+                else start_immediately
+            )
+            tr = TorrentTransfer(self, meta, dl_dir, paused=not auto)
+            self.transfers[meta.info_hash_hex] = tr
+
+        self.cache_torrent_metadata(meta)
+        self.save_session_state()
+        if auto:
+            tr.start()
+        return tr
+
+    def add_torrent_file(
+        self, path: Path | str, download_dir: Optional[Path] = None
+    ) -> TorrentTransfer:
+        meta = parse_torrent_file(path)
+        return self.add_meta(meta, download_dir=download_dir)
+
+    def add_magnet_or_url(
+        self, target: str, download_dir: Optional[Path] = None
+    ) -> TorrentTransfer:
+        s = target.strip()
+        if s.lower().startswith("magnet:?"):
+            meta = parse_magnet_uri(s)
+            return self.add_meta(meta, download_dir=download_dir)
+        if s.lower().startswith(("http://", "https://")):
+            req = urllib.request.Request(s, headers={"User-Agent": HTTP_UA})
+            with urllib.request.urlopen(req, timeout=12.0) as resp:
+                raw = resp.read(10 * 1024 * 1024)
+            meta = parse_torrent_bytes(raw)
+            return self.add_meta(meta, download_dir=download_dir)
+        if s.startswith("file://"):
+            p = Path(urllib.parse.unquote(urllib.parse.urlparse(s).path))
+            return self.add_torrent_file(p, download_dir=download_dir)
+        return self.add_torrent_file(Path(s), download_dir=download_dir)
+
+    def remove_transfer(self, info_hash_hex: str, delete_data: bool = False) -> None:
+        with self._lock:
+            tr = self.transfers.pop(info_hash_hex, None)
+        if tr is None:
+            return
+        tr.shutdown()
+        if delete_data:
+            tr.storage.delete_data()
+        if self.persist:
+            cached = self.cache_dir / f"{info_hash_hex}.torrent"
+            cached.unlink(missing_ok=True)
+            self.save_session_state()
+
+    def shutdown(self) -> None:
+        self._stop_event.set()
+        if self._server_sock is not None:
+            try:
+                self._server_sock.close()
+            except Exception:
+                pass
+        with self._lock:
+            trs = list(self.transfers.values())
+        for tr in trs:
+            tr.shutdown()
+        self.save_session_state()
+
+
+# ---------------------------------------------------------------------------
+# Custom Cairo Widgets: 3-Line Transmission List, 2D Piece Map, Sparkline
+# ---------------------------------------------------------------------------
+def _draw_motif_bevel(
+    cr: cairo.Context,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    sunken: bool = True,
+    thickness: float = 1.5,
+) -> None:
+    top_col = (0.30, 0.32, 0.38) if sunken else (0.93, 0.95, 0.98)
+    bot_col = (0.93, 0.95, 0.98) if sunken else (0.30, 0.32, 0.38)
+    cr.save()
+    cr.set_line_width(thickness)
+    cr.set_source_rgb(*top_col)
+    cr.move_to(x + 0.5, y + h - 0.5)
+    cr.line_to(x + 0.5, y + 0.5)
+    cr.line_to(x + w - 0.5, y + 0.5)
+    cr.stroke()
+
+    cr.set_source_rgb(*bot_col)
+    cr.move_to(x + 0.5, y + h - 0.5)
+    cr.line_to(x + w - 0.5, y + h - 0.5)
+    cr.line_to(x + w - 0.5, y + 0.5)
+    cr.stroke()
+    cr.restore()
+
+
+def _state_bar_rgb(state: str) -> tuple[float, float, float]:
+    if state == TorrentTransfer.STATE_DOWNLOADING:
+        return (0.14, 0.39, 0.74)  # Royal Blue
+    if state in (TorrentTransfer.STATE_SEEDING, TorrentTransfer.STATE_FINISHED):
+        return (0.14, 0.56, 0.32)  # Emerald Green
+    if state in (TorrentTransfer.STATE_VERIFYING, TorrentTransfer.STATE_METADATA):
+        return (0.83, 0.53, 0.09)  # Warm Amber
+    if state == TorrentTransfer.STATE_ERROR:
+        return (0.73, 0.18, 0.18)  # Crimson Red
+    return (0.47, 0.50, 0.58)  # Slate Grey (Paused)
+
+
+class TorrentListCanvas(Gtk.DrawingArea):
+    """Transmission-style 3-line (or Compact 1-line) transfer cards in Motif greenbar well."""
+
+    CARD_H = 68
+    COMPACT_H = 30
+
+    def __init__(
+        self,
+        palette: tuple[str, str, str, str],
+        on_selection_changed: Callable[[], None],
+        on_activate_row: Callable[[], None],
+        on_context_menu: Callable[[Gdk.EventButton], None],
+    ) -> None:
+        super().__init__()
+        self.chrome_hex, self.sel_hex, self.well_hex, self.well_alt_hex = palette
+        self.on_selection_changed = on_selection_changed
+        self.on_activate_row = on_activate_row
+        self.on_context_menu = on_context_menu
+
+        self.items: list[TorrentTransfer] = []
+        self.selected_hashes: set[str] = set()
+        self.anchor_index: int = -1
+        self.compact_view: bool = False
+
+        self.set_can_focus(True)
+        self.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.KEY_PRESS_MASK
+            | Gdk.EventMask.SCROLL_MASK
+        )
+        self.connect("draw", self._on_draw)
+        self.connect("button-press-event", self._on_button_press)
+        self.connect("key-press-event", self._on_key_press)
+
+    def row_height(self) -> int:
+        return self.COMPACT_H if self.compact_view else self.CARD_H
+
+    def set_items(self, items: list[TorrentTransfer], compact: bool) -> None:
+        self.items = items
+        self.compact_view = compact
+        valid_ids = {t.meta.info_hash_hex for t in items}
+        before = set(self.selected_hashes)
+        self.selected_hashes &= valid_ids
+        if not self.selected_hashes and items:
+            self.selected_hashes.add(items[0].meta.info_hash_hex)
+        if self.selected_hashes != before:
+            self.on_selection_changed()
+        total_h = max(180, len(items) * self.row_height() + 4)
+        self.set_size_request(-1, total_h)
+        self.queue_draw()
+
+    def select_all(self) -> None:
+        self.selected_hashes = {t.meta.info_hash_hex for t in self.items}
+        self.on_selection_changed()
+        self.queue_draw()
+
+    def clear_selection(self) -> None:
+        self.selected_hashes.clear()
+        self.on_selection_changed()
+        self.queue_draw()
+
+    def primary_selected(self) -> Optional[TorrentTransfer]:
+        for t in self.items:
+            if t.meta.info_hash_hex in self.selected_hashes:
+                return t
+        return None
+
+    def selected_transfers(self) -> list[TorrentTransfer]:
+        return [t for t in self.items if t.meta.info_hash_hex in self.selected_hashes]
+
+    def _on_button_press(self, _w: Gtk.Widget, ev: Gdk.EventButton) -> bool:
+        self.grab_focus()
+        rh = self.row_height()
+        idx = int(ev.y // rh)
+        if 0 <= idx < len(self.items):
+            ih = self.items[idx].meta.info_hash_hex
+            ctrl = bool(ev.state & Gdk.ModifierType.CONTROL_MASK)
+            shift = bool(ev.state & Gdk.ModifierType.SHIFT_MASK)
+
+            if ev.button == 3:
+                if ih not in self.selected_hashes:
+                    self.selected_hashes = {ih}
+                    self.anchor_index = idx
+                    self.on_selection_changed()
+                    self.queue_draw()
+                self.on_context_menu(ev)
+                return True
+
+            if ev.button == 1:
+                if ev.type == Gdk.EventType._2BUTTON_PRESS:
+                    self.on_activate_row()
+                    return True
+                if shift and 0 <= self.anchor_index < len(self.items):
+                    lo, hi = sorted((self.anchor_index, idx))
+                    self.selected_hashes = {
+                        self.items[i].meta.info_hash_hex for i in range(lo, hi + 1)
+                    }
+                elif ctrl:
+                    if ih in self.selected_hashes:
+                        self.selected_hashes.discard(ih)
+                    else:
+                        self.selected_hashes.add(ih)
+                    self.anchor_index = idx
+                else:
+                    self.selected_hashes = {ih}
+                    self.anchor_index = idx
+                self.on_selection_changed()
+                self.queue_draw()
+                return True
+        else:
+            if ev.button == 1:
+                self.clear_selection()
+        return False
+
+    def _on_key_press(self, _w: Gtk.Widget, ev: Gdk.EventKey) -> bool:
+        if not self.items:
+            return False
+        cur_idx = 0
+        for i, t in enumerate(self.items):
+            if t.meta.info_hash_hex in self.selected_hashes:
+                cur_idx = i
+                break
+        if ev.keyval in (Gdk.KEY_Down, Gdk.KEY_Up):
+            nxt = cur_idx + (1 if ev.keyval == Gdk.KEY_Down else -1)
+            nxt = max(0, min(len(self.items) - 1, nxt))
+            self.selected_hashes = {self.items[nxt].meta.info_hash_hex}
+            self.anchor_index = nxt
+            self.on_selection_changed()
+            self.queue_draw()
+            return True
+        if ev.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self.on_activate_row()
+            return True
+        return False
+
+    def render_to_context(self, cr: cairo.Context, width: int, height: int) -> None:
+        self.draw_transfer_list(
+            cr=cr,
+            width=width,
+            height=height,
+            items=self.items,
+            selected_hashes=self.selected_hashes,
+            palette=(self.chrome_hex, self.sel_hex, self.well_hex, self.well_alt_hex),
+            compact_view=self.compact_view,
+        )
+
+    @classmethod
+    def draw_transfer_list(
+        cls,
+        cr: cairo.Context,
+        width: int,
+        height: int,
+        items: list[TorrentTransfer],
+        selected_hashes: set[str],
+        palette: tuple[str, str, str, str],
+        compact_view: bool = False,
+    ) -> None:
+        _chrome_hex, sel_hex, well_hex, well_alt_hex = palette
+        well_rgb = _hex_to_rgb(well_hex)
+        alt_rgb = _hex_to_rgb(well_alt_hex)
+        sel_rgb = _hex_to_rgb(sel_hex)
+
+        cr.set_source_rgb(*well_rgb)
+        cr.rectangle(0, 0, width, height)
+        cr.fill()
+
+        if not items:
+            layout = PangoCairo.create_layout(cr)
+            layout.set_width(max(100, width - 40) * Pango.SCALE)
+            layout.set_alignment(Pango.Alignment.CENTER)
+            layout.set_markup(
+                "<span size='11000' weight='bold' foreground='#3d4352'>"
+                "No Active Transfers in Current View</span>\n"
+                "<span size='9200' foreground='#596073'>"
+                "Click <b>[📂 Open]</b>, paste a <b>[🔗 Magnet]</b> URI, build a torrent with "
+                "<b>[✚ Create]</b>,\nor drag-and-drop a <b>.torrent</b> file directly onto this window."
+                "</span>"
+            )
+            _ink, log = layout.get_pixel_extents()
+            cr.move_to(20, max(24, (height - log.height) / 2))
+            PangoCairo.show_layout(cr, layout)
+            return
+
+        rh = cls.COMPACT_H if compact_view else cls.CARD_H
+        for idx, tr in enumerate(items):
+            y0 = idx * rh
+            if y0 > height:
+                break
+            is_sel = tr.meta.info_hash_hex in selected_hashes
+            if is_sel:
+                cr.set_source_rgb(
+                    well_rgb[0] * 0.72 + sel_rgb[0] * 0.28,
+                    well_rgb[1] * 0.72 + sel_rgb[1] * 0.28,
+                    well_rgb[2] * 0.72 + sel_rgb[2] * 0.28,
+                )
+            else:
+                cr.set_source_rgb(*(well_rgb if idx % 2 == 0 else alt_rgb))
+            cr.rectangle(0, y0, width, rh)
+            cr.fill()
+
+            cr.set_source_rgb(0.76, 0.78, 0.82)
+            cr.set_line_width(1.0)
+            cr.move_to(0, y0 + rh - 0.5)
+            cr.line_to(width, y0 + rh - 0.5)
+            cr.stroke()
+
+            if is_sel:
+                cr.set_source_rgb(*sel_rgb)
+                cr.rectangle(0, y0, 4, rh - 1)
+                cr.fill()
+                cr.set_line_width(1.0)
+                cr.rectangle(0.5, y0 + 0.5, width - 1.0, rh - 1.5)
+                cr.stroke()
+
+            if compact_view:
+                cls._draw_compact_row(cr, tr, y0, width, rh)
+            else:
+                cls._draw_card_row(cr, tr, y0, width, rh)
+
+    @staticmethod
+    def _status_line_text(tr: TorrentTransfer) -> str:
+        st = tr.state
+        n_conn = len(tr.peers)
+        n_known = max(n_conn, len(tr.known_peers))
+        dr = tr.down_rate
+        ur = tr.up_rate
+        if st == TorrentTransfer.STATE_ERROR:
+            return tr.error_msg or "Tracker or storage error"
+        if st == TorrentTransfer.STATE_VERIFYING:
+            return f"Verifying local data — {tr.progress * 100.0:.1f}% checked"
+        if st == TorrentTransfer.STATE_METADATA:
+            return (
+                f"Magnet transfer — fetching metadata from {n_conn} of {n_known} peers "
+                f"({tr.progress * 100.0:.0f}%)"
+            )
+        if st == TorrentTransfer.STATE_DOWNLOADING:
+            active_dl = sum(1 for p in tr.peers.values() if not p.peer_choking and p.am_interested)
+            return (
+                f"Downloading from {active_dl} of {n_conn} connected peers "
+                f"({n_known} swarm) — ▼ {fmt_rate(dr)}   ▲ {fmt_rate(ur)}"
+            )
+        if st == TorrentTransfer.STATE_SEEDING:
+            active_up = sum(1 for p in tr.peers.values() if p.peer_interested)
+            return (
+                f"Seeding to {active_up} of {n_conn} connected peers — "
+                f"▲ {fmt_rate(ur)}   (Uploaded {fmt_bytes(tr.uploaded_bytes)})"
+            )
+        if st == TorrentTransfer.STATE_FINISHED:
+            return f"Finished (100%) — Ratio {tr.ratio:.2f}"
+        return f"Paused — {tr.progress * 100.0:.1f}% complete"
+
+    @classmethod
+    def _draw_card_row(
+        cls, cr: cairo.Context, tr: TorrentTransfer, y0: float, width: int, rh: int
+    ) -> None:
+        pad_x = 12
+        pct = tr.progress * 100.0
+        st = tr.state
+
+        # Right-side Line 1: Size & Ratio
+        size_str = fmt_bytes(tr.meta.total_size) if tr.meta.has_metadata else "Metadata pending"
+        right_top = f"{size_str}  •  Ratio {tr.ratio:.2f}"
+        rt_layout = PangoCairo.create_layout(cr)
+        rt_layout.set_font_description(Pango.FontDescription("DejaVu Sans Mono 8.5"))
+        rt_layout.set_text(right_top, -1)
+        _, rt_ext = rt_layout.get_pixel_extents()
+        cr.set_source_rgb(0.24, 0.27, 0.34)
+        cr.move_to(max(pad_x + 120, width - pad_x - rt_ext.width), y0 + 7)
+        PangoCairo.show_layout(cr, rt_layout)
+
+        # Left Line 1: Bold Torrent Name
+        name_w = max(80, width - pad_x * 2 - rt_ext.width - 14)
+        nm_layout = PangoCairo.create_layout(cr)
+        nm_layout.set_font_description(Pango.FontDescription("DejaVu Sans Bold 9.5"))
+        nm_layout.set_width(name_w * Pango.SCALE)
+        nm_layout.set_ellipsize(Pango.EllipsizeMode.END)
+        nm_layout.set_text(tr.meta.name, -1)
+        cr.set_source_rgb(0.06, 0.08, 0.11)
+        cr.move_to(pad_x, y0 + 6)
+        PangoCairo.show_layout(cr, nm_layout)
+
+        # Line 2: Peer & Speed Status
+        st_layout = PangoCairo.create_layout(cr)
+        st_layout.set_font_description(Pango.FontDescription("DejaVu Sans 8.5"))
+        st_layout.set_width(max(80, width - pad_x * 2) * Pango.SCALE)
+        st_layout.set_ellipsize(Pango.EllipsizeMode.END)
+        st_layout.set_text(cls._status_line_text(tr), -1)
+        if st == TorrentTransfer.STATE_ERROR:
+            cr.set_source_rgb(0.68, 0.12, 0.12)
+        else:
+            cr.set_source_rgb(0.25, 0.28, 0.35)
+        cr.move_to(pad_x, y0 + 25)
+        PangoCairo.show_layout(cr, st_layout)
+
+        # Line 3 Right: % + ETA
+        eta = tr.eta_seconds
+        eta_part = f"  •  {fmt_eta(eta)}" if st == TorrentTransfer.STATE_DOWNLOADING else f"  •  {st}"
+        pct_text = f"{pct:5.1f}%{eta_part}"
+        pc_layout = PangoCairo.create_layout(cr)
+        pc_layout.set_font_description(Pango.FontDescription("DejaVu Sans Mono 8"))
+        pc_layout.set_text(pct_text, -1)
+        _, pc_ext = pc_layout.get_pixel_extents()
+        right_col_w = max(145, pc_ext.width + 8)
+        cr.set_source_rgb(0.18, 0.20, 0.26)
+        cr.move_to(width - pad_x - pc_ext.width, y0 + 45)
+        PangoCairo.show_layout(cr, pc_layout)
+
+        # Line 3 Left: Chiseled 3D Motif Progress Bar
+        bx = float(pad_x)
+        by = float(y0 + 45)
+        bw = float(max(60, width - pad_x * 2 - right_col_w - 6))
+        bh = 14.0
+
+        # Sunken trough
+        cr.set_source_rgb(0.84, 0.83, 0.79)
+        cr.rectangle(bx, by, bw, bh)
+        cr.fill()
+        _draw_motif_bevel(cr, bx, by, bw, bh, sunken=True, thickness=1.5)
+
+        fill_frac = max(0.0, min(1.0, tr.progress))
+        if st == TorrentTransfer.STATE_METADATA and fill_frac < 0.06:
+            fill_frac = 0.08
+        fw = (bw - 4.0) * fill_frac
+        if fw >= 2.0:
+            bar_rgb = _state_bar_rgb(st)
+            cr.set_source_rgb(*bar_rgb)
+            cr.rectangle(bx + 2.0, by + 2.0, fw, bh - 4.0)
+            cr.fill()
+            # Top glossy Motif highlight strip inside progress bar
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.32)
+            cr.rectangle(bx + 2.0, by + 2.0, fw, 2.5)
+            cr.fill()
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.28)
+            cr.rectangle(bx + 2.0, by + bh - 4.0, fw, 2.0)
+            cr.fill()
+
+    @staticmethod
+    def _draw_compact_row(
+        cr: cairo.Context, tr: TorrentTransfer, y0: float, width: int, rh: int
+    ) -> None:
+        pad_x = 10
+        st = tr.state
+        pct = tr.progress * 100.0
+
+        # Status dot
+        cr.set_source_rgb(*_state_bar_rgb(st))
+        cr.arc(pad_x + 5, y0 + rh / 2, 4.5, 0, math.tau)
+        cr.fill()
+
+        # Right metrics
+        metrics = f"▼ {fmt_rate(tr.down_rate)}  ▲ {fmt_rate(tr.up_rate)}  {pct:5.1f}%"
+        m_layout = PangoCairo.create_layout(cr)
+        m_layout.set_font_description(Pango.FontDescription("DejaVu Sans Mono 8"))
+        m_layout.set_text(metrics, -1)
+        _, m_ext = m_layout.get_pixel_extents()
+        cr.set_source_rgb(0.18, 0.20, 0.26)
+        cr.move_to(width - pad_x - m_ext.width, y0 + 7)
+        PangoCairo.show_layout(cr, m_layout)
+
+        # Mini Motif bar before metrics
+        bw = 96.0
+        bx = float(width - pad_x - m_ext.width - bw - 12)
+        by = float(y0 + 9)
+        bh = 12.0
+        if bx > 180:
+            cr.set_source_rgb(0.84, 0.83, 0.79)
+            cr.rectangle(bx, by, bw, bh)
+            cr.fill()
+            _draw_motif_bevel(cr, bx, by, bw, bh, sunken=True, thickness=1.0)
+            fw = (bw - 2.0) * max(0.0, min(1.0, tr.progress))
+            if fw >= 1.5:
+                cr.set_source_rgb(*_state_bar_rgb(st))
+                cr.rectangle(bx + 1.0, by + 1.0, fw, bh - 2.0)
+                cr.fill()
+
+        # Name
+        nm_w = max(60, int(bx - pad_x - 24))
+        nm_layout = PangoCairo.create_layout(cr)
+        nm_layout.set_font_description(Pango.FontDescription("DejaVu Sans Bold 8.8"))
+        nm_layout.set_width(nm_w * Pango.SCALE)
+        nm_layout.set_ellipsize(Pango.EllipsizeMode.END)
+        nm_layout.set_text(tr.meta.name, -1)
+        cr.set_source_rgb(0.06, 0.08, 0.11)
+        cr.move_to(pad_x + 16, y0 + 6)
+        PangoCairo.show_layout(cr, nm_layout)
+
+    def _on_draw(self, widget: Gtk.Widget, cr: cairo.Context) -> bool:
+        alloc = widget.get_allocation()
+        self.render_to_context(cr, alloc.width, alloc.height)
+        return True
+
+
+class PieceMapCanvas(Gtk.DrawingArea):
+    """Live 2D Cairo piece-map grid for the 5th Inspector tab."""
+
+    def __init__(self, well_hex: str) -> None:
+        super().__init__()
+        self.well_hex = well_hex
+        self.transfer: Optional[TorrentTransfer] = None
+        self.set_size_request(280, 180)
+        self.connect("draw", self._on_draw)
+
+    def set_transfer(self, tr: Optional[TorrentTransfer]) -> None:
+        self.transfer = tr
+        self.queue_draw()
+
+    def render_to_context(self, cr: cairo.Context, width: int, height: int) -> None:
+        self.draw_piece_map(cr, width, height, self.transfer, self.well_hex)
+
+    @staticmethod
+    def draw_piece_map(
+        cr: cairo.Context,
+        width: int,
+        height: int,
+        tr: Optional[TorrentTransfer],
+        well_hex: str,
+    ) -> None:
+        well_rgb = _hex_to_rgb(well_hex)
+        cr.set_source_rgb(*well_rgb)
+        cr.rectangle(0, 0, width, height)
+        cr.fill()
+        if tr is None or not tr.meta.has_metadata or tr.meta.num_pieces == 0:
+            layout = PangoCairo.create_layout(cr)
+            layout.set_font_description(Pango.FontDescription("DejaVu Sans 9"))
+            msg = (
+                "Select a transfer to inspect its 2D piece map."
+                if tr is None
+                else "Waiting for magnet metadata to map pieces..."
+            )
+            layout.set_text(msg, -1)
+            cr.set_source_rgb(0.32, 0.35, 0.42)
+            cr.move_to(12, 14)
+            PangoCairo.show_layout(cr, layout)
+            return
+
+        np = tr.meta.num_pieces
+        have = list(tr.have_pieces)
+        active_set = set(tr.active_assemblies.keys())
+        wanted = list(tr.wanted_pieces)
+        done_cnt = sum(1 for x in have if x)
+
+        # Header legend
+        hdr = (
+            f"Pieces: {done_cnt}/{np} × {fmt_bytes(tr.meta.piece_length)}   "
+            f"[■ Emerald: Verified   ■ Cyan: In-Flight   □ Cream: Missing]"
+        )
+        h_layout = PangoCairo.create_layout(cr)
+        h_layout.set_font_description(Pango.FontDescription("DejaVu Sans Mono 8"))
+        h_layout.set_width(max(80, width - 16) * Pango.SCALE)
+        h_layout.set_ellipsize(Pango.EllipsizeMode.END)
+        h_layout.set_text(hdr, -1)
+        cr.set_source_rgb(0.12, 0.14, 0.18)
+        cr.move_to(8, 6)
+        PangoCairo.show_layout(cr, h_layout)
+
+        gx, gy = 8.0, 26.0
+        gw = max(40.0, width - 16.0)
+        gh = max(40.0, height - 34.0)
+
+        cr.set_source_rgb(0.86, 0.84, 0.79)
+        cr.rectangle(gx, gy, gw, gh)
+        cr.fill()
+        _draw_motif_bevel(cr, gx, gy, gw, gh, sunken=True, thickness=1.5)
+
+        ix, iy, iw, ih = gx + 3.0, gy + 3.0, gw - 6.0, gh - 6.0
+        max_cells = min(np, 1200)
+        aspect = max(1.0, iw / max(1.0, ih))
+        cols = max(1, int(math.ceil(math.sqrt(max_cells * aspect))))
+        rows = max(1, int(math.ceil(max_cells / cols)))
+        total_cells = min(np, cols * rows)
+
+        cell_w = iw / cols
+        cell_h = ih / rows
+        pad = 1.0 if min(cell_w, cell_h) >= 5.0 else 0.0
+
+        for c_idx in range(total_cells):
+            p_start = int(c_idx * np / total_cells)
+            p_end = max(p_start + 1, int((c_idx + 1) * np / total_cells))
+            r = c_idx // cols
+            c = c_idx % cols
+            cx = ix + c * cell_w + pad
+            cy = iy + r * cell_h + pad
+            cw = max(1.0, cell_w - pad * 2)
+            ch = max(1.0, cell_h - pad * 2)
+
+            any_active = any(pi in active_set for pi in range(p_start, min(np, p_end)))
+            all_have = all(have[pi] for pi in range(p_start, min(np, p_end)))
+            some_have = any(have[pi] for pi in range(p_start, min(np, p_end)))
+            any_wanted = any(wanted[pi] for pi in range(p_start, min(np, p_end)))
+
+            if all_have:
+                cr.set_source_rgb(0.14, 0.58, 0.33)  # Emerald verified
+            elif any_active:
+                cr.set_source_rgb(0.12, 0.62, 0.78)  # Cyan active/in-flight
+            elif some_have:
+                cr.set_source_rgb(0.42, 0.74, 0.52)  # Partial bucket
+            elif not any_wanted:
+                cr.set_source_rgb(0.68, 0.70, 0.75)  # Skipped/unwanted
+            else:
+                cr.set_source_rgb(0.95, 0.92, 0.85)  # Missing sunken cream
+            cr.rectangle(cx, cy, cw, ch)
+            cr.fill()
+
+    def _on_draw(self, widget: Gtk.Widget, cr: cairo.Context) -> bool:
+        alloc = widget.get_allocation()
+        self.render_to_context(cr, alloc.width, alloc.height)
+        return True
+
+
+class ThroughputSparkline(Gtk.DrawingArea):
+    """Mini status-bar throughput graph (Down = Cobalt, Up = Emerald)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.down_hist: collections.deque[float] = collections.deque([0.0] * 48, maxlen=48)
+        self.up_hist: collections.deque[float] = collections.deque([0.0] * 48, maxlen=48)
+        self.set_size_request(118, 20)
+        self.connect("draw", self._on_draw)
+
+    def push(self, down_bps: float, up_bps: float) -> None:
+        self.down_hist.append(max(0.0, down_bps))
+        self.up_hist.append(max(0.0, up_bps))
+        self.queue_draw()
+
+    def render_to_context(self, cr: cairo.Context, w: int, h: int) -> None:
+        self.draw_sparkline(cr, w, h, self.down_hist, self.up_hist)
+
+    @staticmethod
+    def draw_sparkline(
+        cr: cairo.Context,
+        w: int,
+        h: int,
+        down_hist: collections.deque[float],
+        up_hist: collections.deque[float],
+    ) -> None:
+        cr.set_source_rgb(0.11, 0.14, 0.18)
+        cr.rectangle(0, 0, w, h)
+        cr.fill()
+        _draw_motif_bevel(cr, 0, 0, w, h, sunken=True, thickness=1.0)
+
+        peak = max(10240.0, max(down_hist, default=0.0), max(up_hist, default=0.0))
+        n = len(down_hist)
+        if n < 2:
+            return
+
+        def _plot(series: collections.deque[float], rgb: tuple[float, float, float]) -> None:
+            cr.set_source_rgb(*rgb)
+            cr.set_line_width(1.3)
+            for i, val in enumerate(series):
+                x = 2.0 + (w - 4.0) * (i / (n - 1))
+                y = (h - 2.0) - (h - 4.0) * min(1.0, val / peak)
+                if i == 0:
+                    cr.move_to(x, y)
+                else:
+                    cr.line_to(x, y)
+            cr.stroke()
+
+        _plot(up_hist, (0.25, 0.88, 0.52))
+        _plot(down_hist, (0.36, 0.68, 0.98))
+
+    def _on_draw(self, widget: Gtk.Widget, cr: cairo.Context) -> bool:
+        alloc = widget.get_allocation()
+        self.render_to_context(cr, alloc.width, alloc.height)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Main Transmission-in-CDE Application Window (1020x640)
+# ---------------------------------------------------------------------------
+class DtDelugeWindow(Gtk.Window):
+    def __init__(self, engine: TorrentEngine, enable_ipc: bool = True) -> None:
+        super().__init__(title="dtDeluge — CDE BitTorrent Client")
+        self.engine = engine
+        self.palette = load_cde_palette()
+        self.chrome_hex, self.sel_hex, self.well_hex, self.well_alt_hex = self.palette
+
+        # Apply CDE Motif CSS globally
+        provider = Gtk.CssProvider()
+        provider.load_from_data(build_cde_css(*self.palette))
+        screen = Gdk.Screen.get_default()
+        if screen is not None:
+            Gtk.StyleContext.add_provider_for_screen(
+                screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
+
+        self.set_default_size(1020, 640)
+        icon_png = Path(__file__).resolve().parent.parent / "assets" / "icons" / "dtdeluge.png"
+        if icon_png.is_file():
+            try:
+                self.set_icon_from_file(str(icon_png))
+            except Exception:
+                pass
+
+        self.active_status_filter: str = "All"
+        self.active_tracker_filter: str = "All Trackers"
+        self.search_query: str = ""
+        self._updating_ui: bool = False
+        self._known_tracker_hosts: set[str] = set()
+
+        self._build_ui()
+        self._setup_drag_and_drop()
+
+        self._ipc_sock: Optional[socket.socket] = None
+        if enable_ipc:
+            self._start_ipc_server()
+
+        self._refresh_ui()
+        self._timer_id = GLib.timeout_add(650, self._on_ui_timer)
+        self.connect("delete-event", self._on_delete_event)
+
+    # ---- UI Construction ----
+    def _build_ui(self) -> None:
+        root_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(root_vbox)
+
+        # 1. Menu Bar
+        root_vbox.pack_start(self._build_menubar(), False, False, 0)
+
+        # 2. Chiseled 3D Motif Transmission Toolbar
+        root_vbox.pack_start(self._build_toolbar(), False, False, 0)
+
+        # 3. Transmission Filter Bar
+        root_vbox.pack_start(self._build_filterbar(), False, False, 0)
+
+        # 4. Main HPaned: Left = Torrent Transfer Cards, Right = 5-Tab Transmission Inspector
+        self.hpaned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        self.hpaned.set_position(575)
+        root_vbox.pack_start(self.hpaned, True, True, 0)
+
+        # Left pane: Sunken cream/greenbar ScrolledWindow + TorrentListCanvas
+        list_frame = Gtk.Frame()
+        list_frame.get_style_context().add_class("cde-well-frame")
+        list_frame.set_margin_start(4)
+        list_frame.set_margin_top(4)
+        list_frame.set_margin_bottom(4)
+        list_frame.set_margin_end(2)
+
+        self.list_scroll = Gtk.ScrolledWindow()
+        self.list_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.list_canvas = TorrentListCanvas(
+            palette=self.palette,
+            on_selection_changed=self._on_selection_changed,
+            on_activate_row=self._on_row_double_clicked,
+            on_context_menu=self._popup_row_context_menu,
+        )
+        self.list_scroll.add(self.list_canvas)
+        list_frame.add(self.list_scroll)
+        self.hpaned.pack1(list_frame, resize=True, shrink=False)
+
+        # Right pane: 5-Tab Transmission Inspector
+        self.inspector_box = self._build_inspector_notebook()
+        self.hpaned.pack2(self.inspector_box, resize=False, shrink=False)
+
+        # 5. Transmission Bottom Status Bar
+        root_vbox.pack_start(self._build_statusbar(), False, False, 0)
+
+        self.show_all()
+        if not self.engine.settings.get("show_inspector", True):
+            self.inspector_box.hide()
+
+    def _build_menubar(self) -> Gtk.MenuBar:
+        mb = Gtk.MenuBar()
+        accel = Gtk.AccelGroup()
+        self.add_accel_group(accel)
+
+        def _add_item(
+            menu: Gtk.Menu,
+            label: str,
+            cb: Callable[..., None],
+            key: Optional[int] = None,
+            mod: Gdk.ModifierType = Gdk.ModifierType.CONTROL_MASK,
+        ) -> Gtk.MenuItem:
+            mi = Gtk.MenuItem.new_with_mnemonic(label)
+            mi.connect("activate", lambda *_: cb())
+            if key is not None:
+                mi.add_accelerator("activate", accel, key, mod, Gtk.AccelFlags.VISIBLE)
+            menu.append(mi)
+            return mi
+
+        # Torrent menu
+        m_torrent = Gtk.Menu()
+        ti_torrent = Gtk.MenuItem.new_with_mnemonic("_Torrent")
+        ti_torrent.set_submenu(m_torrent)
+        _add_item(m_torrent, "_Open .torrent...", self.dialog_open_torrent, Gdk.KEY_o)
+        _add_item(m_torrent, "Open _Magnet / URL...", self.dialog_open_magnet, Gdk.KEY_u)
+        _add_item(m_torrent, "_New .torrent Maker...", self.dialog_create_torrent, Gdk.KEY_n)
+        m_torrent.append(Gtk.SeparatorMenuItem())
+        _add_item(m_torrent, "_Start", self.action_start_selected, Gdk.KEY_s)
+        _add_item(m_torrent, "_Pause", self.action_pause_selected, Gdk.KEY_p)
+        _add_item(m_torrent, "_Verify Local Data", self.action_verify_selected, Gdk.KEY_v)
+        _add_item(m_torrent, "Add Direct P_eer (IP:Port)...", self.dialog_add_peer)
+        m_torrent.append(Gtk.SeparatorMenuItem())
+        _add_item(m_torrent, "_Remove", lambda: self.action_remove_selected(False), Gdk.KEY_Delete, Gdk.ModifierType(0))
+        _add_item(m_torrent, "Remove & _Delete Data...", lambda: self.action_remove_selected(True))
+        m_torrent.append(Gtk.SeparatorMenuItem())
+        _add_item(m_torrent, "_Quit", self.close, Gdk.KEY_q)
+        mb.append(ti_torrent)
+
+        # Edit menu
+        m_edit = Gtk.Menu()
+        ti_edit = Gtk.MenuItem.new_with_mnemonic("_Edit")
+        ti_edit.set_submenu(m_edit)
+        _add_item(m_edit, "Select _All", self.list_canvas_select_all, Gdk.KEY_a)
+        _add_item(m_edit, "_Deselect All", self.list_canvas_clear_sel)
+        m_edit.append(Gtk.SeparatorMenuItem())
+        _add_item(m_edit, "_Preferences...", self.dialog_preferences)
+        mb.append(ti_edit)
+
+        # View menu
+        m_view = Gtk.Menu()
+        ti_view = Gtk.MenuItem.new_with_mnemonic("_View")
+        ti_view.set_submenu(m_view)
+        for st_name in ("All", "Active", "Downloading", "Seeding", "Paused", "Finished"):
+            _add_item(m_view, st_name, lambda s=st_name: self._set_status_filter(s))
+        m_view.append(Gtk.SeparatorMenuItem())
+        self.mi_inspector = Gtk.CheckMenuItem.new_with_mnemonic("Toggle _Inspector")
+        self.mi_inspector.set_active(bool(self.engine.settings.get("show_inspector", True)))
+        self.mi_inspector.connect("toggled", self._on_menu_toggle_inspector)
+        m_view.append(self.mi_inspector)
+
+        self.mi_compact = Gtk.CheckMenuItem.new_with_mnemonic("_Compact View")
+        self.mi_compact.set_active(bool(self.engine.settings.get("compact_view", False)))
+        self.mi_compact.connect("toggled", self._on_menu_toggle_compact)
+        m_view.append(self.mi_compact)
+        mb.append(ti_view)
+
+        # Help menu
+        m_help = Gtk.Menu()
+        ti_help = Gtk.MenuItem.new_with_mnemonic("_Help")
+        ti_help.set_submenu(m_help)
+        _add_item(m_help, "_About dtDeluge", self.dialog_about)
+        mb.append(ti_help)
+
+        return mb
+
+    def _build_toolbar(self) -> Gtk.Box:
+        tb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        tb.get_style_context().add_class("cde-toolbar")
+
+        def _btn(label: str, tip: str, cb: Callable[..., None], accent: bool = False) -> Gtk.Button:
+            b = Gtk.Button(label=label)
+            b.set_tooltip_text(tip)
+            if accent:
+                b.get_style_context().add_class("cde-accent")
+            b.connect("clicked", lambda *_: cb())
+            tb.pack_start(b, False, False, 0)
+            return b
+
+        _btn("📂 Open", "Open a local .torrent file (Ctrl+O)", self.dialog_open_torrent, accent=True)
+        _btn("🔗 Magnet", "Open a magnet:? link or .torrent HTTP URL (Ctrl+U)", self.dialog_open_magnet)
+        _btn("✚ Create", "Create a new .torrent file from a local file or folder (Ctrl+N)", self.dialog_create_torrent)
+
+        sep1 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        sep1.set_margin_start(3)
+        sep1.set_margin_end(3)
+        tb.pack_start(sep1, False, False, 0)
+
+        self.btn_start = _btn("▶ Start", "Start selected transfers", self.action_start_selected)
+        self.btn_pause = _btn("⏸ Pause", "Pause selected transfers", self.action_pause_selected)
+        _btn("▶▶ Start All", "Start all transfers", self.action_start_all)
+        _btn("⏸⏸ Pause All", "Pause all transfers", self.action_pause_all)
+        self.btn_remove = _btn("✖ Remove", "Remove selected transfers from list", lambda: self.action_remove_selected(False))
+
+        # Right-aligned Inspector toggle + Preferences
+        btn_prefs = Gtk.Button(label="⚙ Prefs")
+        btn_prefs.set_tooltip_text("Configure download folder, bandwidth limits, and listening port")
+        btn_prefs.connect("clicked", lambda *_: self.dialog_preferences())
+        tb.pack_end(btn_prefs, False, False, 0)
+
+        self.btn_inspector = Gtk.ToggleButton(label="ℹ Inspector")
+        self.btn_inspector.set_tooltip_text("Show or hide the 5-tab Transmission Inspector pane")
+        self.btn_inspector.set_active(bool(self.engine.settings.get("show_inspector", True)))
+        self.btn_inspector.connect("toggled", self._on_toolbar_toggle_inspector)
+        tb.pack_end(self.btn_inspector, False, False, 0)
+
+        return tb
+
+    def _build_filterbar(self) -> Gtk.Box:
+        fb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        fb.get_style_context().add_class("cde-filterbar")
+
+        lbl_show = Gtk.Label(label="Show:")
+        lbl_show.set_margin_start(2)
+        fb.pack_start(lbl_show, False, False, 2)
+
+        self.filter_pills: dict[str, Gtk.Button] = {}
+        for name in ("All", "Active", "Downloading", "Seeding", "Paused", "Finished"):
+            b = Gtk.Button(label=name)
+            b.connect("clicked", lambda _w, s=name: self._set_status_filter(s))
+            if name == "All":
+                b.get_style_context().add_class("pill-active")
+            fb.pack_start(b, False, False, 0)
+            self.filter_pills[name] = b
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        sep.set_margin_start(4)
+        sep.set_margin_end(4)
+        fb.pack_start(sep, False, False, 0)
+
+        self.tracker_combo = Gtk.ComboBoxText()
+        self.tracker_combo.append_text("All Trackers")
+        self.tracker_combo.set_active(0)
+        self.tracker_combo.connect("changed", self._on_tracker_filter_changed)
+        fb.pack_start(self.tracker_combo, False, False, 0)
+
+        self.count_label = Gtk.Label(label="0 transfers")
+        self.count_label.set_margin_end(4)
+        fb.pack_end(self.count_label, False, False, 2)
+
+        self.search_entry = Gtk.Entry()
+        self.search_entry.set_placeholder_text("Filter torrents...")
+        self.search_entry.set_width_chars(18)
+        self.search_entry.connect("changed", self._on_search_changed)
+        fb.pack_end(self.search_entry, False, False, 2)
+
+        return fb
+
+    def _build_inspector_notebook(self) -> Gtk.Box:
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        outer.set_margin_start(2)
+        outer.set_margin_end(4)
+        outer.set_margin_top(4)
+        outer.set_margin_bottom(4)
+        outer.set_size_request(410, -1)
+
+        self.insp_title = Gtk.Label(label="Inspector — No Transfer Selected")
+        self.insp_title.set_xalign(0.0)
+        self.insp_title.set_ellipsize(Pango.EllipsizeMode.END)
+        self.insp_title.set_markup("<b>Inspector — Select a Torrent</b>")
+        outer.pack_start(self.insp_title, False, False, 2)
+
+        self.notebook = Gtk.Notebook()
+        outer.pack_start(self.notebook, True, True, 0)
+
+        # ---- Tab 1: Activity / Info ----
+        info_scroll = Gtk.ScrolledWindow()
+        info_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        info_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        info_card.get_style_context().add_class("cde-inspector-card")
+
+        grid = Gtk.Grid(column_spacing=10, row_spacing=5)
+        info_card.pack_start(grid, False, False, 0)
+        self.info_labels: dict[str, Gtk.Label] = {}
+        fields = [
+            ("state", "State:"),
+            ("progress", "Progress:"),
+            ("availability", "Availability:"),
+            ("downloaded", "Downloaded:"),
+            ("uploaded", "Uploaded:"),
+            ("ratio", "Share Ratio:"),
+            ("speed", "Transfer Speed:"),
+            ("pieces", "Pieces:"),
+            ("infohash", "Infohash (SHA-1):"),
+            ("folder", "Download Folder:"),
+            ("created", "Created By:"),
+            ("comment", "Comment:"),
+        ]
+        for row_i, (key, caption) in enumerate(fields):
+            k_lbl = Gtk.Label(label=caption)
+            k_lbl.set_xalign(0.0)
+            k_lbl.set_markup(f"<b>{caption}</b>")
+            v_lbl = Gtk.Label(label="—")
+            v_lbl.set_xalign(0.0)
+            v_lbl.set_selectable(True)
+            v_lbl.set_line_wrap(True)
+            v_lbl.set_max_width_chars(38)
+            v_lbl.set_ellipsize(Pango.EllipsizeMode.MIDDLE if key in ("infohash", "folder") else Pango.EllipsizeMode.END)
+            grid.attach(k_lbl, 0, row_i, 1, 1)
+            grid.attach(v_lbl, 1, row_i, 1, 1)
+            self.info_labels[key] = v_lbl
+
+        act_btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        btn_copy_mag = Gtk.Button(label="🔗 Copy Magnet")
+        btn_copy_mag.connect("clicked", lambda *_: self.action_copy_magnet())
+        btn_verify = Gtk.Button(label="✔ Verify Data")
+        btn_verify.connect("clicked", lambda *_: self.action_verify_selected())
+        act_btn_row.pack_start(btn_copy_mag, False, False, 0)
+        act_btn_row.pack_start(btn_verify, False, False, 0)
+        info_card.pack_start(act_btn_row, False, False, 4)
+
+        info_scroll.add(info_card)
+        self.notebook.append_page(info_scroll, Gtk.Label(label="Activity / Info"))
+
+        # ---- Tab 2: Peers ----
+        peers_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        peers_vbox.set_margin_top(4)
+        # Store: addr, client, flags, pct_str, down_str, up_str, bg_hex
+        self.peers_store = Gtk.ListStore(str, str, str, str, str, str, str)
+        peers_tv = Gtk.TreeView(model=self.peers_store)
+        peers_tv.set_headers_visible(True)
+        for col_i, (title, expand) in enumerate(
+            [
+                ("IP:Port", False),
+                ("Client", True),
+                ("Flags", False),
+                ("%", False),
+                ("▼ KB/s", False),
+                ("▲ KB/s", False),
+            ]
+        ):
+            r = Gtk.CellRendererText()
+            if col_i in (3, 4, 5):
+                r.set_property("xalign", 1.0)
+            if col_i == 1:
+                r.set_property("ellipsize", Pango.EllipsizeMode.END)
+            col = Gtk.TreeViewColumn(title, r, text=col_i, cell_background=6)
+            col.set_expand(expand)
+            col.set_resizable(True)
+            peers_tv.append_column(col)
+
+        peers_sc = Gtk.ScrolledWindow()
+        peers_sc.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        peers_sc.add(peers_tv)
+        peers_vbox.pack_start(peers_sc, True, True, 0)
+
+        peer_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.peers_summary_lbl = Gtk.Label(label="0 connected peers")
+        self.peers_summary_lbl.set_xalign(0.0)
+        peer_bar.pack_start(self.peers_summary_lbl, True, True, 4)
+        btn_add_peer = Gtk.Button(label="+ Add Peer...")
+        btn_add_peer.connect("clicked", lambda *_: self.dialog_add_peer())
+        peer_bar.pack_end(btn_add_peer, False, False, 2)
+        peers_vbox.pack_start(peer_bar, False, False, 2)
+        self.notebook.append_page(peers_vbox, Gtk.Label(label="Peers"))
+
+        # ---- Tab 3: Trackers ----
+        tr_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        tr_vbox.set_margin_top(4)
+        # Store: tier, url, status, seeders, leechers, bg_hex
+        self.trackers_store = Gtk.ListStore(int, str, str, int, int, str)
+        tr_tv = Gtk.TreeView(model=self.trackers_store)
+        for col_i, (title, expand) in enumerate(
+            [
+                ("Tier", False),
+                ("Tracker URL", True),
+                ("Last Announce Status", True),
+                ("Seed", False),
+                ("Leech", False),
+            ]
+        ):
+            r = Gtk.CellRendererText()
+            if col_i in (1, 2):
+                r.set_property("ellipsize", Pango.EllipsizeMode.MIDDLE if col_i == 1 else Pango.EllipsizeMode.END)
+            col = Gtk.TreeViewColumn(title, r, text=col_i, cell_background=5)
+            col.set_expand(expand)
+            col.set_resizable(True)
+            tr_tv.append_column(col)
+
+        tr_sc = Gtk.ScrolledWindow()
+        tr_sc.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        tr_sc.add(tr_tv)
+        tr_vbox.pack_start(tr_sc, True, True, 0)
+
+        tr_btn_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        btn_add_tr = Gtk.Button(label="+ Add Tracker")
+        btn_add_tr.connect("clicked", lambda *_: self.dialog_add_tracker())
+        btn_reann = Gtk.Button(label="↻ Announce Now")
+        btn_reann.connect("clicked", lambda *_: self.action_reannounce_selected())
+        tr_btn_bar.pack_start(btn_add_tr, False, False, 2)
+        tr_btn_bar.pack_start(btn_reann, False, False, 2)
+        tr_vbox.pack_start(tr_btn_bar, False, False, 2)
+        self.notebook.append_page(tr_vbox, Gtk.Label(label="Trackers"))
+
+        # ---- Tab 4: Files ----
+        files_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        files_vbox.set_margin_top(4)
+        # Store: file_idx, wanted_bool, rel_path, priority_str, size_str, pct_str, bg_hex
+        self.files_store = Gtk.ListStore(int, bool, str, str, str, str, str)
+        files_tv = Gtk.TreeView(model=self.files_store)
+
+        toggle_r = Gtk.CellRendererToggle()
+        toggle_r.connect("toggled", self._on_file_wanted_toggled)
+        col_w = Gtk.TreeViewColumn("✔", toggle_r, active=1, cell_background=6)
+        files_tv.append_column(col_w)
+
+        path_r = Gtk.CellRendererText()
+        path_r.set_property("ellipsize", Pango.EllipsizeMode.MIDDLE)
+        col_p = Gtk.TreeViewColumn("File", path_r, text=2, cell_background=6)
+        col_p.set_expand(True)
+        col_p.set_resizable(True)
+        files_tv.append_column(col_p)
+
+        prio_model = Gtk.ListStore(str)
+        for pr_level in ("High", "Normal", "Low"):
+            prio_model.append([pr_level])
+        prio_r = Gtk.CellRendererCombo()
+        prio_r.set_property("editable", True)
+        prio_r.set_property("model", prio_model)
+        prio_r.set_property("text-column", 0)
+        prio_r.set_property("has-entry", False)
+        prio_r.connect("edited", self._on_file_priority_edited)
+        col_pr = Gtk.TreeViewColumn("Priority", prio_r, text=3, cell_background=6)
+        files_tv.append_column(col_pr)
+
+        sz_r = Gtk.CellRendererText()
+        sz_r.set_property("xalign", 1.0)
+        files_tv.append_column(Gtk.TreeViewColumn("Size", sz_r, text=4, cell_background=6))
+
+        pc_r = Gtk.CellRendererText()
+        pc_r.set_property("xalign", 1.0)
+        files_tv.append_column(Gtk.TreeViewColumn("Done", pc_r, text=5, cell_background=6))
+
+        files_sc = Gtk.ScrolledWindow()
+        files_sc.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        files_sc.add(files_tv)
+        files_vbox.pack_start(files_sc, True, True, 0)
+
+        files_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        btn_open_dir = Gtk.Button(label="📂 Open Download Folder")
+        btn_open_dir.connect("clicked", lambda *_: self.action_open_download_folder())
+        files_bar.pack_start(btn_open_dir, False, False, 2)
+        files_vbox.pack_start(files_bar, False, False, 2)
+        self.notebook.append_page(files_vbox, Gtk.Label(label="Files"))
+
+        # ---- Tab 5: Pieces (Live 2D Cairo Piece Map) ----
+        pieces_frame = Gtk.Frame()
+        pieces_frame.get_style_context().add_class("cde-well-frame")
+        pieces_frame.set_margin_top(4)
+        self.piece_map_canvas = PieceMapCanvas(self.well_hex)
+        pieces_frame.add(self.piece_map_canvas)
+        self.notebook.append_page(pieces_frame, Gtk.Label(label="Pieces"))
+
+        return outer
+
+    def _build_statusbar(self) -> Gtk.Box:
+        sb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        sb.get_style_context().add_class("cde-status")
+
+        self.btn_turtle = Gtk.ToggleButton(label="🐢 Alt Speed")
+        self.btn_turtle.set_tooltip_text(
+            "Toggle Transmission Turtle Mode (Alt-Speed bandwidth limits)"
+        )
+        is_alt = bool(self.engine.settings.get("alt_speed_enabled", False))
+        self.btn_turtle.set_active(is_alt)
+        if is_alt:
+            self.btn_turtle.get_style_context().add_class("turtle-active")
+        self.btn_turtle.connect("toggled", self._on_turtle_toggled)
+        sb.pack_start(self.btn_turtle, False, False, 0)
+
+        self.lbl_global_down = Gtk.Label(label="▼ Down: 0.0 KB/s")
+        self.lbl_global_up = Gtk.Label(label="▲ Up: 0.0 KB/s")
+        sb.pack_start(self.lbl_global_down, False, False, 4)
+        sb.pack_start(self.lbl_global_up, False, False, 4)
+
+        self.sparkline = ThroughputSparkline()
+        sb.pack_start(self.sparkline, False, False, 2)
+
+        self.lbl_port = Gtk.Label(label=f"● Port {self.engine.listen_port}")
+        sb.pack_end(self.lbl_port, False, False, 4)
+
+        self.lbl_disk_free = Gtk.Label(label="Free: —")
+        sb.pack_end(self.lbl_disk_free, False, False, 8)
+
+        return sb
+
+    # ---- Drag & Drop + Single-Instance IPC ----
+    def _setup_drag_and_drop(self) -> None:
+        targets = [
+            Gtk.TargetEntry.new("text/uri-list", 0, 1),
+            Gtk.TargetEntry.new("STRING", 0, 2),
+            Gtk.TargetEntry.new("text/plain", 0, 3),
+        ]
+        self.drag_dest_set(Gtk.DestDefaults.ALL, targets, Gdk.DragAction.COPY)
+        self.connect("drag-data-received", self._on_drag_data_received)
+
+    def _on_drag_data_received(
+        self,
+        _widget: Gtk.Widget,
+        context: Gdk.DragContext,
+        _x: int,
+        _y: int,
+        data: Gtk.SelectionData,
+        info: int,
+        time_val: int,
+    ) -> None:
+        handled = False
+        if info == 1:
+            for uri in data.get_uris() or []:
+                if self._ingest_external_arg(uri):
+                    handled = True
+        else:
+            txt = data.get_text() or ""
+            for line in txt.splitlines():
+                line = line.strip()
+                if line and self._ingest_external_arg(line):
+                    handled = True
+        Gtk.drag_finish(context, handled, False, time_val)
+        if handled:
+            self._refresh_ui()
+
+    def _ingest_external_arg(self, arg: str) -> bool:
+        s = arg.strip()
+        if not s:
+            return False
+        try:
+            tr = self.engine.add_magnet_or_url(s)
+            self.list_canvas.selected_hashes = {tr.meta.info_hash_hex}
+            return True
+        except Exception as exc:
+            self._show_error(f"Could not add '{s}':\n{exc}")
+            return False
+
+    def _start_ipc_server(self) -> None:
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            if IPC_SOCK_PATH.exists():
+                IPC_SOCK_PATH.unlink(missing_ok=True)
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(str(IPC_SOCK_PATH))
+            srv.listen(8)
+            srv.settimeout(1.0)
+            self._ipc_sock = srv
+
+            def _loop() -> None:
+                while self._ipc_sock is srv:
+                    try:
+                        conn, _ = srv.accept()
+                    except socket.timeout:
+                        continue
+                    except Exception:
+                        break
+                    try:
+                        payload = conn.recv(16384).decode("utf-8", errors="ignore")
+                        conn.close()
+                        args = [l.strip() for l in payload.splitlines() if l.strip()]
+                        GLib.idle_add(self._on_ipc_args, args)
+                    except Exception:
+                        pass
+
+            threading.Thread(target=_loop, name="DtDelugeIPC", daemon=True).start()
+        except Exception:
+            pass
+
+    def _on_ipc_args(self, args: list[str]) -> bool:
+        for a in args:
+            if a != "__RAISE__":
+                self._ingest_external_arg(a)
+        self.present()
+        self._refresh_ui()
+        return False
+
+    # ---- Filtering, Selection & Periodic Refresh ----
+    def _matches_filters(self, tr: TorrentTransfer) -> bool:
+        st = tr.state
+        f = self.active_status_filter
+        if f == "Active":
+            if tr.down_rate < 1.0 and tr.up_rate < 1.0 and st not in (
+                TorrentTransfer.STATE_METADATA,
+                TorrentTransfer.STATE_VERIFYING,
+            ):
+                return False
+        elif f == "Downloading":
+            if st not in (TorrentTransfer.STATE_DOWNLOADING, TorrentTransfer.STATE_METADATA):
+                return False
+        elif f == "Seeding":
+            if st != TorrentTransfer.STATE_SEEDING:
+                return False
+        elif f == "Paused":
+            if st != TorrentTransfer.STATE_PAUSED:
+                return False
+        elif f == "Finished":
+            if not tr.is_wanted_complete():
+                return False
+
+        if self.active_tracker_filter != "All Trackers":
+            hosts = {t.host for t in tr.trackers}
+            if self.active_tracker_filter not in hosts:
+                return False
+
+        if self.search_query:
+            q = self.search_query.lower()
+            if q not in tr.meta.name.lower() and q not in tr.meta.info_hash_hex.lower():
+                return False
+
+        return True
+
+    def _set_status_filter(self, status_name: str) -> None:
+        self.active_status_filter = status_name
+        for name, btn in self.filter_pills.items():
+            ctx = btn.get_style_context()
+            if name == status_name:
+                ctx.add_class("pill-active")
+            else:
+                ctx.remove_class("pill-active")
+        self._refresh_ui()
+
+    def _on_tracker_filter_changed(self, combo: Gtk.ComboBoxText) -> None:
+        txt = combo.get_active_text()
+        self.active_tracker_filter = txt or "All Trackers"
+        self._refresh_ui()
+
+    def _on_search_changed(self, entry: Gtk.Entry) -> None:
+        self.search_query = entry.get_text().strip()
+        self._refresh_ui()
+
+    def _on_menu_toggle_inspector(self, item: Gtk.CheckMenuItem) -> None:
+        if self._updating_ui:
+            return
+        active = item.get_active()
+        self._updating_ui = True
+        self.btn_inspector.set_active(active)
+        self._updating_ui = False
+        self._apply_inspector_visibility(active)
+
+    def _on_toolbar_toggle_inspector(self, btn: Gtk.ToggleButton) -> None:
+        if self._updating_ui:
+            return
+        active = btn.get_active()
+        self._updating_ui = True
+        self.mi_inspector.set_active(active)
+        self._updating_ui = False
+        self._apply_inspector_visibility(active)
+
+    def _apply_inspector_visibility(self, visible: bool) -> None:
+        self.engine.settings["show_inspector"] = visible
+        self.engine.save_settings()
+        if visible:
+            self.inspector_box.show()
+        else:
+            self.inspector_box.hide()
+
+    def _on_menu_toggle_compact(self, item: Gtk.CheckMenuItem) -> None:
+        compact = item.get_active()
+        self.engine.settings["compact_view"] = compact
+        self.engine.save_settings()
+        self._refresh_ui()
+
+    def _on_turtle_toggled(self, btn: Gtk.ToggleButton) -> None:
+        active = btn.get_active()
+        ctx = btn.get_style_context()
+        if active:
+            ctx.add_class("turtle-active")
+        else:
+            ctx.remove_class("turtle-active")
+        self.engine.settings["alt_speed_enabled"] = active
+        self.engine.save_settings()
+
+    def list_canvas_select_all(self) -> None:
+        self.list_canvas.select_all()
+
+    def list_canvas_clear_sel(self) -> None:
+        self.list_canvas.clear_selection()
+
+    def _on_selection_changed(self) -> None:
+        has_sel = bool(self.list_canvas.selected_hashes)
+        self.btn_start.set_sensitive(has_sel)
+        self.btn_pause.set_sensitive(has_sel)
+        self.btn_remove.set_sensitive(has_sel)
+        self._refresh_inspector(force_files=True)
+
+    def _on_row_double_clicked(self) -> None:
+        if not self.btn_inspector.get_active():
+            self.btn_inspector.set_active(True)
+        self._refresh_inspector(force_files=True)
+
+    def _on_ui_timer(self) -> bool:
+        self._refresh_ui()
+        return True
+
+    def _refresh_ui(self) -> None:
+        with self.engine._lock:
+            all_transfers = list(self.engine.transfers.values())
+
+        # Sync tracker filter options if new hosts appeared
+        hosts = sorted({t.host for tr in all_transfers for t in tr.trackers if t.host})
+        if set(hosts) != self._known_tracker_hosts:
+            self._known_tracker_hosts = set(hosts)
+            cur = self.active_tracker_filter
+            self.tracker_combo.remove_all()
+            self.tracker_combo.append_text("All Trackers")
+            active_i = 0
+            for idx, h in enumerate(hosts, start=1):
+                self.tracker_combo.append_text(h)
+                if h == cur:
+                    active_i = idx
+            self.tracker_combo.set_active(active_i)
+
+        visible = [tr for tr in all_transfers if self._matches_filters(tr)]
+        compact = bool(self.engine.settings.get("compact_view", False))
+        self.list_canvas.set_items(visible, compact=compact)
+
+        total_n = len(all_transfers)
+        vis_n = len(visible)
+        if vis_n == total_n:
+            self.count_label.set_text(f"{total_n} transfer{'s' if total_n != 1 else ''}")
+        else:
+            self.count_label.set_text(f"{vis_n} of {total_n} transfers")
+
+        # Global speeds & sparkline
+        g_down = sum(t.down_rate for t in all_transfers)
+        g_up = sum(t.up_rate for t in all_transfers)
+        self.lbl_global_down.set_text(f"▼ Down: {fmt_rate(g_down)}")
+        self.lbl_global_up.set_text(f"▲ Up: {fmt_rate(g_up)}")
+        self.sparkline.push(g_down, g_up)
+
+        # Free disk space via os.statvfs
+        dl_dir = Path(self.engine.settings.get("download_dir", str(HOME / "Downloads")))
+        probe = dl_dir if dl_dir.exists() else HOME
+        try:
+            st = os.statvfs(probe)
+            free_b = st.f_bavail * st.f_frsize
+            self.lbl_disk_free.set_text(f"Free: {fmt_bytes(free_b)}")
+        except Exception:
+            self.lbl_disk_free.set_text("Free: —")
+
+        led = "●" if self.engine.port_open else "○"
+        self.lbl_port.set_text(f"{led} Port {self.engine.listen_port}")
+
+        if self.inspector_box.get_visible():
+            self._refresh_inspector(force_files=False)
+
+    def _refresh_inspector(self, force_files: bool = False) -> None:
+        tr = self.list_canvas.primary_selected()
+        self.piece_map_canvas.set_transfer(tr)
+        if tr is None:
+            self.insp_title.set_markup("<b>Inspector — No Transfer Selected</b>")
+            for lbl in self.info_labels.values():
+                lbl.set_text("—")
+            self.peers_store.clear()
+            self.trackers_store.clear()
+            self.files_store.clear()
+            self.peers_summary_lbl.set_text("0 connected peers")
+            return
+
+        esc_name = GLib.markup_escape_text(tr.meta.name)
+        self.insp_title.set_markup(f"<b>Inspector — {esc_name}</b>")
+
+        # Tab 1: Activity / Info
+        pct = tr.progress * 100.0
+        self.info_labels["state"].set_text(tr.state)
+        self.info_labels["progress"].set_text(
+            f"{pct:.1f}% ({fmt_bytes(tr.verified_bytes)} of {fmt_bytes(tr.meta.total_size)})"
+            if tr.meta.has_metadata
+            else "Fetching magnet metadata (BEP-9)..."
+        )
+        self.info_labels["availability"].set_text(f"{tr.availability_pct():.1f}%")
+        self.info_labels["downloaded"].set_text(fmt_bytes(max(tr.verified_bytes, tr.downloaded_session)))
+        self.info_labels["uploaded"].set_text(fmt_bytes(tr.uploaded_bytes))
+        self.info_labels["ratio"].set_text(f"{tr.ratio:.3f}")
+        self.info_labels["speed"].set_text(f"▼ {fmt_rate(tr.down_rate)}   ▲ {fmt_rate(tr.up_rate)}")
+        if tr.meta.has_metadata:
+            done_p = sum(1 for x in tr.have_pieces if x)
+            self.info_labels["pieces"].set_text(
+                f"{done_p} / {tr.meta.num_pieces} × {fmt_bytes(tr.meta.piece_length)}"
+            )
+        else:
+            self.info_labels["pieces"].set_text("Pending metadata")
+        self.info_labels["infohash"].set_text(tr.meta.info_hash_hex)
+        self.info_labels["folder"].set_text(str(tr.download_dir))
+        c_str = tr.meta.created_by or "Unknown"
+        if tr.meta.creation_date > 0:
+            dt_s = datetime.datetime.fromtimestamp(tr.meta.creation_date).strftime("%Y-%m-%d")
+            c_str = f"{c_str} ({dt_s})"
+        self.info_labels["created"].set_text(c_str)
+        self.info_labels["comment"].set_text(tr.meta.comment or "—")
+
+        # Tab 2: Peers (greenbar alternating background)
+        self.peers_store.clear()
+        with tr._lock:
+            peers_list = list(tr.peers.values())
+        for idx, p in enumerate(peers_list):
+            bg = self.well_hex if idx % 2 == 0 else self.well_alt_hex
+            self.peers_store.append(
+                [
+                    p.address_label,
+                    p.client_name,
+                    p.flags_str,
+                    f"{p.progress_pct:.0f}%",
+                    f"{p.down_meter.rate() / 1024.0:.1f}",
+                    f"{p.up_meter.rate() / 1024.0:.1f}",
+                    bg,
+                ]
+            )
+        self.peers_summary_lbl.set_text(
+            f"{len(peers_list)} connected ({len(tr.known_peers)} known in swarm)"
+        )
+
+        # Tab 3: Trackers
+        self.trackers_store.clear()
+        for idx, t in enumerate(tr.trackers):
+            bg = self.well_hex if idx % 2 == 0 else self.well_alt_hex
+            self.trackers_store.append(
+                [t.tier, t.url, t.status, t.seeders, t.leechers, bg]
+            )
+
+        # Tab 4: Files (rebuild if transfer changed or count differs, else update in-place)
+        if len(self.files_store) != len(tr.meta.files) or force_files:
+            self.files_store.clear()
+            for idx, f in enumerate(tr.meta.files):
+                bg = self.well_hex if idx % 2 == 0 else self.well_alt_hex
+                fpct = (100.0 * f.completed_bytes / f.length) if f.length > 0 else 100.0
+                self.files_store.append(
+                    [
+                        f.index,
+                        f.wanted,
+                        f.rel_path,
+                        f.priority,
+                        fmt_bytes(f.length),
+                        f"{min(100.0, fpct):.1f}%",
+                        bg,
+                    ]
+                )
+        else:
+            it = self.files_store.get_iter_first()
+            idx = 0
+            while it is not None and idx < len(tr.meta.files):
+                f = tr.meta.files[idx]
+                fpct = (100.0 * f.completed_bytes / f.length) if f.length > 0 else 100.0
+                self.files_store.set_value(it, 1, f.wanted)
+                self.files_store.set_value(it, 3, f.priority)
+                self.files_store.set_value(it, 5, f"{min(100.0, fpct):.1f}%")
+                it = self.files_store.iter_next(it)
+                idx += 1
+
+    # ---- Inspector File Table Callbacks ----
+    def _on_file_wanted_toggled(self, _renderer: Gtk.CellRendererToggle, path_str: str) -> None:
+        tr = self.list_canvas.primary_selected()
+        if tr is None:
+            return
+        it = self.files_store.get_iter(path_str)
+        file_idx = self.files_store.get_value(it, 0)
+        cur = self.files_store.get_value(it, 1)
+        tr.set_file_wanted(file_idx, not cur)
+        self.engine.save_session_state()
+        self._refresh_inspector(force_files=True)
+
+    def _on_file_priority_edited(
+        self, _renderer: Gtk.CellRendererCombo, path_str: str, new_text: str
+    ) -> None:
+        tr = self.list_canvas.primary_selected()
+        if tr is None or new_text not in ("High", "Normal", "Low"):
+            return
+        it = self.files_store.get_iter(path_str)
+        file_idx = self.files_store.get_value(it, 0)
+        tr.set_file_priority(file_idx, new_text)
+        self.engine.save_session_state()
+        self._refresh_inspector(force_files=True)
+
+    # ---- Context Menu & Torrent Actions ----
+    def _popup_row_context_menu(self, ev: Gdk.EventButton) -> None:
+        menu = Gtk.Menu()
+        for label, cb in [
+            ("▶ Start", self.action_start_selected),
+            ("⏸ Pause", self.action_pause_selected),
+            ("✔ Verify Local Data", self.action_verify_selected),
+            (None, None),
+            ("📂 Open Download Folder", self.action_open_download_folder),
+            ("🔗 Copy Magnet Link", self.action_copy_magnet),
+            ("+ Add Direct Peer (IP:Port)...", self.dialog_add_peer),
+            (None, None),
+            ("✖ Remove from List", lambda: self.action_remove_selected(False)),
+            ("🗑 Remove & Delete Data...", lambda: self.action_remove_selected(True)),
+        ]:
+            if label is None:
+                menu.append(Gtk.SeparatorMenuItem())
+            else:
+                mi = Gtk.MenuItem(label=label)
+                mi.connect("activate", lambda _w, fn=cb: fn())
+                menu.append(mi)
+        menu.show_all()
+        menu.popup_at_pointer(ev)
+
+    def action_start_selected(self) -> None:
+        for tr in self.list_canvas.selected_transfers():
+            tr.start()
+        self.engine.save_session_state()
+        self._refresh_ui()
+
+    def action_pause_selected(self) -> None:
+        for tr in self.list_canvas.selected_transfers():
+            tr.pause()
+        self.engine.save_session_state()
+        self._refresh_ui()
+
+    def action_start_all(self) -> None:
+        with self.engine._lock:
+            trs = list(self.engine.transfers.values())
+        for tr in trs:
+            tr.start()
+        self.engine.save_session_state()
+        self._refresh_ui()
+
+    def action_pause_all(self) -> None:
+        with self.engine._lock:
+            trs = list(self.engine.transfers.values())
+        for tr in trs:
+            tr.pause()
+        self.engine.save_session_state()
+        self._refresh_ui()
+
+    def action_verify_selected(self) -> None:
+        for tr in self.list_canvas.selected_transfers():
+            tr.verify_local_data()
+        self._refresh_ui()
+
+    def action_reannounce_selected(self) -> None:
+        tr = self.list_canvas.primary_selected()
+        if tr is not None:
+            tr.trigger_tracker_announce()
+            self._refresh_ui()
+
+    def action_copy_magnet(self) -> None:
+        tr = self.list_canvas.primary_selected()
+        if tr is None:
+            return
+        cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        cb.set_text(tr.meta.to_magnet_uri(), -1)
+        cb.store()
+
+    def action_open_download_folder(self) -> None:
+        tr = self.list_canvas.primary_selected()
+        folder = tr.download_dir if tr is not None else Path(self.engine.settings["download_dir"])
+        folder.mkdir(parents=True, exist_ok=True)
+        for cmd in (["/usr/dt/bin/dtaction", "Dtfile", str(folder)], ["xdg-open", str(folder)]):
+            if Path(cmd[0]).exists() or shutil.which(cmd[0]):
+                try:
+                    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return
+                except Exception:
+                    continue
+
+    def action_remove_selected(self, delete_data: bool = False) -> None:
+        sel = self.list_canvas.selected_transfers()
+        if not sel:
+            return
+        if delete_data:
+            names = ", ".join(t.meta.name for t in sel[:3])
+            dlg = Gtk.MessageDialog(
+                transient_for=self,
+                flags=0,
+                message_type=Gtk.MessageType.WARNING,
+                buttons=Gtk.ButtonsType.OK_CANCEL,
+                text="Remove transfer(s) and permanently delete downloaded files?",
+            )
+            dlg.format_secondary_text(
+                f"This will delete local data on disk for: {names}"
+            )
+            resp = dlg.run()
+            dlg.destroy()
+            if resp != Gtk.ResponseType.OK:
+                return
+        for tr in sel:
+            self.engine.remove_transfer(tr.meta.info_hash_hex, delete_data=delete_data)
+        self._refresh_ui()
+
+    # ---- Dialogs: Open .torrent, Magnet/URL, New .torrent Maker, Prefs ----
+    def dialog_open_torrent(self) -> None:
+        dlg = Gtk.FileChooserDialog(
+            title="Open .torrent File — dtDeluge",
+            parent=self,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dlg.add_buttons(
+            Gtk.STOCK_CANCEL,
+            Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_OPEN,
+            Gtk.ResponseType.OK,
+        )
+        dlg.set_select_multiple(True)
+
+        flt_t = Gtk.FileFilter()
+        flt_t.set_name("BitTorrent Files (*.torrent)")
+        flt_t.add_pattern("*.torrent")
+        dlg.add_filter(flt_t)
+
+        flt_all = Gtk.FileFilter()
+        flt_all.set_name("All Files")
+        flt_all.add_pattern("*")
+        dlg.add_filter(flt_all)
+
+        extra = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        extra.set_margin_start(6)
+        extra.set_margin_end(6)
+        extra.pack_start(Gtk.Label(label="Save to:"), False, False, 0)
+        dest_btn = Gtk.FileChooserButton(
+            title="Select Download Folder", action=Gtk.FileChooserAction.SELECT_FOLDER
+        )
+        dest_btn.set_filename(str(self.engine.settings["download_dir"]))
+        extra.pack_start(dest_btn, True, True, 0)
+        chk_start = Gtk.CheckButton(label="Start transfer immediately")
+        chk_start.set_active(bool(self.engine.settings.get("auto_start", True)))
+        extra.pack_start(chk_start, False, False, 0)
+        extra.show_all()
+        dlg.set_extra_widget(extra)
+
+        if dlg.run() == Gtk.ResponseType.OK:
+            files = dlg.get_filenames()
+            dl_dir = Path(dest_btn.get_filename() or self.engine.settings["download_dir"])
+            auto = chk_start.get_active()
+            dlg.destroy()
+            for f in files:
+                try:
+                    meta = parse_torrent_file(f)
+                    tr = self.engine.add_meta(meta, download_dir=dl_dir, start_immediately=auto)
+                    self.list_canvas.selected_hashes = {tr.meta.info_hash_hex}
+                except Exception as exc:
+                    self._show_error(f"Failed to open {f}:\n{exc}")
+            self._refresh_ui()
+        else:
+            dlg.destroy()
+
+    def dialog_open_magnet(self) -> None:
+        dlg = Gtk.Dialog(
+            title="Open Magnet Link or .torrent URL — dtDeluge",
+            transient_for=self,
+            flags=0,
+        )
+        dlg.add_buttons(
+            Gtk.STOCK_CANCEL,
+            Gtk.ResponseType.CANCEL,
+            "Add Transfer",
+            Gtk.ResponseType.OK,
+        )
+        dlg.set_default_size(540, 170)
+        box = dlg.get_content_area()
+        box.set_spacing(8)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        box.set_margin_top(10)
+        box.set_margin_bottom(8)
+
+        lbl = Gtk.Label(
+            label="Paste a magnet:?xt=urn:btih:... URI or an http(s):// .torrent URL:"
+        )
+        lbl.set_xalign(0.0)
+        box.pack_start(lbl, False, False, 0)
+
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("magnet:?xt=urn:btih:...&dn=...&tr=...")
+        cb_txt = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).wait_for_text() or ""
+        if cb_txt.strip().lower().startswith(("magnet:?", "http://", "https://")):
+            entry.set_text(cb_txt.strip())
+        box.pack_start(entry, False, False, 0)
+
+        dest_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        dest_row.pack_start(Gtk.Label(label="Download Folder:"), False, False, 0)
+        dest_btn = Gtk.FileChooserButton(
+            title="Download Folder", action=Gtk.FileChooserAction.SELECT_FOLDER
+        )
+        dest_btn.set_filename(str(self.engine.settings["download_dir"]))
+        dest_row.pack_start(dest_btn, True, True, 0)
+        box.pack_start(dest_row, False, False, 0)
+
+        box.show_all()
+        if dlg.run() == Gtk.ResponseType.OK:
+            uri = entry.get_text().strip()
+            dl_dir = Path(dest_btn.get_filename() or self.engine.settings["download_dir"])
+            dlg.destroy()
+            if uri:
+                def _fetch_and_add() -> None:
+                    try:
+                        tr = self.engine.add_magnet_or_url(uri, download_dir=dl_dir)
+                        GLib.idle_add(self._after_async_add, tr)
+                    except Exception as exc:
+                        GLib.idle_add(self._show_error, f"Could not add URI:\n{exc}")
+
+                threading.Thread(target=_fetch_and_add, daemon=True).start()
+        else:
+            dlg.destroy()
+
+    def _after_async_add(self, tr: TorrentTransfer) -> bool:
+        self.list_canvas.selected_hashes = {tr.meta.info_hash_hex}
+        self._refresh_ui()
+        return False
+
+    def dialog_create_torrent(self) -> None:
+        dlg = Gtk.Dialog(
+            title="New .torrent Maker — dtDeluge",
+            transient_for=self,
+            flags=0,
+        )
+        dlg.add_buttons(
+            Gtk.STOCK_CANCEL,
+            Gtk.ResponseType.CANCEL,
+            "Create .torrent...",
+            Gtk.ResponseType.OK,
+        )
+        dlg.set_default_size(560, 340)
+        box = dlg.get_content_area()
+        box.set_spacing(8)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        box.set_margin_top(10)
+        box.set_margin_bottom(8)
+
+        src_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        src_entry = Gtk.Entry()
+        src_entry.set_placeholder_text("Select a local file or folder to package...")
+        btn_pick_file = Gtk.Button(label="📄 File...")
+        btn_pick_dir = Gtk.Button(label="📁 Folder...")
+
+        def _pick(is_folder: bool) -> None:
+            fc = Gtk.FileChooserDialog(
+                title="Choose Folder" if is_folder else "Choose File",
+                parent=dlg,
+                action=Gtk.FileChooserAction.SELECT_FOLDER if is_folder else Gtk.FileChooserAction.OPEN,
+            )
+            fc.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
+            if fc.run() == Gtk.ResponseType.OK and fc.get_filename():
+                src_entry.set_text(fc.get_filename())
+            fc.destroy()
+
+        btn_pick_file.connect("clicked", lambda *_: _pick(False))
+        btn_pick_dir.connect("clicked", lambda *_: _pick(True))
+        src_row.pack_start(Gtk.Label(label="Source:"), False, False, 0)
+        src_row.pack_start(src_entry, True, True, 0)
+        src_row.pack_start(btn_pick_file, False, False, 0)
+        src_row.pack_start(btn_pick_dir, False, False, 0)
+        box.pack_start(src_row, False, False, 0)
+
+        tr_lbl = Gtk.Label(label="Trackers (one http/https/udp announce URL per line):")
+        tr_lbl.set_xalign(0.0)
+        box.pack_start(tr_lbl, False, False, 0)
+
+        tr_view = Gtk.TextView()
+        tr_buf = tr_view.get_buffer()
+        tr_buf.set_text(
+            "udp://tracker.opentrackr.org:1337/announce\n"
+            "udp://open.stealth.si:80/announce\n"
+        )
+        tr_sc = Gtk.ScrolledWindow()
+        tr_sc.set_min_content_height(75)
+        tr_sc.add(tr_view)
+        box.pack_start(tr_sc, True, True, 0)
+
+        opt_grid = Gtk.Grid(column_spacing=8, row_spacing=6)
+        opt_grid.attach(Gtk.Label(label="Comment:"), 0, 0, 1, 1)
+        comment_entry = Gtk.Entry()
+        comment_entry.set_hexpand(True)
+        comment_entry.set_placeholder_text("Created with dtDeluge on CDE")
+        opt_grid.attach(comment_entry, 1, 0, 2, 1)
+
+        opt_grid.attach(Gtk.Label(label="Piece Size:"), 0, 1, 1, 1)
+        plen_combo = Gtk.ComboBoxText()
+        plen_choices = [
+            ("Auto (Recommended)", 0),
+            ("16 KiB", 16384),
+            ("32 KiB", 32768),
+            ("64 KiB", 65536),
+            ("256 KiB", 262144),
+            ("512 KiB", 524288),
+            ("1 MiB", 1048576),
+        ]
+        for label, _ in plen_choices:
+            plen_combo.append_text(label)
+        plen_combo.set_active(0)
+        opt_grid.attach(plen_combo, 1, 1, 1, 1)
+
+        chk_private = Gtk.CheckButton(label="Private tracker flag")
+        opt_grid.attach(chk_private, 2, 1, 1, 1)
+        box.pack_start(opt_grid, False, False, 0)
+
+        chk_seed = Gtk.CheckButton(label="Add to dtDeluge and start seeding immediately")
+        chk_seed.set_active(True)
+        box.pack_start(chk_seed, False, False, 0)
+
+        box.show_all()
+        if dlg.run() != Gtk.ResponseType.OK:
+            dlg.destroy()
+            return
+
+        src_path = Path(src_entry.get_text().strip())
+        start_it, end_it = tr_buf.get_bounds()
+        trackers = [
+            ln.strip()
+            for ln in tr_buf.get_text(start_it, end_it, False).splitlines()
+            if ln.strip()
+        ]
+        comment = comment_entry.get_text().strip()
+        plen_val = plen_choices[max(0, plen_combo.get_active())][1]
+        priv = chk_private.get_active()
+        seed_now = chk_seed.get_active()
+        dlg.destroy()
+
+        if not src_path.exists():
+            self._show_error("Please choose an existing file or folder.")
+            return
+
+        save_fc = Gtk.FileChooserDialog(
+            title="Save .torrent File As",
+            parent=self,
+            action=Gtk.FileChooserAction.SAVE,
+        )
+        save_fc.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_SAVE, Gtk.ResponseType.OK)
+        save_fc.set_do_overwrite_confirmation(True)
+        save_fc.set_current_folder(str(HOME / "Downloads"))
+        save_fc.set_current_name(f"{src_path.name}.torrent")
+        if save_fc.run() != Gtk.ResponseType.OK or not save_fc.get_filename():
+            save_fc.destroy()
+            return
+        out_path = Path(save_fc.get_filename())
+        save_fc.destroy()
+
+        try:
+            meta = create_torrent_file(
+                source_path=src_path,
+                out_torrent_path=out_path,
+                trackers=trackers,
+                comment=comment,
+                piece_length=plen_val,
+                private=priv,
+            )
+            if seed_now:
+                tr = self.engine.add_meta(
+                    meta, download_dir=src_path.parent, start_immediately=False
+                )
+                tr.have_pieces = [True] * meta.num_pieces
+                tr._recompute_verified_bytes_locked()
+                tr.paused = False
+                tr.trigger_tracker_announce(event="started")
+                self.engine.save_session_state()
+                self.list_canvas.selected_hashes = {tr.meta.info_hash_hex}
+                self._refresh_ui()
+        except Exception as exc:
+            self._show_error(f"Failed to create .torrent:\n{exc}")
+
+    def dialog_add_peer(self) -> None:
+        tr = self.list_canvas.primary_selected()
+        if tr is None:
+            return
+        dlg = Gtk.Dialog(title="Add Direct Peer (IP:Port)", transient_for=self, flags=0)
+        dlg.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, "Connect Peer", Gtk.ResponseType.OK)
+        box = dlg.get_content_area()
+        box.set_spacing(8)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        box.set_margin_top(10)
+        box.set_margin_bottom(8)
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("127.0.0.1:51413")
+        box.pack_start(Gtk.Label(label="Enter peer IPv4/IPv6 address and TCP port:"), False, False, 0)
+        box.pack_start(entry, False, False, 0)
+        box.show_all()
+        if dlg.run() == Gtk.ResponseType.OK:
+            txt = entry.get_text().strip()
+            dlg.destroy()
+            if ":" in txt:
+                host, port_s = txt.rsplit(":", 1)
+                try:
+                    tr.add_peer_manual(host, int(port_s))
+                    self._refresh_ui()
+                except ValueError:
+                    self._show_error("Port must be a valid integer.")
+        else:
+            dlg.destroy()
+
+    def dialog_add_tracker(self) -> None:
+        tr = self.list_canvas.primary_selected()
+        if tr is None:
+            return
+        dlg = Gtk.Dialog(title="Add Tracker Announce URL", transient_for=self, flags=0)
+        dlg.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, "Add Tracker", Gtk.ResponseType.OK)
+        dlg.set_default_size(460, 120)
+        box = dlg.get_content_area()
+        box.set_spacing(8)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        box.set_margin_top(10)
+        box.set_margin_bottom(8)
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("udp://tracker.opentrackr.org:1337/announce")
+        box.pack_start(Gtk.Label(label="Tracker URL (http://, https://, or udp://):"), False, False, 0)
+        box.pack_start(entry, False, False, 0)
+        box.show_all()
+        if dlg.run() == Gtk.ResponseType.OK:
+            url = entry.get_text().strip()
+            dlg.destroy()
+            if url and not tr.add_tracker(url):
+                self._show_error("Invalid or duplicate tracker URL.")
+            else:
+                self.engine.save_session_state()
+                self._refresh_ui()
+        else:
+            dlg.destroy()
+
+    def dialog_preferences(self) -> None:
+        dlg = Gtk.Dialog(title="dtDeluge Preferences", transient_for=self, flags=0)
+        dlg.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_SAVE, Gtk.ResponseType.OK)
+        dlg.set_default_size(480, 340)
+        box = dlg.get_content_area()
+        box.set_spacing(10)
+        box.set_margin_start(14)
+        box.set_margin_end(14)
+        box.set_margin_top(10)
+        box.set_margin_bottom(10)
+
+        grid = Gtk.Grid(column_spacing=10, row_spacing=8)
+        box.pack_start(grid, True, True, 0)
+
+        s = self.engine.settings
+
+        grid.attach(Gtk.Label(label="Default Download Folder:", xalign=0.0), 0, 0, 1, 1)
+        dir_btn = Gtk.FileChooserButton(
+            title="Select Download Folder", action=Gtk.FileChooserAction.SELECT_FOLDER
+        )
+        Path(s["download_dir"]).mkdir(parents=True, exist_ok=True)
+        dir_btn.set_filename(str(s["download_dir"]))
+        grid.attach(dir_btn, 1, 0, 2, 1)
+
+        chk_auto = Gtk.CheckButton(label="Start added torrents automatically")
+        chk_auto.set_active(bool(s.get("auto_start", True)))
+        grid.attach(chk_auto, 0, 1, 3, 1)
+
+        chk_dl = Gtk.CheckButton(label="Limit Download Speed (KB/s):")
+        chk_dl.set_active(bool(s.get("speed_limit_down_enabled", False)))
+        sp_dl = Gtk.SpinButton.new_with_range(10, 1000000, 50)
+        sp_dl.set_value(int(s.get("speed_limit_down_kbps", 2048)))
+        grid.attach(chk_dl, 0, 2, 2, 1)
+        grid.attach(sp_dl, 2, 2, 1, 1)
+
+        chk_ul = Gtk.CheckButton(label="Limit Upload Speed (KB/s):")
+        chk_ul.set_active(bool(s.get("speed_limit_up_enabled", False)))
+        sp_ul = Gtk.SpinButton.new_with_range(10, 1000000, 25)
+        sp_ul.set_value(int(s.get("speed_limit_up_kbps", 512)))
+        grid.attach(chk_ul, 0, 3, 2, 1)
+        grid.attach(sp_ul, 2, 3, 1, 1)
+
+        grid.attach(Gtk.Label(label="🐢 Turtle Alt-Speed Down (KB/s):", xalign=0.0), 0, 4, 2, 1)
+        sp_alt_dl = Gtk.SpinButton.new_with_range(5, 500000, 25)
+        sp_alt_dl.set_value(int(s.get("alt_speed_down_kbps", 250)))
+        grid.attach(sp_alt_dl, 2, 4, 1, 1)
+
+        grid.attach(Gtk.Label(label="🐢 Turtle Alt-Speed Up (KB/s):", xalign=0.0), 0, 5, 2, 1)
+        sp_alt_ul = Gtk.SpinButton.new_with_range(5, 500000, 10)
+        sp_alt_ul.set_value(int(s.get("alt_speed_up_kbps", 100)))
+        grid.attach(sp_alt_ul, 2, 5, 1, 1)
+
+        grid.attach(Gtk.Label(label="Max Peers per Torrent:", xalign=0.0), 0, 6, 2, 1)
+        sp_peers = Gtk.SpinButton.new_with_range(4, 200, 5)
+        sp_peers.set_value(int(s.get("max_peers_per_torrent", 40)))
+        grid.attach(sp_peers, 2, 6, 1, 1)
+
+        grid.attach(Gtk.Label(label="Incoming Peer TCP Port:", xalign=0.0), 0, 7, 2, 1)
+        sp_port = Gtk.SpinButton.new_with_range(1025, 65535, 1)
+        sp_port.set_value(int(s.get("listen_port", 51413)))
+        grid.attach(sp_port, 2, 7, 1, 1)
+
+        box.show_all()
+        if dlg.run() == Gtk.ResponseType.OK:
+            s["download_dir"] = dir_btn.get_filename() or s["download_dir"]
+            s["auto_start"] = chk_auto.get_active()
+            s["speed_limit_down_enabled"] = chk_dl.get_active()
+            s["speed_limit_down_kbps"] = sp_dl.get_value_as_int()
+            s["speed_limit_up_enabled"] = chk_ul.get_active()
+            s["speed_limit_up_kbps"] = sp_ul.get_value_as_int()
+            s["alt_speed_down_kbps"] = sp_alt_dl.get_value_as_int()
+            s["alt_speed_up_kbps"] = sp_alt_ul.get_value_as_int()
+            s["max_peers_per_torrent"] = sp_peers.get_value_as_int()
+            new_port = sp_port.get_value_as_int()
+            if new_port != int(s.get("listen_port", 51413)):
+                self.engine.rebind_port(new_port)
+            else:
+                self.engine.save_settings()
+            self._refresh_ui()
+        dlg.destroy()
+
+    def dialog_about(self) -> None:
+        dlg = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text=f"dtDeluge {APP_VERSION} — CDE BitTorrent Client",
+        )
+        dlg.format_secondary_text(
+            "Transmission GTK UX & 5-Tab Inspector in authentic Common Desktop Environment "
+            "(OSF/Motif) livery.\n\n"
+            "Powered by a self-contained pure-Python 3 BitTorrent Peer Wire engine "
+            "(Bencode, HTTP/HTTPS & BEP-15 UDP trackers, BEP-10/BEP-9 magnet metadata, "
+            "pipelined 16 KiB block transfers, SHA-1 piece verification, and Turtle Alt-Speed)."
+        )
+        dlg.run()
+        dlg.destroy()
+
+    def _show_error(self, message: str) -> bool:
+        dlg = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.OK,
+            text="dtDeluge Error",
+        )
+        dlg.format_secondary_text(message)
+        dlg.run()
+        dlg.destroy()
+        return False
+
+    def _on_delete_event(self, *_args: Any) -> bool:
+        if self._timer_id:
+            GLib.source_remove(self._timer_id)
+            self._timer_id = 0
+        if self._ipc_sock is not None:
+            try:
+                self._ipc_sock.close()
+            except Exception:
+                pass
+            self._ipc_sock = None
+            IPC_SOCK_PATH.unlink(missing_ok=True)
+        self.engine.shutdown()
+        Gtk.main_quit()
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Comprehensive End-to-End Self-Test (--self-test)
+# ---------------------------------------------------------------------------
+def run_self_test() -> int:
+    with tempfile.TemporaryDirectory(prefix="dtdeluge_selftest_") as tmp_s:
+        tmp = Path(tmp_s)
+
+        # 1. Test Bencode encode / decode + raw info slice
+        sample = {
+            b"announce": b"http://127.0.0.1:6969/announce",
+            b"count": 42,
+            b"neg": -17,
+            b"list": [b"alpha", 0, [1, 2, 3]],
+            b"info": {b"name": b"test.bin", b"piece length": 16384, b"pieces": b"\xaa" * 20},
+        }
+        enc = bencode(sample)
+        dec = bdecode(enc)
+        assert dec == sample, "Bencode round-trip mismatch"
+        root_d, raw_info = extract_top_info_slice(enc)
+        assert hashlib.sha1(raw_info).digest() == hashlib.sha1(bencode(sample[b"info"])).digest()
+
+        # 2. Test multi-file .torrent creation & parsing (4 pieces × 16 KiB)
+        seed_dir = tmp / "seed_data"
+        pkg_dir = seed_dir / "CDE_Demo_Release"
+        (pkg_dir / "docs").mkdir(parents=True)
+        payload_a = os.urandom(36000)  # spans > 2 pieces
+        payload_b = b"Common Desktop Environment BitTorrent Payload\n" * 450  # ~20.7 KiB
+        (pkg_dir / "archive.dat").write_bytes(payload_a)
+        (pkg_dir / "docs" / "README.txt").write_bytes(payload_b)
+
+        torrent_path = tmp / "demo.torrent"
+        created_meta = create_torrent_file(
+            source_path=pkg_dir,
+            out_torrent_path=torrent_path,
+            trackers=["udp://127.0.0.1:9/announce"],
+            comment="Self-test multi-file package",
+            piece_length=16384,
+        )
+        parsed_meta = parse_torrent_file(torrent_path)
+        assert parsed_meta.info_hash == created_meta.info_hash
+        assert parsed_meta.num_pieces == 4
+        assert parsed_meta.total_size == len(payload_a) + len(payload_b)
+
+        # 3. Test Magnet URI parser (both 40-char hex AND 32-char RFC4648 Base32)
+        ih_hex = parsed_meta.info_hash_hex
+        ih_b32 = base64.b32encode(parsed_meta.info_hash).decode("ascii")
+        m_hex = parse_magnet_uri(
+            f"magnet:?xt=urn:btih:{ih_hex}&dn=HexTest&tr=udp%3A%2F%2Ftracker.example%3A80"
+        )
+        m_b32 = parse_magnet_uri(
+            f"magnet:?xt=urn:btih:{ih_b32.lower()}&dn=Base32Test&x.pe=127.0.0.1:51413"
+        )
+        assert m_hex.info_hash == parsed_meta.info_hash
+        assert m_b32.info_hash == parsed_meta.info_hash
+        assert m_b32.peer_hints == [("127.0.0.1", 51413)]
+
+        # 4. End-to-End Local Loopback Swarm Test on 127.0.0.1:
+        #    Seeder Engine serves BOTH BEP-9 ut_metadata AND 4 × 16 KiB pieces over TCP
+        #    to a Magnet Leecher Engine starting with ZERO metadata and an empty download dir!
+        leech_dl_dir = tmp / "leech_downloads"
+        leech_dl_dir.mkdir()
+
+        seeder_engine = TorrentEngine(config_dir=tmp / "cfg_seed", listen_port=0, persist=False)
+        leecher_engine = TorrentEngine(config_dir=tmp / "cfg_leech", listen_port=0, persist=False)
+        try:
+            assert seeder_engine.port_open and seeder_engine.listen_port > 0
+            seed_tr = seeder_engine.add_meta(
+                parsed_meta, download_dir=seed_dir, start_immediately=False
+            )
+            seed_tr.verify_local_data(auto_resume=True)
+
+            # Wait until seeder finishes verifying all 4 pieces on disk
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline:
+                if all(seed_tr.have_pieces) and not seed_tr.verifying:
+                    break
+                time.sleep(0.05)
+            assert all(seed_tr.have_pieces), "Seeder local verification failed"
+
+            # Add via Magnet URI with x.pe pointing to local seeder!
+            magnet_uri = (
+                f"magnet:?xt=urn:btih:{ih_b32}&dn=CDE_Demo_Release"
+                f"&x.pe=127.0.0.1:{seeder_engine.listen_port}"
+            )
+            leech_tr = leecher_engine.add_magnet_or_url(magnet_uri, download_dir=leech_dl_dir)
+
+            deadline = time.monotonic() + 12.0
+            while time.monotonic() < deadline:
+                if leech_tr.meta.has_metadata and leech_tr.is_wanted_complete():
+                    break
+                leech_tr.connect_more_peers()
+                time.sleep(0.05)
+
+            assert leech_tr.meta.has_metadata, "BEP-9 ut_metadata exchange timed out"
+            assert leech_tr.is_wanted_complete(), "Loopback 16 KiB piece transfer timed out"
+            assert (leech_dl_dir / "CDE_Demo_Release" / "archive.dat").read_bytes() == payload_a
+            assert (
+                leech_dl_dir / "CDE_Demo_Release" / "docs" / "README.txt"
+            ).read_bytes() == payload_b
+            assert seed_tr.uploaded_bytes >= parsed_meta.total_size
+
+            # 5. Exercise CDE Motif CSS, PangoCairo UI rendering, and GTK3 Window (if X11 active)
+            pal = load_cde_palette()
+            css_bytes = build_cde_css(*pal)
+            assert b"cde-toolbar" in css_bytes and b"turtle-active" in css_bytes
+
+            surf = cairo.ImageSurface(cairo.Format.ARGB32, 620, 260)
+            cr = cairo.Context(surf)
+            TorrentListCanvas.draw_transfer_list(
+                cr, 620, 260, [leech_tr, seed_tr], {leech_tr.meta.info_hash_hex}, pal, False
+            )
+            TorrentListCanvas.draw_transfer_list(
+                cr, 620, 260, [leech_tr, seed_tr], {leech_tr.meta.info_hash_hex}, pal, True
+            )
+            PieceMapCanvas.draw_piece_map(cr, 400, 220, leech_tr, pal[2])
+            ThroughputSparkline.draw_sparkline(
+                cr,
+                118,
+                20,
+                collections.deque([0.0, 65536.0, 131072.0]),
+                collections.deque([0.0, 16384.0, 32768.0]),
+            )
+            surf.flush()
+            assert any(surf.get_data()), "Cairo surface rendered empty"
+
+            ok_disp, _ = Gtk.init_check(sys.argv[:1])
+            if ok_disp and Gdk.Display.get_default() is not None:
+                win = DtDelugeWindow(leecher_engine, enable_ipc=False)
+                win._refresh_ui()
+                if win._timer_id:
+                    GLib.source_remove(win._timer_id)
+                    win._timer_id = 0
+                win.destroy()
+        finally:
+            leecher_engine.shutdown()
+            seeder_engine.shutdown()
+
+    print("DTDELUGE_SELF_TEST_OK")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Entry Point & Single-Instance Argument Forwarding
+# ---------------------------------------------------------------------------
+def _try_forward_to_existing_instance(targets: list[str]) -> bool:
+    if not IPC_SOCK_PATH.exists():
+        return False
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1.2)
+        s.connect(str(IPC_SOCK_PATH))
+        msg = "\n".join(targets if targets else ["__RAISE__"]) + "\n"
+        s.sendall(msg.encode("utf-8"))
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="dtdeluge",
+        description="dtDeluge — CDE BitTorrent Client (Transmission UX in OSF/Motif Livery)",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run built-in Bencode, .torrent, Magnet, Loopback Peer Wire, and Cairo UI self-tests",
+    )
+    parser.add_argument(
+        "targets",
+        nargs="*",
+        help="Optional .torrent file paths, magnet:? URIs, or http(s) .torrent URLs",
+    )
+    args = parser.parse_args()
+
+    if args.self_test:
+        return run_self_test()
+
+    clean_targets = [t for t in args.targets if t and t.strip()]
+    if _try_forward_to_existing_instance(clean_targets):
+        return 0
+
+    ok, _ = Gtk.init_check(sys.argv[:1])
+    if not ok:
+        sys.stderr.write("dtDeluge: Unable to open X11/GTK display.\n")
+        return 1
+
+    engine = TorrentEngine(config_dir=CONFIG_DIR, persist=True)
+    win = DtDelugeWindow(engine, enable_ipc=True)
+    for t in clean_targets:
+        win._ingest_external_arg(t)
+    win._refresh_ui()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

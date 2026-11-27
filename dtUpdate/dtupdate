@@ -249,9 +249,19 @@ PYTHON_CDE_APPS = [
     ("dtNotes",  "dtnotes",  ("python3", "gir1.2-gtk-3", "gir1.2-gtksource", "libgtksourceview", "gir1.2-webkit2", "libwebkit2gtk")),
     ("dtReader", "dtreader", ("python3", "gir1.2-gtk-3", "gir1.2-evince", "libevdocument", "libevview", "libpoppler")),
     ("dtZip",    "dtzip",    ("python3", "gir1.2-gtk-3", "p7zip", "7zip", "xz-utils", "bzip2")),
-    ("dtWine",   "dtwine",   ("python3", "gir1.2-gtk-3", "wine", "libwine", "python3-pil")),
-    ("dtUpdate", "dtupdate", ("python3", "gir1.2-gtk-3", "apt")),
-    ("dtRadio",  "dtradio",  ("python3", "gir1.2-gtk-3", "libgtk-3", "gir1.2-gst", "gstreamer1.0", "libcairo")),
+    ("dtWine",    "dtwine",    ("python3", "gir1.2-gtk-3", "wine", "libwine", "python3-pil")),
+    ("dtUpdate",  "dtupdate",  ("python3", "gir1.2-gtk-3", "apt")),
+    ("dtRadio",   "dtradio",   ("python3", "gir1.2-gtk-3", "libgtk-3", "gir1.2-gst", "gstreamer1.0", "libcairo")),
+    ("dtScope",   "dtscope",   ("python3", "gir1.2-gtk-3", "libgtk-3", "gir1.2-gst", "gstreamer1.0", "python3-numpy", "libcairo")),
+    ("dtDecoder", "dtdecoder", ("python3", "gir1.2-gtk-3", "libgtk-3", "gir1.2-gst", "gstreamer1.0", "python3-numpy", "libcairo")),
+    ("dtRadar",   "dtradar",   ("python3", "gir1.2-gtk-3", "libgtk-3", "python3-pil", "python3-requests", "python3-numpy", "libcairo")),
+    ("dtSat",     "dtsat",     ("python3", "gir1.2-gtk-3", "libgtk-3", "python3-requests", "python3-numpy", "libcairo")),
+    ("dtLog",     "dtlog",     ("python3", "gir1.2-gtk-3", "libgtk-3", "python3-pil", "libcairo")),
+    ("dtMaps",    "dtmaps",    ("python3", "gir1.2-gtk-3", "libgtk-3", "python3-pil", "python3-requests", "python3-numpy", "libcairo")),
+    ("dtDeck",    "dtdeck",    ("python3", "gir1.2-gtk-3", "libgtk-3", "gir1.2-gst", "gstreamer1.0", "python3-numpy", "libcairo")),
+    ("dtSys",     "dtsys",     ("python3", "gir1.2-gtk-3", "libgtk-3", "libcairo")),
+    ("dtNet",     "dtnet",     ("python3", "gir1.2-gtk-3", "libgtk-3", "python3-requests", "libcairo")),
+    ("dtDeluge",  "dtdeluge",  ("python3", "gir1.2-gtk-3", "libgtk-3", "python3-requests", "python3-pil", "libcairo")),
 ]
 
 # Known C/Motif targets when a Makefile-based CDE source directory is present
@@ -259,6 +269,7 @@ MOTIF_TARGET_MAP = [
     ("dtMail (cde-mail)",   "cde-mail",                LOCAL_BIN / "cde-mail",                  ["cde_mail.c", "cde_oe_icons.h"]),
     ("dtCalendar (dtcm)",   "cde-calendar",            LOCAL_BIN / "cde-calendar",              ["cde_calendar.c"]),
     ("dtTerm (cde-term)",   "cde-term",                LOCAL_BIN / "cde-term",                  ["cde_term.c", "cde_term_icon.h"]),
+    ("dtCalc (cde-calc)",   "cde-calc",                LOCAL_BIN / "cde-calc",                  ["cde_calc.c", "cde_calc_icon.h"]),
     ("CDE Screenshot",      "cde-shot",                LOCAL_BIN / "cde-shot",                  ["cde_shot.c", "cde_motif_theme.h"]),
     ("CDE Panel Tray",      "cde-panel-tray",          LOCAL_BIN / "cde-panel-tray",            ["cde_panel_tray.c"]),
     ("CDE Layout Helper",   "cde-apply-layout",        LOCAL_BIN / "cde-apply-layout",          ["cde_apply_layout.c"]),
@@ -280,6 +291,7 @@ MOTIF_TARGET_MAP = [
     ("HamClock Manager",    "cde-hamclock-mgr",        LOCAL_BIN / "cde-hamclock-mgr",          ["cde_hamclock_mgr.c"]),
     ("dtterm SmartClip SO", "libdtterm_smartclip.so",  LOCAL_LIB / "libdtterm_smartclip.so",    ["dtterm_smartclip.c"]),
     ("dtsession Lock SO",   "libdtsession_lockwake.so", LOCAL_LIB / "libdtsession_lockwake.so", ["dtsession_lockwake.c"]),
+    ("dtwm Subpanel Cols",  "libdtwm_subpanel_cols.so", LOCAL_BIN / "libdtwm_subpanel_cols.so", ["dtwm_subpanel_cols.c"]),
 ]
 
 
@@ -1246,13 +1258,16 @@ class DtUpdateWindow(Gtk.Window):
             return rc.returncode == 0
 
         # Standard CDE dtwm restart fallback
+        dtwm_bin = LOCAL_BIN / "dtwm-wrapper"
+        if not dtwm_bin.is_file():
+            dtwm_bin = Path("/usr/dt/bin/dtwm")
         dtwm_pids = subprocess.run(
             ["pgrep", "-u", str(os.getuid()), "-x", "dtwm"], capture_output=True, text=True
         ).stdout.split()
-        if dtwm_pids and Path("/usr/dt/bin/dtwm").is_file():
-            subprocess.run(["kill", dtwm_pids[0]], stderr=subprocess.DEVNULL)
+        if dtwm_pids and dtwm_bin.is_file():
+            subprocess.run(["kill", "-9", dtwm_pids[0]], stderr=subprocess.DEVNULL)
             time.sleep(0.5)
-            subprocess.Popen(["/usr/dt/bin/dtwm"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            subprocess.Popen([str(dtwm_bin)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
             time.sleep(1.5)
             return True
         return False

@@ -1,0 +1,3409 @@
+#!/usr/bin/env python3
+"""
+dtDeck — Vintage 1980s 4-Track Simul-Sync Tape & Aircheck Studio for CDE
+
+Features:
+  - Authentic TASCAM Portastudio / TEAC / Nakamichi 1980s brushed-metal & Motif 3D bevel faceplate:
+      * Centerpiece 30fps Backlit Mechanical Tape Well with warm incandescent cabinet glow,
+        switchable Twin 7" 3-Slot Spun-Aluminum NAB Reels & Studio CrO2 Cassette Shell,
+        dynamic magnetic tape pack radius transfer (0% -> 100%), Permalloy 4-Track Simul-Sync
+        head shield, engaging rubber pinch roller, and flexing spring-loaded tension arms!
+      * Dual Warm-Backlit Ballistic Analog VU Meters (CH L & CH R, -20..0..+3 dB red arc)
+        driven by real GStreamer `level` RMS/peak telemetry + crimson jewel PEAK clip LEDs!
+      * 4-Digit Rolling Mechanical Drum Counter (0000..9999) + Glowing Cyan VFD MM:SS.d readout,
+        [RESET 0000], [MEMORY], and [RTZ] Return-to-Zero auto-stop wind!
+      * Chunky Mechanical Piano-Key Transport Bar: [◀◀ REW], [▶ PLAY], [■ STOP], [▶▶ FF],
+        [● REC], [⏸ PAUSE], [A-B LOOP].
+  - Real 4-Track Simul-Sync Studio Mixer + Live Recording & Bounce:
+      * 4 vertical channel strips (TRK 1..4) with illuminated studio faders, rotary PAN knobs,
+        12-segment vertical LED bar meters, [REC ARM], [MUTE], [SOLO], [LOAD], and [CLEAR].
+      * Live multitrack overdub recording via GStreamer (`pulsesrc` / `autoaudiosrc`) from
+        Microphone or Desktop Audio Monitor straight into `~/Music/dtDeck/` `.wav` stems while
+        monitoring existing tracks!
+      * Built-in 4-Track Analog Demo Tape Synthesizer (`LOAD DEMO 4-TRACK TAPE`) + quick-browser
+        sidebar for `~/Music/dtRadio` airchecks, `~/Music/dtDeck`, and `~/Music`.
+      * `[BOUNCE MASTER .WAV]` mixing active tracks with fader/pan/varispeed/warmth via `numpy`
+        into a stereo 16-bit 44.1 kHz `.wav` master!
+  - 10-Band Graphic Equalizer + Varispeed (±20%) & Tape Bias / NR:
+      * 10 vertical sliders (31 Hz .. 16 kHz) wired live to GStreamer `equalizer-10bands`
+        with [FLAT], [VOICE/SSB], [WARM TAPE], and [LOUDNESS] presets.
+      * Real speed+pitch `VARISPEED (±20%)` rotary knob and `TAPE BIAS / NR` (FLAT / WARM / DOLBY-B).
+"""
+
+import datetime
+import json
+import math
+import os
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import wave
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import cairo
+import gi
+import numpy as np
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("Pango", "1.0")
+gi.require_version("Gst", "1.0")
+from gi.repository import Gdk, GLib, Gst, Gtk, Pango
+
+Gst.init(None)
+
+SAMPLE_RATE = 44100
+BLOCK_FRAMES = 1024
+EQ_BANDS_LABELS = ["31", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"]
+EQ_PRESETS: dict[str, list[float]] = {
+    "FLAT": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    "VOICE/SSB": [-8.0, -5.0, -1.5, 2.5, 4.5, 5.5, 4.0, -1.0, -6.0, -9.0],
+    "WARM TAPE": [2.5, 4.0, 3.0, 1.5, 0.0, -0.5, 1.0, 2.0, -1.5, -3.5],
+    "LOUDNESS": [6.5, 5.0, 2.0, 0.0, -1.5, -1.5, 0.5, 3.0, 5.0, 6.0],
+}
+
+HOME = Path.home()
+CONFIG_DIR = HOME / ".config" / "dtdeck"
+CACHE_DIR = HOME / ".cache" / "dtdeck"
+STATE_FILE = CONFIG_DIR / "state.json"
+DECK_DIR = HOME / "Music" / "dtDeck"
+RADIO_DIR = HOME / "Music" / "dtRadio"
+MUSIC_DIR = HOME / "Music"
+
+AUDIO_EXTS = {".wav", ".mp3", ".ogg", ".flac", ".m4a", ".opus", ".aac"}
+
+
+# ---------------------------------------------------------------------------
+# CDE Palette Loader & Vintage Studio Deck Motif 3D CSS
+# ---------------------------------------------------------------------------
+def load_cde_palette() -> tuple[str, str, str]:
+    chrome, sel, well = "#aeb2c3", "#2c567e", "#fff7e9"
+    try:
+        out = subprocess.check_output(["xrdb", "-query"], text=True, stderr=subprocess.DEVNULL)
+        pal_name = "Crimson.dp"
+        for ln in out.splitlines():
+            if "ColorPalette:" in ln:
+                pal_name = ln.split(":", 1)[1].strip()
+                break
+        for pdir in (HOME / ".dt/palettes", Path("/usr/dt/palettes")):
+            pf = pdir / pal_name
+            if pf.is_file():
+                hexes = [l.strip() for l in pf.read_text().splitlines() if l.strip().startswith("#")]
+                if len(hexes) >= 4:
+                    def norm16(h: str) -> str:
+                        h = h.lstrip("#")
+                        return f"#{h[0:2]}{h[4:6]}{h[8:10]}" if len(h) == 12 else "#" + h[:6]
+                    chrome, sel, well = norm16(hexes[1]), norm16(hexes[2]), norm16(hexes[3])
+                break
+    except Exception:
+        pass
+    return chrome, sel, well
+
+
+def build_deck_css(chrome: str, sel: str, _well: str) -> bytes:
+    css = f"""
+    window, dialog, .background {{
+        background-color: {chrome};
+        color: #101216;
+        font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+        font-size: 8.5pt;
+    }}
+    .deck-cabinet {{
+        background-color: #272b34;
+        border-top: 2px solid #596275;
+        border-left: 2px solid #596275;
+        border-right: 2px solid #13161c;
+        border-bottom: 2px solid #13161c;
+        padding: 5px 6px;
+    }}
+    .deck-module {{
+        background-color: #323844;
+        border-top: 2px solid #555e70;
+        border-left: 2px solid #555e70;
+        border-right: 2px solid #181b22;
+        border-bottom: 2px solid #181b22;
+        padding: 4px 5px;
+    }}
+    .deck-strip {{
+        background-color: #2d323d;
+        border-top: 2px solid #4e5668;
+        border-left: 2px solid #4e5668;
+        border-right: 2px solid #161920;
+        border-bottom: 2px solid #161920;
+        padding: 3px 4px;
+    }}
+    .engraved-title {{
+        color: #e6dcc8;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8.5pt;
+        letter-spacing: 0.5px;
+    }}
+    .engraved {{
+        color: #d6deec;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 7.8pt;
+    }}
+    .stem-badge {{
+        background-color: #182028;
+        color: #63f5d4;
+        border-top: 1px solid #0d1217;
+        border-left: 1px solid #0d1217;
+        border-right: 1px solid #4b5568;
+        border-bottom: 1px solid #4b5568;
+        padding: 1px 3px;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 7.5pt;
+    }}
+    button {{
+        background-image: none;
+        background-color: #454c5b;
+        color: #edf2f8;
+        border-top: 2px solid #778198;
+        border-left: 2px solid #778198;
+        border-right: 2px solid #1b1f27;
+        border-bottom: 2px solid #1b1f27;
+        border-radius: 0px;
+        padding: 2px 6px;
+        min-height: 18px;
+        min-width: 16px;
+        box-shadow: none;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8pt;
+    }}
+    button label {{
+        color: #edf2f8;
+    }}
+    button:hover {{
+        background-color: #525a6c;
+    }}
+    button:active, button:checked {{
+        background-color: #262b35;
+        border-top: 2px solid #15181f;
+        border-left: 2px solid #15181f;
+        border-right: 2px solid #6b7488;
+        border-bottom: 2px solid #6b7488;
+    }}
+    button.piano-key {{
+        background-color: #4d5566;
+        border-top: 3px solid #8a95ad;
+        border-left: 2px solid #7c879e;
+        border-right: 2px solid #171a21;
+        border-bottom: 3px solid #14171d;
+        padding: 4px 10px;
+        font-size: 8.5pt;
+    }}
+    button.piano-play-on {{
+        background-color: #1e573b;
+        border-top: 3px solid #113021;
+        border-left: 2px solid #113021;
+        border-right: 2px solid #59cf96;
+        border-bottom: 3px solid #59cf96;
+    }}
+    button.piano-play-on label {{
+        color: #7dffbe;
+    }}
+    button.piano-wind-on {{
+        background-color: #61481c;
+        border-top: 3px solid #2e210a;
+        border-left: 2px solid #2e210a;
+        border-right: 2px solid #f0b84d;
+        border-bottom: 3px solid #f0b84d;
+    }}
+    button.piano-wind-on label {{
+        color: #ffd97d;
+    }}
+    button.piano-rec {{
+        background-color: #632326;
+        border-top: 3px solid #9e474b;
+        border-left: 2px solid #9e474b;
+        border-right: 2px solid #290b0d;
+        border-bottom: 3px solid #290b0d;
+    }}
+    button.piano-rec label {{
+        color: #ffdede;
+    }}
+    button.piano-rec-on {{
+        background-color: #a81c22;
+        border-top: 3px solid #45080b;
+        border-left: 2px solid #45080b;
+        border-right: 2px solid #ff7a80;
+        border-bottom: 3px solid #ff7a80;
+    }}
+    button.piano-rec-on label {{
+        color: #ffffff;
+    }}
+    button.sw-active {{
+        background-color: #214d3f;
+        border-top: 2px solid #122922;
+        border-left: 2px solid #122922;
+        border-right: 2px solid #56c29f;
+        border-bottom: 2px solid #56c29f;
+    }}
+    button.sw-active label {{
+        color: #6effd2;
+    }}
+    button.sw-amber {{
+        background-color: #5e4419;
+        border-top: 2px solid #2b1e09;
+        border-left: 2px solid #2b1e09;
+        border-right: 2px solid #e6a947;
+        border-bottom: 2px solid #e6a947;
+    }}
+    button.sw-amber label {{
+        color: #ffd884;
+    }}
+    button.sw-arm-on {{
+        background-color: #9e1b22;
+        border-top: 2px solid #42080b;
+        border-left: 2px solid #42080b;
+        border-right: 2px solid #f26d74;
+        border-bottom: 2px solid #f26d74;
+    }}
+    button.sw-arm-on label {{
+        color: #ffffff;
+    }}
+    button.btn-gold {{
+        background-color: #6e5223;
+        border-top: 2px solid #b8914f;
+        border-left: 2px solid #b8914f;
+        border-right: 2px solid #2b1f0b;
+        border-bottom: 2px solid #2b1f0b;
+        padding: 2px 8px;
+    }}
+    button.btn-gold:hover {{
+        background-color: #82622b;
+    }}
+    button.btn-gold label {{
+        color: #fff0cc;
+    }}
+    button.btn-bounce {{
+        background-color: #1f5278;
+        border-top: 2px solid #68a8d9;
+        border-left: 2px solid #68a8d9;
+        border-right: 2px solid #0b2236;
+        border-bottom: 2px solid #0b2236;
+        padding: 2px 8px;
+    }}
+    button.btn-bounce:hover {{
+        background-color: #276491;
+    }}
+    button.btn-bounce label {{
+        color: #e6f6ff;
+    }}
+    button.mini-btn {{
+        padding: 1px 4px;
+        font-size: 7.5pt;
+    }}
+    combobox button.combo {{
+        background-color: #20252f;
+        color: #d8f8ee;
+        border-top: 2px solid #13161c;
+        border-left: 2px solid #13161c;
+        border-right: 2px solid #5d667a;
+        border-bottom: 2px solid #5d667a;
+        padding: 2px 5px;
+    }}
+    combobox button.combo label, combobox cellview {{
+        color: #d8f8ee;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 7.8pt;
+    }}
+    treeview.view {{
+        background-color: #1b2029;
+        color: #dbe6f5;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 7.8pt;
+    }}
+    treeview.view:selected {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    scrolledwindow {{
+        border-top: 2px solid #14171e;
+        border-left: 2px solid #14171e;
+        border-right: 2px solid #596275;
+        border-bottom: 2px solid #596275;
+    }}
+    scale trough {{
+        background-color: #191d25;
+        border: 1px solid #4c5466;
+        min-height: 6px;
+    }}
+    scale highlight {{
+        background-color: #d99b38;
+    }}
+    scale slider {{
+        background-color: #aeb7c9;
+        border-top: 2px solid #e4eaf5;
+        border-left: 2px solid #e4eaf5;
+        border-right: 2px solid #1f232b;
+        border-bottom: 2px solid #1f232b;
+        border-radius: 0px;
+        min-width: 14px;
+        min-height: 14px;
+    }}
+    .cde-status {{
+        background-color: {chrome};
+        color: #101216;
+        padding: 2px 8px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8pt;
+    }}
+    """
+    return css.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Built-in 4-Stem Vintage Analog Tape Demo Synthesizer & Audio File Loader
+# ---------------------------------------------------------------------------
+def write_mono_wav_16(path: Path, samples: np.ndarray, sr: int = SAMPLE_RATE):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    clipped = np.clip(samples, -1.0, 1.0)
+    pcm16 = (clipped * 32767.0).astype("<i2")
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(pcm16.tobytes())
+
+
+def ensure_demo_4track_stems(cache_dir: Path = CACHE_DIR) -> list[tuple[str, Path, np.ndarray]]:
+    """Synthesize a musical 16-second 4-stem 1980s analog Portastudio reel on demand."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    stem_specs = [
+        ("ANALOG BASS", cache_dir / "demo_trk1_bass.wav"),
+        ("JUNO CHORDS", cache_dir / "demo_trk2_chords.wav"),
+        ("TAPE DRUM+ARP", cache_dir / "demo_trk3_rhythm.wav"),
+        ("SYNTH LEAD", cache_dir / "demo_trk4_lead.wav"),
+    ]
+    if all(p.is_file() and p.stat().st_size > SAMPLE_RATE for _, p in stem_specs):
+        out = []
+        for label, p in stem_specs:
+            arr = load_audio_to_mono_f32(p)
+            out.append((label, p, arr))
+        return out
+
+    dur = 16.0  # 8 bars at 120 BPM (2.0s per bar, 0.5s per beat)
+    n = int(dur * SAMPLE_RATE)
+    t = np.arange(n, dtype=np.float32) / SAMPLE_RATE
+
+    # Chord progression (2 bars = 4s each): Am7 -> Fmaj7 -> Cmaj7 -> G6
+    # --- Stem 1: Warm Analog Saw+Sub Bass (8th notes = 0.25s) ---
+    bass = np.zeros(n, dtype=np.float32)
+    bass_roots = [55.0, 55.0, 43.6535, 43.6535, 65.4064, 65.4064, 48.9994, 48.9994]  # A1, F1, C2, G1 (1 bar each -> repeat x2)
+    bass_prog = [55.0, 55.0, 43.6535, 43.6535, 65.4064, 65.4064, 48.9994, 55.0]
+    eighth_n = int(0.25 * SAMPLE_RATE)
+    for step in range(int(dur / 0.25)):
+        i0 = step * eighth_n
+        i1 = min(n, i0 + eighth_n)
+        lt = np.arange(i1 - i0, dtype=np.float32) / SAMPLE_RATE
+        bar_idx = min(7, step // 8)
+        f0 = bass_prog[bar_idx] * (2.0 if (step % 4 == 2) else 1.0)
+        env = np.exp(-lt * 8.5) * (1.0 - np.exp(-lt * 180.0))
+        sig = (
+            0.62 * np.sin(2.0 * np.pi * f0 * lt)
+            + 0.28 * np.sin(2.0 * np.pi * 2.0 * f0 * lt)
+            + 0.12 * np.sin(2.0 * np.pi * 3.0 * f0 * lt) * env
+        )
+        bass[i0:i1] = sig * env * 0.78
+
+    # --- Stem 2: Lush Chorus Polysynth Chords ---
+    chords_hz = [
+        [220.00, 261.63, 329.63, 392.00],  # Am7
+        [174.61, 220.00, 261.63, 329.63],  # Fmaj7
+        [196.00, 261.63, 329.63, 493.88],  # Cmaj7/G
+        [196.00, 246.94, 293.66, 329.63],  # G6
+    ]
+    pad = np.zeros(n, dtype=np.float32)
+    seg_n = int(4.0 * SAMPLE_RATE)
+    for c_idx, freqs in enumerate(chords_hz):
+        i0 = c_idx * seg_n
+        i1 = min(n, i0 + seg_n)
+        lt = np.arange(i1 - i0, dtype=np.float32) / SAMPLE_RATE
+        lfo = 0.0035 * np.sin(2.0 * np.pi * 0.85 * lt)
+        env = np.minimum(1.0, lt / 0.18) * np.minimum(1.0, (4.0 - lt) / 0.22)
+        csum = np.zeros_like(lt)
+        for fk in freqs:
+            csum += np.sin(2.0 * np.pi * fk * (1.0 + lfo) * lt)
+            csum += 0.45 * np.sin(2.0 * np.pi * fk * 2.0 * (1.0 - lfo * 0.7) * lt)
+        pad[i0:i1] = np.tanh(csum * 0.22) * env * 0.65
+
+    # --- Stem 3: 1980s Studio Drum Machine + Sparkling 16th Arp ---
+    rhythm = np.zeros(n, dtype=np.float32)
+    rng = np.random.default_rng(1984)
+    beat_n = int(0.5 * SAMPLE_RATE)
+    sixteenth_n = int(0.125 * SAMPLE_RATE)
+    for b in range(int(dur / 0.5)):
+        i0 = b * beat_n
+        if b % 2 == 0:
+            # Punchy analog kick
+            kl = min(int(0.22 * SAMPLE_RATE), n - i0)
+            kt = np.arange(kl, dtype=np.float32) / SAMPLE_RATE
+            k_phase = 2.0 * np.pi * (48.0 * kt + 18.0 * (1.0 - np.exp(-kt * 38.0)))
+            rhythm[i0 : i0 + kl] += 0.72 * np.sin(k_phase) * np.exp(-kt * 14.0)
+        else:
+            # Gated 80s snare
+            sl = min(int(0.19 * SAMPLE_RATE), n - i0)
+            st_arr = np.arange(sl, dtype=np.float32) / SAMPLE_RATE
+            noise = rng.uniform(-1.0, 1.0, sl).astype(np.float32)
+            body = np.sin(2.0 * np.pi * 185.0 * st_arr) * np.exp(-st_arr * 26.0)
+            rhythm[i0 : i0 + sl] += (0.42 * noise * np.exp(-st_arr * 17.0) + 0.32 * body)
+
+    arp_notes_sets = [
+        [440.0, 523.25, 659.25, 783.99],
+        [349.23, 440.0, 523.25, 659.25],
+        [392.0, 523.25, 659.25, 783.99],
+        [392.0, 493.88, 587.33, 783.99],
+    ]
+    for s16 in range(int(dur / 0.125)):
+        i0 = s16 * sixteenth_n
+        i1 = min(n, i0 + sixteenth_n)
+        lt = np.arange(i1 - i0, dtype=np.float32) / SAMPLE_RATE
+        # Closed hi-hat tick
+        hh = rng.uniform(-1.0, 1.0, i1 - i0).astype(np.float32) * np.exp(-lt * 65.0) * 0.14
+        c_idx = min(3, s16 // 32)
+        fn = arp_notes_sets[c_idx][s16 % 4]
+        arp = np.sin(2.0 * np.pi * fn * lt) * np.exp(-lt * 16.0) * 0.24
+        rhythm[i0:i1] += hh + arp
+    rhythm = np.clip(rhythm, -0.95, 0.95)
+
+    # --- Stem 4: Analog Lead Melody + Broadcast Studio Sync Pips ---
+    lead = np.zeros(n, dtype=np.float32)
+    melody = [
+        (0.5, 1.0, 659.25), (1.5, 0.5, 587.33), (2.0, 1.5, 523.25),
+        (4.5, 1.0, 523.25), (5.5, 0.5, 587.33), (6.0, 1.5, 659.25),
+        (8.5, 1.0, 783.99), (9.5, 0.5, 659.25), (10.0, 1.5, 523.25),
+        (12.5, 1.0, 587.33), (13.5, 0.5, 659.25), (14.0, 1.6, 440.00),
+    ]
+    for t_start, n_dur, freq in melody:
+        i0 = int(t_start * SAMPLE_RATE)
+        i1 = min(n, int((t_start + n_dur) * SAMPLE_RATE))
+        lt = np.arange(i1 - i0, dtype=np.float32) / SAMPLE_RATE
+        vib = 1.0 + 0.0045 * np.sin(2.0 * np.pi * 5.4 * lt) * np.minimum(1.0, lt / 0.25)
+        env = np.minimum(1.0, lt / 0.04) * np.minimum(1.0, (n_dur - lt) / 0.08)
+        ph = 2.0 * np.pi * np.cumsum(np.full_like(lt, freq) * vib) / SAMPLE_RATE
+        wave_sig = 0.65 * np.sin(ph) + 0.22 * np.sin(2.0 * ph) + 0.10 * np.sin(3.0 * ph)
+        lead[i0:i1] += wave_sig * env * 0.56
+
+    # Subtle 1kHz studio slate sync pip on bar 1 & bar 5
+    for pip_t in (0.0, 8.0):
+        i0 = int(pip_t * SAMPLE_RATE)
+        i1 = min(n, i0 + int(0.06 * SAMPLE_RATE))
+        lt = np.arange(i1 - i0, dtype=np.float32) / SAMPLE_RATE
+        lead[i0:i1] += 0.35 * np.sin(2.0 * np.pi * 1000.0 * lt) * np.exp(-lt * 25.0)
+
+    arrays = [bass, pad, rhythm, lead]
+    out = []
+    for (label, path), arr in zip(stem_specs, arrays):
+        write_mono_wav_16(path, arr, SAMPLE_RATE)
+        out.append((label, path, arr))
+    return out
+
+
+def load_audio_to_mono_f32(path: Path) -> np.ndarray:
+    """Decode WAV (via `wave`+`numpy`) or any compressed audio (via GStreamer) to 44.1kHz mono float32."""
+    if path.suffix.lower() == ".wav":
+        try:
+            with wave.open(str(path), "rb") as wf:
+                nch = wf.getnchannels()
+                sw = wf.getsampwidth()
+                sr = wf.getframerate()
+                nframes = wf.getnframes()
+                raw = wf.readframes(nframes)
+            if sw == 2:
+                data = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+            elif sw == 1:
+                data = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+            elif sw == 4:
+                data = np.frombuffer(raw, dtype="<i4").astype(np.float32) / 2147483648.0
+            elif sw == 3:
+                b = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
+                val = (
+                    b[:, 0].astype(np.int32)
+                    | (b[:, 1].astype(np.int32) << 8)
+                    | (b[:, 2].astype(np.int8).astype(np.int32) << 16)
+                )
+                data = val.astype(np.float32) / 8388608.0
+            else:
+                raise ValueError("Unsupported PCM width")
+
+            if nch > 1:
+                data = data[: (len(data) // nch) * nch].reshape(-1, nch).mean(axis=1)
+            if sr != SAMPLE_RATE and len(data) > 1:
+                new_len = max(1, int(round(len(data) * SAMPLE_RATE / float(sr))))
+                xp = np.linspace(0.0, 1.0, len(data), dtype=np.float32)
+                xq = np.linspace(0.0, 1.0, new_len, dtype=np.float32)
+                data = np.interp(xq, xp, data).astype(np.float32)
+            return data
+        except Exception:
+            pass
+
+    # Fallback: GStreamer decodebin -> 44.1kHz S16LE mono appsink
+    uri = path.resolve().as_uri()
+    pipe = Gst.Pipeline.new("file_loader")
+    src = Gst.ElementFactory.make("uridecodebin", None)
+    src.set_property("uri", uri)
+    conv = Gst.ElementFactory.make("audioconvert", None)
+    res = Gst.ElementFactory.make("audioresample", None)
+    capsf = Gst.ElementFactory.make("capsfilter", None)
+    capsf.set_property("caps", Gst.Caps.from_string(f"audio/x-raw,format=S16LE,channels=1,rate={SAMPLE_RATE}"))
+    sink = Gst.ElementFactory.make("appsink", None)
+    sink.set_property("sync", False)
+    sink.set_property("emit-signals", False)
+
+    for el in (src, conv, res, capsf, sink):
+        pipe.add(el)
+    conv.link(res)
+    res.link(capsf)
+    capsf.link(sink)
+
+    def on_pad(_el, pad):
+        caps = pad.get_current_caps() or pad.query_caps(None)
+        if caps and caps.get_size() > 0 and caps.get_structure(0).get_name().startswith("audio/"):
+            sp = conv.get_static_pad("sink")
+            if sp and not sp.is_linked():
+                pad.link(sp)
+
+    src.connect("pad-added", on_pad)
+    chunks: list[np.ndarray] = []
+    pipe.set_state(Gst.State.PLAYING)
+    bus = pipe.get_bus()
+    deadline = time.monotonic() + 12.0
+    try:
+        while time.monotonic() < deadline:
+            sample = sink.emit("try-pull-sample", 40_000_000)
+            if sample is not None:
+                buf = sample.get_buffer()
+                ok, mi = buf.map(Gst.MapFlags.READ)
+                if ok:
+                    try:
+                        chunks.append(np.frombuffer(mi.data, dtype="<i2").copy())
+                    finally:
+                        buf.unmap(mi)
+            msg = bus.pop_filtered(Gst.MessageType.EOS | Gst.MessageType.ERROR)
+            if msg is not None:
+                break
+    finally:
+        pipe.set_state(Gst.State.NULL)
+
+    if not chunks:
+        return np.zeros(0, dtype=np.float32)
+    return np.concatenate(chunks).astype(np.float32) / 32768.0
+
+
+# ---------------------------------------------------------------------------
+# 4-Track Channel Model & Numpy Master Bounce Engine
+# ---------------------------------------------------------------------------
+@dataclass
+class TapeTrack:
+    index: int
+    name: str = "EMPTY"
+    path: str = ""
+    samples: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    fader: float = 0.78       # 0.0 .. 1.0 (0.78 ~= 0 dB unity, 1.0 = +3.5 dB)
+    pan: float = 0.5          # 0.0 = Hard L, 0.5 = Center, 1.0 = Hard R
+    muted: bool = False
+    solo: bool = False
+    rec_arm: bool = False
+    meter_db: float = -60.0   # Live channel strip post-fader dB
+
+    def gain_linear(self) -> float:
+        if self.fader <= 0.01:
+            return 0.0
+        # Smooth audio taper: 0.78 -> 1.0x (0dB), 1.0 -> 1.50x (+3.5dB)
+        return float(math.pow(self.fader / 0.78, 1.85))
+
+    def pan_gains(self) -> tuple[float, float]:
+        ang = self.pan * (math.pi * 0.5)
+        return float(math.cos(ang)), float(math.sin(ang))
+
+
+def bounce_tracks_numpy(
+    tracks: list[TapeTrack],
+    out_path: Path,
+    varispeed_pct: float = 0.0,
+    bias_mode: str = "WARM",
+    master_gain: float = 0.85,
+) -> tuple[bool, str, int]:
+    """Mix active 4-track stems with fader/pan/varispeed/tape-warmth into a stereo 16-bit WAV."""
+    any_solo = any(t.solo for t in tracks)
+    active: list[TapeTrack] = []
+    max_len = 0
+    for trk in tracks:
+        is_audible = trk.solo if any_solo else (not trk.muted)
+        if is_audible and len(trk.samples) > 0 and trk.fader > 0.01:
+            active.append(trk)
+            max_len = max(max_len, len(trk.samples))
+
+    if max_len == 0 or not active:
+        return False, "NO AUDIBLE TRACK AUDIO TO BOUNCE", 0
+
+    mix_l = np.zeros(max_len, dtype=np.float32)
+    mix_r = np.zeros(max_len, dtype=np.float32)
+
+    for trk in active:
+        g = trk.gain_linear()
+        gl, gr = trk.pan_gains()
+        n = len(trk.samples)
+        mix_l[:n] += trk.samples * (g * gl)
+        mix_r[:n] += trk.samples * (g * gr)
+
+    # Apply Varispeed resampling if non-zero
+    speed_ratio = max(0.80, min(1.20, 1.0 + varispeed_pct / 100.0))
+    if abs(speed_ratio - 1.0) > 0.002 and max_len > 4:
+        out_len = max(2, int(round(max_len / speed_ratio)))
+        xp = np.arange(max_len, dtype=np.float32)
+        xq = np.linspace(0.0, float(max_len - 1), out_len, dtype=np.float32)
+        mix_l = np.interp(xq, xp, mix_l).astype(np.float32)
+        mix_r = np.interp(xq, xp, mix_r).astype(np.float32)
+
+    # Apply Tape Bias / Oxide character
+    mg = float(max(0.05, master_gain * 1.15))
+    mix_l *= mg
+    mix_r *= mg
+    if bias_mode == "WARM":
+        drive = 1.28
+        norm_t = float(math.tanh(drive))
+        mix_l = np.tanh(mix_l * drive) / norm_t
+        mix_r = np.tanh(mix_r * drive) / norm_t
+    elif bias_mode == "DOLBY-B":
+        # Gentle 1-pole HF hiss smoothing
+        k = np.array([0.22, 0.56, 0.22], dtype=np.float32)
+        mix_l = np.convolve(mix_l, k, mode="same")
+        mix_r = np.convolve(mix_r, k, mode="same")
+
+    stereo = np.empty((len(mix_l), 2), dtype=np.float32)
+    stereo[:, 0] = np.clip(mix_l, -1.0, 1.0)
+    stereo[:, 1] = np.clip(mix_r, -1.0, 1.0)
+    pcm16 = (stereo * 32767.0).astype("<i2")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(out_path), "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(pcm16.tobytes())
+
+    return True, str(out_path), len(mix_l)
+
+
+# ---------------------------------------------------------------------------
+# Audio Input Device Discovery (Mic + Desktop Monitor)
+# ---------------------------------------------------------------------------
+def discover_record_sources() -> list[tuple[str, str]]:
+    """Return list of (id, label) audio capture sources including Desktop Monitor."""
+    sources: list[tuple[str, str]] = [("auto", "DEFAULT MIC / INPUT")]
+    try:
+        out = subprocess.check_output(
+            ["pactl", "list", "short", "sources"], text=True, stderr=subprocess.DEVNULL, timeout=1.5
+        )
+        for ln in out.splitlines():
+            parts = ln.split("\t")
+            if len(parts) >= 2:
+                dev = parts[1].strip()
+                if ".monitor" in dev:
+                    short = dev.replace("alsa_output.", "").replace(".monitor", "")[:22]
+                    sources.append((f"pulse:{dev}", f"MONITOR: {short}"))
+                else:
+                    short = dev.replace("alsa_input.", "")[:22]
+                    sources.append((f"pulse:{dev}", f"MIC: {short}"))
+    except Exception:
+        sources.append(("pulse_default_monitor", "DESKTOP MONITOR (PULSE)"))
+    sources.append(("sim_tone", "STUDIO TEST MIC (440Hz/VOX)"))
+    return sources
+
+
+# ---------------------------------------------------------------------------
+# Real-Time 4-Track Tape Transport, Simul-Sync Recorder & GStreamer Master Bus
+# ---------------------------------------------------------------------------
+class TapeDeckEngine:
+    def __init__(self, on_vu_cb, on_status_cb, headless: bool = False):
+        self.on_vu_cb = on_vu_cb
+        self.on_status_cb = on_status_cb
+        self.headless = headless
+
+        self.tracks: list[TapeTrack] = [
+            TapeTrack(0, "EMPTY", fader=0.80, pan=0.35),
+            TapeTrack(1, "EMPTY", fader=0.76, pan=0.65),
+            TapeTrack(2, "EMPTY", fader=0.78, pan=0.45),
+            TapeTrack(3, "EMPTY", fader=0.78, pan=0.55),
+        ]
+        self._lock = threading.Lock()
+
+        # Transport state: "STOP", "PLAY", "PAUSE", "REW", "FF", "REC", "RTZ"
+        self.mode: str = "STOP"
+        self.playhead: float = 0.0          # Sample index at 44.1 kHz
+        self.counter_zero_sample: float = 0.0
+        self.memory_sample: float = 0.0
+        self.rtz_target_sample: float = 0.0
+
+        # Loop A-B state: 0=off, 1=A set waiting B, 2=active A..B loop
+        self.loop_state: int = 0
+        self.loop_a: float = 0.0
+        self.loop_b: float = 0.0
+
+        # DSP parameters
+        self.eq_gains: list[float] = [0.0] * 10
+        self.varispeed_pct: float = 0.0     # -20.0 .. +20.0 %
+        self.bias_mode: str = "WARM"        # "FLAT" | "WARM" | "DOLBY-B"
+        self.master_gain: float = 0.82
+        self.input_source_id: str = "auto"
+
+        # GStreamer master bus elements
+        self._pipe: Gst.Pipeline | None = None
+        self._appsrc: Gst.Element | None = None
+        self._eq: Gst.Element | None = None
+        self._lp: Gst.Element | None = None
+        self._vol: Gst.Element | None = None
+
+        # Live recording capture pipeline & WAV writers
+        self._rec_pipe: Gst.Pipeline | None = None
+        self._rec_wavs: dict[int, tuple[wave.Wave_write, Path]] = {}
+        self._rec_write_cursor: int = 0
+
+        self._running = True
+        self._build_master_pipeline()
+        self._feeder_thread = threading.Thread(target=self._feeder_loop, daemon=True)
+        self._feeder_thread.start()
+
+    def total_samples(self) -> int:
+        m = max((len(t.samples) for t in self.tracks), default=0)
+        if self.mode == "REC":
+            m = max(m, int(self.playhead) + SAMPLE_RATE * 2)
+        return max(m, SAMPLE_RATE * 16)
+
+    def progress_fraction(self) -> float:
+        tot = max(1, self.total_samples())
+        return max(0.0, min(1.0, self.playhead / float(tot)))
+
+    def _build_master_pipeline(self):
+        pipe = Gst.Pipeline.new("dtdeck_master_bus")
+        appsrc = Gst.ElementFactory.make("appsrc", "tape_src")
+        appsrc.set_property("is-live", True)
+        appsrc.set_property("format", Gst.Format.TIME)
+        appsrc.set_property("do-timestamp", True)
+        appsrc.set_property("block", False)
+        appsrc.set_property("max-bytes", BLOCK_FRAMES * 4 * 6)
+        appsrc.set_property(
+            "caps",
+            Gst.Caps.from_string(
+                f"audio/x-raw,format=S16LE,channels=2,rate={SAMPLE_RATE},layout=interleaved"
+            ),
+        )
+
+        conv1 = Gst.ElementFactory.make("audioconvert", None)
+        eq = Gst.ElementFactory.make("equalizer-10bands", "eq10")
+        lp = Gst.ElementFactory.make("audiocheblimit", "tape_lp")
+        Gst.util_set_object_arg(lp, "mode", "low-pass")
+        lp.set_property("poles", 4)
+        lp.set_property("cutoff", 12500.0)
+
+        vol = Gst.ElementFactory.make("volume", "master_vol")
+        lvl = Gst.ElementFactory.make("level", "vu_level")
+        lvl.set_property("interval", 33_000_000)  # ~30 Hz
+        lvl.set_property("post-messages", True)
+        lvl.set_property("peak-ttl", 250_000_000)
+        lvl.set_property("peak-falloff", 14.0)
+
+        conv2 = Gst.ElementFactory.make("audioconvert", None)
+        res2 = Gst.ElementFactory.make("audioresample", None)
+        if self.headless:
+            sink = Gst.ElementFactory.make("fakesink", None)
+            sink.set_property("sync", True)
+        else:
+            sink = Gst.ElementFactory.make("autoaudiosink", None)
+
+        for el in (appsrc, conv1, eq, lp, vol, lvl, conv2, res2, sink):
+            pipe.add(el)
+
+        appsrc.link(conv1)
+        conv1.link(eq)
+        eq.link(lp)
+        lp.link(vol)
+        vol.link(lvl)
+        lvl.link(conv2)
+        conv2.link(res2)
+        res2.link(sink)
+
+        bus = pipe.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_bus_message)
+
+        self._pipe = pipe
+        self._appsrc = appsrc
+        self._eq = eq
+        self._lp = lp
+        self._vol = vol
+        self.apply_dsp()
+        pipe.set_state(Gst.State.PLAYING)
+
+    def apply_dsp(self):
+        if self._eq is not None:
+            for i in range(10):
+                g = float(max(-24.0, min(12.0, self.eq_gains[i])))
+                if self.bias_mode == "WARM":
+                    if i in (1, 2):
+                        g = min(12.0, g + 1.8)
+                    elif i == 9:
+                        g = max(-24.0, g - 2.0)
+                elif self.bias_mode == "DOLBY-B":
+                    if i >= 8:
+                        g = max(-24.0, g - 3.5)
+                self._eq.set_property(f"band{i}", g)
+
+        if self._lp is not None:
+            cutoff = {"FLAT": 19500.0, "WARM": 12200.0, "DOLBY-B": 8400.0}.get(self.bias_mode, 15000.0)
+            self._lp.set_property("cutoff", float(cutoff))
+
+        if self._vol is not None:
+            self._vol.set_property("volume", float(max(0.0, self.master_gain * 1.25)))
+
+    def _on_bus_message(self, _bus, msg):
+        if msg.type == Gst.MessageType.ELEMENT:
+            st = msg.get_structure()
+            if st and st.get_name() == "level":
+                rms_list = st.get_value("rms")
+                peak_list = st.get_value("peak")
+                if rms_list and len(rms_list) >= 2:
+                    rms_l = float(rms_list[0])
+                    rms_r = float(rms_list[1])
+                    pk_l = float(peak_list[0]) if peak_list and len(peak_list) >= 1 else rms_l
+                    pk_r = float(peak_list[1]) if peak_list and len(peak_list) >= 2 else rms_r
+                    if self.on_vu_cb:
+                        self.on_vu_cb(rms_l, rms_r, pk_l, pk_r)
+        elif msg.type == Gst.MessageType.ERROR:
+            err, _dbg = msg.parse_error()
+            if self.on_status_cb:
+                GLib.idle_add(self.on_status_cb, f"AUDIO ENGINE NOTICE: {err.message[:48]}")
+
+    def poll_bus_sync(self):
+        """Pump GStreamer bus messages explicitly when no GLib main loop is active (headless self-test)."""
+        if self._pipe is None:
+            return
+        bus = self._pipe.get_bus()
+        while True:
+            msg = bus.pop()
+            if msg is None:
+                break
+            self._on_bus_message(bus, msg)
+
+    # ---- Live Simul-Sync Multitrack Recording ----
+    def _start_live_capture(self, armed_indices: list[int]):
+        self._stop_live_capture()
+        DECK_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        with self._lock:
+            self._rec_write_cursor = int(max(0.0, self.playhead))
+            for idx in armed_indices:
+                out_p = DECK_DIR / f"dtdeck_trk{idx+1}_{ts}.wav"
+                wf = wave.open(str(out_p), "wb")
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(SAMPLE_RATE)
+                self._rec_wavs[idx] = (wf, out_p)
+                self.tracks[idx].name = f"REC TRK{idx+1}"
+                self.tracks[idx].path = str(out_p)
+                # Ensure buffer is at least up to current playhead
+                need = self._rec_write_cursor + SAMPLE_RATE * 4
+                if len(self.tracks[idx].samples) < need:
+                    pad = np.zeros(need - len(self.tracks[idx].samples), dtype=np.float32)
+                    self.tracks[idx].samples = np.concatenate([self.tracks[idx].samples, pad])
+
+        if self.input_source_id == "sim_tone" or self.headless:
+            # Built-in test microphone synth generated inside feeder loop
+            return
+
+        pipe = Gst.Pipeline.new("dtdeck_simul_rec")
+        src = None
+        if self.input_source_id.startswith("pulse:"):
+            dev = self.input_source_id.split(":", 1)[1]
+            src = Gst.ElementFactory.make("pulsesrc", None)
+            if src is not None:
+                src.set_property("device", dev)
+        elif self.input_source_id == "pulse_default_monitor":
+            src = Gst.ElementFactory.make("pulsesrc", None)
+        if src is None:
+            src = Gst.ElementFactory.make("autoaudiosrc", None)
+
+        conv = Gst.ElementFactory.make("audioconvert", None)
+        res = Gst.ElementFactory.make("audioresample", None)
+        capsf = Gst.ElementFactory.make("capsfilter", None)
+        capsf.set_property("caps", Gst.Caps.from_string(f"audio/x-raw,format=S16LE,channels=1,rate={SAMPLE_RATE}"))
+        appsink = Gst.ElementFactory.make("appsink", "rec_sink")
+        appsink.set_property("emit-signals", True)
+        appsink.set_property("sync", False)
+        appsink.set_property("drop", True)
+        appsink.set_property("max-buffers", 24)
+        appsink.connect("new-sample", self._on_capture_sample)
+
+        for el in (src, conv, res, capsf, appsink):
+            pipe.add(el)
+        src.link(conv)
+        conv.link(res)
+        res.link(capsf)
+        capsf.link(appsink)
+
+        ret = pipe.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            pipe.set_state(Gst.State.NULL)
+            if self.on_status_cb:
+                GLib.idle_add(self.on_status_cb, "MIC DEVICE UNAVAILABLE — USING STUDIO TEST INPUT")
+            return
+        self._rec_pipe = pipe
+
+    def _on_capture_sample(self, appsink):
+        sample = appsink.emit("pull-sample")
+        if sample is None or self.mode != "REC":
+            return Gst.FlowReturn.OK
+        buf = sample.get_buffer()
+        ok, mi = buf.map(Gst.MapFlags.READ)
+        if ok:
+            try:
+                raw_bytes = bytes(mi.data)
+                f32 = np.frombuffer(raw_bytes, dtype="<i2").astype(np.float32) / 32768.0
+                self._append_recorded_chunk(raw_bytes, f32)
+            finally:
+                buf.unmap(mi)
+        return Gst.FlowReturn.OK
+
+    def _append_recorded_chunk(self, raw_s16: bytes, f32: np.ndarray):
+        if len(f32) == 0:
+            return
+        rms = float(np.sqrt(np.mean(f32 * f32)) + 1e-9)
+        db = max(-60.0, min(6.0, 20.0 * math.log10(rms)))
+        with self._lock:
+            c0 = self._rec_write_cursor
+            c1 = c0 + len(f32)
+            for idx, (wf, _p) in self._rec_wavs.items():
+                try:
+                    wf.writeframesraw(raw_s16)
+                except Exception:
+                    pass
+                trk = self.tracks[idx]
+                if len(trk.samples) < c1 + SAMPLE_RATE:
+                    grow = np.zeros(max(SAMPLE_RATE * 4, c1 - len(trk.samples) + SAMPLE_RATE), dtype=np.float32)
+                    trk.samples = np.concatenate([trk.samples, grow])
+                trk.samples[c0:c1] = f32
+                trk.meter_db = db
+            self._rec_write_cursor = c1
+
+    def _stop_live_capture(self):
+        if self._rec_pipe is not None:
+            try:
+                self._rec_pipe.set_state(Gst.State.NULL)
+            except Exception:
+                pass
+            self._rec_pipe = None
+
+        saved_paths: list[str] = []
+        with self._lock:
+            end_cur = self._rec_write_cursor
+            for idx, (wf, out_p) in list(self._rec_wavs.items()):
+                try:
+                    wf.close()
+                except Exception:
+                    pass
+                trk = self.tracks[idx]
+                if 0 < end_cur < len(trk.samples):
+                    trk.samples = trk.samples[:end_cur].copy()
+                saved_paths.append(out_p.name)
+            self._rec_wavs.clear()
+
+        if saved_paths and self.on_status_cb:
+            GLib.idle_add(self.on_status_cb, f"SAVED SIMUL-SYNC TAKE -> ~/Music/dtDeck/{saved_paths[0]}")
+
+    # ---- Transport Commands ----
+    def set_mode(self, new_mode: str):
+        if new_mode == self.mode and new_mode != "STOP":
+            if new_mode == "PAUSE":
+                self.mode = "PLAY"
+            return
+
+        if self.mode == "REC" and new_mode != "REC":
+            self._stop_live_capture()
+
+        if new_mode == "REC":
+            armed = [t.index for t in self.tracks if t.rec_arm]
+            if not armed:
+                # Convenience: auto-arm Track 4 (or first empty track) if user clicks REC directly
+                empty = [t.index for t in self.tracks if len(t.samples) == 0]
+                pick = empty[0] if empty else 3
+                self.tracks[pick].rec_arm = True
+                armed = [pick]
+            self.mode = "REC"
+            self._start_live_capture(armed)
+            return
+
+        if new_mode == "PLAY" and self.playhead >= self.total_samples() - 64:
+            self.playhead = 0.0
+
+        self.mode = new_mode
+
+    def start_rtz(self, to_memory: bool = False):
+        if self.mode == "REC":
+            self._stop_live_capture()
+        self.rtz_target_sample = self.memory_sample if to_memory else self.counter_zero_sample
+        self.rtz_target_sample = max(0.0, min(float(self.total_samples()), self.rtz_target_sample))
+        if abs(self.playhead - self.rtz_target_sample) < BLOCK_FRAMES:
+            self.playhead = self.rtz_target_sample
+            self.mode = "STOP"
+        else:
+            self.mode = "RTZ"
+
+    # ---- Real-Time 4-Track Tape Head Readout Loop ----
+    def _feeder_loop(self):
+        frame_dt = BLOCK_FRAMES / float(SAMPLE_RATE)
+        next_t = time.monotonic()
+        sim_phase = 0.0
+
+        while self._running:
+            now = time.monotonic()
+            if now < next_t:
+                time.sleep(min(0.012, next_t - now))
+                continue
+            next_t = max(now, next_t + frame_dt)
+
+            m = self.mode
+            if m in ("PLAY", "REC"):
+                speed_ratio = max(0.80, min(1.20, 1.0 + self.varispeed_pct / 100.0))
+                step_samples = BLOCK_FRAMES * speed_ratio
+
+                with self._lock:
+                    tot = self.total_samples()
+                    pos0 = self.playhead
+                    pos1 = pos0 + step_samples
+
+                    if m == "PLAY" and self.loop_state == 2 and self.loop_b > self.loop_a + BLOCK_FRAMES:
+                        if pos1 >= self.loop_b:
+                            pos0 = self.loop_a
+                            pos1 = pos0 + step_samples
+
+                    if m == "PLAY" and pos0 >= tot:
+                        self.playhead = float(tot)
+                        self.mode = "STOP"
+                        for trk in self.tracks:
+                            trk.meter_db = -60.0
+                        continue
+
+                    any_solo = any(t.solo for t in self.tracks)
+                    mix_l = np.zeros(BLOCK_FRAMES, dtype=np.float32)
+                    mix_r = np.zeros(BLOCK_FRAMES, dtype=np.float32)
+                    xq = np.linspace(pos0, pos1, BLOCK_FRAMES, endpoint=False, dtype=np.float32)
+
+                    for trk in self.tracks:
+                        # In Simul-Sync REC, play un-armed tracks so user can overdub without feedback
+                        if m == "REC" and trk.rec_arm:
+                            continue
+                        n_s = len(trk.samples)
+                        if n_s == 0:
+                            trk.meter_db = max(-60.0, trk.meter_db - 3.2)
+                            continue
+
+                        idx_int = xq.astype(np.int64)
+                        valid = (idx_int >= 0) & (idx_int < n_s - 1)
+                        if not np.any(valid):
+                            trk.meter_db = max(-60.0, trk.meter_db - 3.2)
+                            continue
+
+                        seg = np.zeros(BLOCK_FRAMES, dtype=np.float32)
+                        vi = idx_int[valid]
+                        frac = xq[valid] - vi
+                        seg[valid] = trk.samples[vi] * (1.0 - frac) + trk.samples[vi + 1] * frac
+
+                        g = trk.gain_linear()
+                        post = seg * g
+                        rms = float(np.sqrt(np.mean(post * post)) + 1e-9)
+                        trk.meter_db = max(-60.0, min(6.0, 20.0 * math.log10(rms)))
+
+                        audible = trk.solo if any_solo else (not trk.muted)
+                        if audible and g > 0.0:
+                            gl, gr = trk.pan_gains()
+                            mix_l += post * gl
+                            mix_r += post * gr
+
+                    self.playhead = pos1
+
+                # If recording via simulated mic / headless self-test, synthesize live input
+                if m == "REC" and self._rec_pipe is None:
+                    lt = (np.arange(BLOCK_FRAMES, dtype=np.float32) + sim_phase) / SAMPLE_RATE
+                    sim_phase += BLOCK_FRAMES
+                    sim_sig = (
+                        0.42 * np.sin(2.0 * np.pi * 440.0 * lt)
+                        + 0.18 * np.sin(2.0 * np.pi * 554.37 * lt)
+                    ) * (0.65 + 0.35 * np.sin(2.0 * np.pi * 2.0 * lt))
+                    pcm_rec = (np.clip(sim_sig, -1.0, 1.0) * 32767.0).astype("<i2")
+                    self._append_recorded_chunk(pcm_rec.tobytes(), sim_sig.astype(np.float32))
+                    # Monitor soft input in headphones
+                    mix_l += sim_sig * 0.25
+                    mix_r += sim_sig * 0.25
+
+                if self.bias_mode == "WARM":
+                    mix_l = np.tanh(mix_l * 1.2) / 0.83365
+                    mix_r = np.tanh(mix_r * 1.2) / 0.83365
+
+                stereo = np.empty((BLOCK_FRAMES, 2), dtype=np.float32)
+                stereo[:, 0] = np.clip(mix_l, -1.0, 1.0)
+                stereo[:, 1] = np.clip(mix_r, -1.0, 1.0)
+                pcm_bytes = (stereo * 32767.0).astype("<i2").tobytes()
+                if self._appsrc is not None:
+                    self._appsrc.emit("push-buffer", Gst.Buffer.new_wrapped(pcm_bytes))
+
+            elif m in ("FF", "REW", "RTZ"):
+                wind_rate = 6.0 * BLOCK_FRAMES
+                with self._lock:
+                    tot = float(self.total_samples())
+                    if m == "FF":
+                        self.playhead = min(tot, self.playhead + wind_rate)
+                        if self.playhead >= tot:
+                            self.mode = "STOP"
+                    elif m == "REW":
+                        self.playhead = max(0.0, self.playhead - wind_rate)
+                        if self.playhead <= 0.0:
+                            self.mode = "STOP"
+                    elif m == "RTZ":
+                        diff = self.rtz_target_sample - self.playhead
+                        if abs(diff) <= wind_rate:
+                            self.playhead = self.rtz_target_sample
+                            self.mode = "STOP"
+                        else:
+                            self.playhead += math.copysign(wind_rate, diff)
+                    for trk in self.tracks:
+                        trk.meter_db = max(-60.0, trk.meter_db - 4.0)
+            else:
+                # STOP or PAUSE: decay per-track meters cleanly
+                with self._lock:
+                    for trk in self.tracks:
+                        trk.meter_db = max(-60.0, trk.meter_db - 3.5)
+
+    def shutdown(self):
+        self._running = False
+        self._stop_live_capture()
+        if self._feeder_thread.is_alive():
+            self._feeder_thread.join(timeout=0.8)
+        if self._pipe is not None:
+            try:
+                self._pipe.set_state(Gst.State.NULL)
+            except Exception:
+                pass
+            self._pipe = None
+
+
+# ---------------------------------------------------------------------------
+# Pure Cairo Studio Hardware Renderers (Shared by GTK Widgets & Self-Test)
+# ---------------------------------------------------------------------------
+def _draw_screw(cr: cairo.Context, x: float, y: float, r: float = 4.2):
+    cr.arc(x + 0.8, y + 1.0, r, 0, 2 * math.pi)
+    cr.set_source_rgba(0.03, 0.04, 0.05, 0.8)
+    cr.fill()
+    g = cairo.LinearGradient(x - r, y - r, x + r, y + r)
+    g.add_color_stop_rgb(0.0, 0.56, 0.60, 0.68)
+    g.add_color_stop_rgb(1.0, 0.22, 0.25, 0.30)
+    cr.arc(x, y, r, 0, 2 * math.pi)
+    cr.set_source(g)
+    cr.fill()
+    cr.set_line_width(1.2)
+    cr.set_source_rgb(0.12, 0.14, 0.17)
+    cr.move_to(x - r * 0.55, y - r * 0.35)
+    cr.line_to(x + r * 0.55, y + r * 0.35)
+    cr.stroke()
+
+
+def render_tape_well(
+    cr: cairo.Context,
+    W: float,
+    H: float,
+    reel_mode: str,
+    progress: float,
+    reel_angle_l: float,
+    reel_angle_r: float,
+    transport_mode: str,
+    tension_flex: float,
+):
+    """Render the backlit smoked-acrylic 4-Track Tape Well (7" NAB Reels OR Studio Cassette Shell)."""
+    # Outer brushed dark anodized aluminum deck plate
+    cr.rectangle(0, 0, W, H)
+    plate = cairo.LinearGradient(0, 0, 0, H)
+    plate.add_color_stop_rgb(0.0, 0.18, 0.20, 0.25)
+    plate.add_color_stop_rgb(0.5, 0.14, 0.16, 0.20)
+    plate.add_color_stop_rgb(1.0, 0.11, 0.13, 0.16)
+    cr.set_source(plate)
+    cr.fill()
+
+    for sx, sy in ((10, 10), (W - 10, 10), (10, H - 10), (W - 10, H - 10)):
+        _draw_screw(cr, sx, sy, 3.8)
+
+    # Recessed smoked acrylic viewing well
+    wx, wy, ww, wh = 18.0, 8.0, W - 36.0, H - 16.0
+    cr.rectangle(wx, wy, ww, wh)
+    cr.set_source_rgb(0.07, 0.06, 0.06)
+    cr.fill()
+
+    # Warm honey-amber incandescent interior cabinet illumination
+    lamp = cairo.RadialGradient(wx + ww * 0.5, wy + 18.0, 10.0, wx + ww * 0.5, wy + wh * 0.52, ww * 0.62)
+    lamp.add_color_stop_rgb(0.0, 0.68, 0.45, 0.18)
+    lamp.add_color_stop_rgb(0.45, 0.36, 0.23, 0.10)
+    lamp.add_color_stop_rgb(1.0, 0.10, 0.08, 0.07)
+    cr.rectangle(wx + 3, wy + 3, ww - 6, wh - 6)
+    cr.set_source(lamp)
+    cr.fill()
+
+    # Brushed steel inner backplate texture lines
+    cr.set_line_width(1.0)
+    cr.set_source_rgba(1.0, 0.85, 0.55, 0.035)
+    for y_line in range(int(wy + 8), int(wy + wh - 8), 4):
+        cr.move_to(wx + 5, y_line)
+        cr.line_to(wx + ww - 5, y_line)
+    cr.stroke()
+
+    p = max(0.0, min(1.0, progress))
+    engaged = transport_mode in ("PLAY", "REC")
+
+    if reel_mode == "nab":
+        # ---- MODE A: Twin 7" Spun-Aluminum 3-Slot NAB Reels ----
+        cy = wy + wh * 0.43
+        cx_l = wx + ww * 0.275
+        cx_r = wx + ww * 0.725
+        r_flange = min(ww * 0.205, wh * 0.39)
+        r_hub = r_flange * 0.34
+        r_max_tape = r_flange * 0.91
+        r_min_tape = r_hub * 1.15
+
+        # Area-conserving magnetic tape pancake radii
+        r_tape_l = math.sqrt((r_max_tape ** 2) * (1.0 - p) + (r_min_tape ** 2) * p)
+        r_tape_r = math.sqrt((r_min_tape ** 2) * (1.0 - p) + (r_max_tape ** 2) * p)
+
+        # Lower Tape Path Geometry (Tension arms, stainless guides, Permalloy head block, Capstan)
+        head_y = wy + wh - 24.0
+        guide_l_x, guide_l_y = wx + 36.0, wy + wh - 40.0 + tension_flex * 5.5
+        guide_r_x, guide_r_y = wx + ww - 36.0, wy + wh - 40.0 - tension_flex * 4.5
+        cap_x, cap_y = wx + ww * 0.66, head_y - 3.0
+
+        # Draw dark ferric-oxide 1/4" magnetic tape ribbon first (behind reel top flanges)
+        cr.set_line_width(3.0)
+        cr.set_source_rgb(0.32, 0.18, 0.10)
+        cr.move_to(cx_l - r_tape_l * 0.65, cy + r_tape_l * 0.75)
+        cr.line_to(guide_l_x, guide_l_y)
+        cr.line_to(wx + ww * 0.38, head_y - 2.0)
+        cr.line_to(wx + ww * 0.62, head_y - 2.0)
+        cr.line_to(cap_x, cap_y + 2.0)
+        cr.line_to(guide_r_x, guide_r_y)
+        cr.line_to(cx_r + r_tape_r * 0.65, cy + r_tape_r * 0.75)
+        cr.stroke()
+
+        # Draw Supply & Takeup NAB Reels
+        for cx, r_tape, ang, tag in (
+            (cx_l, r_tape_l, reel_angle_l, "SUPPLY"),
+            (cx_r, r_tape_r, reel_angle_r, "TAKEUP"),
+        ):
+            # Drop shadow on backplate
+            cr.arc(cx + 3.0, cy + 4.0, r_flange + 1.5, 0, 2 * math.pi)
+            cr.set_source_rgba(0.02, 0.02, 0.02, 0.65)
+            cr.fill()
+
+            # Rear reel flange rim
+            cr.arc(cx, cy, r_flange, 0, 2 * math.pi)
+            cr.set_source_rgb(0.38, 0.40, 0.45)
+            cr.fill()
+
+            # Dark brown oxide magnetic tape pancake + subtle concentric winding sheen
+            cr.arc(cx, cy, r_tape, 0, 2 * math.pi)
+            cr.set_source_rgb(0.22, 0.12, 0.07)
+            cr.fill()
+            for ring_f in (0.55, 0.72, 0.88):
+                rr = r_hub + (r_tape - r_hub) * ring_f
+                if rr > r_hub + 2.0:
+                    cr.arc(cx, cy, rr, 0, 2 * math.pi)
+                    cr.set_line_width(0.8)
+                    cr.set_source_rgba(0.46, 0.27, 0.15, 0.35)
+                    cr.stroke()
+
+            # Front Spun-Aluminum NAB Flange with 3 Trapezoidal Cutout Windows!
+            cr.save()
+            cr.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
+            cr.arc(cx, cy, r_flange, 0, 2 * math.pi)
+            for k in range(3):
+                a_mid = ang + k * (2.0 * math.pi / 3.0)
+                a_w_in = 0.34
+                a_w_out = 0.42
+                r_in = r_hub * 1.18
+                r_out = r_flange * 0.86
+                cr.move_to(cx + r_in * math.cos(a_mid - a_w_in), cy + r_in * math.sin(a_mid - a_w_in))
+                cr.arc(cx, cy, r_out, a_mid - a_w_out, a_mid + a_w_out)
+                cr.arc_negative(cx, cy, r_in, a_mid + a_w_in, a_mid - a_w_in)
+                cr.close_path()
+
+            alu = cairo.LinearGradient(cx - r_flange, cy - r_flange, cx + r_flange, cy + r_flange)
+            alu.add_color_stop_rgb(0.0, 0.90, 0.92, 0.96)
+            alu.add_color_stop_rgb(0.35, 0.68, 0.72, 0.79)
+            alu.add_color_stop_rgb(0.52, 0.94, 0.95, 0.98)
+            alu.add_color_stop_rgb(0.78, 0.56, 0.60, 0.68)
+            alu.add_color_stop_rgb(1.0, 0.78, 0.81, 0.88)
+            cr.set_source(alu)
+            cr.fill_preserve()
+            cr.set_fill_rule(cairo.FILL_RULE_WINDING)
+            cr.set_line_width(1.1)
+            cr.set_source_rgba(0.18, 0.20, 0.24, 0.85)
+            cr.stroke()
+            cr.restore()
+
+            # Center NAB Hub Ring + 3 Mounting Screws + Trident Spindle Clamp
+            cr.arc(cx, cy, r_hub * 0.88, 0, 2 * math.pi)
+            cr.set_source_rgb(0.78, 0.81, 0.87)
+            cr.fill()
+            cr.arc(cx, cy, r_hub * 0.52, 0, 2 * math.pi)
+            cr.set_source_rgb(0.15, 0.17, 0.21)
+            cr.fill()
+            for k in range(3):
+                sa = ang + k * (2.0 * math.pi / 3.0) + 0.52
+                cr.arc(cx + r_hub * 0.68 * math.cos(sa), cy + r_hub * 0.68 * math.sin(sa), 1.6, 0, 2 * math.pi)
+                cr.set_source_rgb(0.24, 0.27, 0.32)
+                cr.fill()
+                # Trident spindle spline
+                cr.set_line_width(2.0)
+                cr.set_source_rgb(0.84, 0.87, 0.92)
+                cr.move_to(cx, cy)
+                cr.line_to(cx + r_hub * 0.46 * math.cos(sa), cy + r_hub * 0.46 * math.sin(sa))
+                cr.stroke()
+
+            # Subtle silkscreen label above reel
+            cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            cr.set_font_size(7.5)
+            cr.set_source_rgba(0.96, 0.88, 0.70, 0.65)
+            ext = cr.text_extents(tag)
+            cr.move_to(cx - ext.width * 0.5, wy + 13.0)
+            cr.show_text(tag)
+
+        # Spring-loaded mechanical tension arms (Left & Right)
+        for piv_x, piv_y, gx, gy in (
+            (wx + 16.0, wy + wh - 66.0, guide_l_x, guide_l_y),
+            (wx + ww - 16.0, wy + wh - 66.0, guide_r_x, guide_r_y),
+        ):
+            cr.set_line_width(3.0)
+            cr.set_source_rgb(0.68, 0.72, 0.79)
+            cr.move_to(piv_x, piv_y)
+            cr.line_to(gx, gy)
+            cr.stroke()
+            cr.arc(piv_x, piv_y, 4.0, 0, 2 * math.pi)
+            cr.set_source_rgb(0.42, 0.46, 0.52)
+            cr.fill()
+            # Stainless roller guide
+            cr.arc(gx, gy, 5.2, 0, 2 * math.pi)
+            cr.set_source_rgb(0.88, 0.91, 0.96)
+            cr.fill()
+            cr.arc(gx, gy, 2.0, 0, 2 * math.pi)
+            cr.set_source_rgb(0.22, 0.25, 0.30)
+            cr.fill()
+
+    else:
+        # ---- MODE B: Studio CrO2 Master Cassette Shell ----
+        cw = min(ww * 0.76, 330.0)
+        ch = min(wh * 0.76, 162.0)
+        cx0 = wx + (ww - cw) * 0.5
+        cy0 = wy + 12.0
+
+        # Smoked transparent polycarbonate cassette body
+        cr.rectangle(cx0, cy0, cw, ch)
+        shell_g = cairo.LinearGradient(cx0, cy0, cx0, cy0 + ch)
+        shell_g.add_color_stop_rgb(0.0, 0.23, 0.24, 0.28)
+        shell_g.add_color_stop_rgb(1.0, 0.14, 0.15, 0.18)
+        cr.set_source(shell_g)
+        cr.fill_preserve()
+        cr.set_line_width(2.0)
+        cr.set_source_rgb(0.48, 0.52, 0.60)
+        cr.stroke()
+
+        # Champagne-Gold & Onyx Studio Cassette Label
+        lx, ly, lw, lh = cx0 + 16.0, cy0 + 11.0, cw - 32.0, ch * 0.62
+        cr.rectangle(lx, ly, lw, lh)
+        lbl_g = cairo.LinearGradient(lx, ly, lx, ly + lh)
+        lbl_g.add_color_stop_rgb(0.0, 0.88, 0.75, 0.46)
+        lbl_g.add_color_stop_rgb(0.32, 0.78, 0.63, 0.34)
+        lbl_g.add_color_stop_rgb(0.33, 0.16, 0.17, 0.21)
+        lbl_g.add_color_stop_rgb(1.0, 0.12, 0.13, 0.16)
+        cr.set_source(lbl_g)
+        cr.fill()
+
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(8.5)
+        cr.set_source_rgb(0.14, 0.11, 0.06)
+        cr.move_to(lx + 8.0, ly + 13.0)
+        cr.show_text("dtDeck STUDIO CrO2  •  TYPE II 70µs")
+        cr.move_to(lx + lw - 62.0, ly + 13.0)
+        cr.show_text("SIDE A")
+
+        # Center clear tape viewing window
+        vwx, vwy, vww, vwh = lx + 18.0, ly + lh * 0.36, lw - 36.0, lh * 0.56
+        cr.rectangle(vwx, vwy, vww, vwh)
+        cr.set_source_rgb(0.18, 0.13, 0.08)
+        cr.fill_preserve()
+        cr.set_line_width(1.2)
+        cr.set_source_rgb(0.55, 0.58, 0.65)
+        cr.stroke()
+
+        h_cy = vwy + vwh * 0.5
+        h_l = cx0 + cw * 0.31
+        h_r = cx0 + cw * 0.69
+        r_hub_c = min(vwh * 0.38, 17.5)
+        r_max_c = min(vwh * 0.92, 39.0)
+        r_tl = math.sqrt((r_max_c ** 2) * (1.0 - p) + ((r_hub_c * 1.15) ** 2) * p)
+        r_tr = math.sqrt(((r_hub_c * 1.15) ** 2) * (1.0 - p) + (r_max_c ** 2) * p)
+
+        # Clip tape packs to cassette window
+        cr.save()
+        cr.rectangle(lx + 4, ly + lh * 0.34, lw - 8, lh * 0.62)
+        cr.clip()
+        for hcx, rt in ((h_l, r_tl), (h_r, r_tr)):
+            cr.arc(hcx, h_cy, rt, 0, 2 * math.pi)
+            cr.set_source_rgb(0.24, 0.13, 0.08)
+            cr.fill()
+        cr.restore()
+
+        # 6-tooth splined cassette hubs
+        for hcx, ang in ((h_l, reel_angle_l), (h_r, reel_angle_r)):
+            cr.arc(hcx, h_cy, r_hub_c, 0, 2 * math.pi)
+            cr.set_source_rgb(0.88, 0.90, 0.94)
+            cr.fill()
+            cr.arc(hcx, h_cy, r_hub_c * 0.62, 0, 2 * math.pi)
+            cr.set_source_rgb(0.14, 0.15, 0.18)
+            cr.fill()
+            for t_i in range(6):
+                ta = ang + t_i * (math.pi / 3.0)
+                cr.set_line_width(2.2)
+                cr.set_source_rgb(0.90, 0.92, 0.96)
+                cr.move_to(hcx + r_hub_c * 0.38 * math.cos(ta), h_cy + r_hub_c * 0.38 * math.sin(ta))
+                cr.line_to(hcx + r_hub_c * 0.66 * math.cos(ta), h_cy + r_hub_c * 0.66 * math.sin(ta))
+                cr.stroke()
+
+        # Cassette bottom trapezoid head shield
+        bx0, bx1 = cx0 + cw * 0.16, cx0 + cw * 0.84
+        cr.move_to(bx0, cy0 + ch)
+        cr.line_to(bx0 + 12, cy0 + ch - 24)
+        cr.line_to(bx1 - 12, cy0 + ch - 24)
+        cr.line_to(bx1, cy0 + ch)
+        cr.close_path()
+        cr.set_source_rgb(0.26, 0.29, 0.35)
+        cr.fill_preserve()
+        cr.set_source_rgb(0.45, 0.49, 0.58)
+        cr.stroke()
+        for scx, scy in ((cx0 + 8, cy0 + 8), (cx0 + cw - 8, cy0 + 8), (cx0 + 8, cy0 + ch - 8), (cx0 + cw - 8, cy0 + ch - 8)):
+            _draw_screw(cr, scx, scy, 2.8)
+
+        head_y = wy + wh - 22.0
+        cap_x, cap_y = wx + ww * 0.67, head_y - 3.0
+
+    # ---- Lower Brushed Permalloy Head-Shield & Engaging Pinch Roller / Capstan ----
+    hs_w, hs_h = 166.0, 28.0
+    hs_x = wx + (ww - hs_w) * 0.5 - 10.0
+    hs_y = wy + wh - hs_h - 5.0
+    hs_grad = cairo.LinearGradient(hs_x, hs_y, hs_x, hs_y + hs_h)
+    hs_grad.add_color_stop_rgb(0.0, 0.78, 0.82, 0.88)
+    hs_grad.add_color_stop_rgb(0.45, 0.52, 0.56, 0.64)
+    hs_grad.add_color_stop_rgb(1.0, 0.30, 0.34, 0.40)
+    cr.rectangle(hs_x, hs_y, hs_w, hs_h)
+    cr.set_source(hs_grad)
+    cr.fill_preserve()
+    cr.set_line_width(1.2)
+    cr.set_source_rgb(0.14, 0.16, 0.20)
+    cr.stroke()
+
+    # Erase + Sync R/P Permalloy head tips peeking above head shield
+    for hx_off, hcol in ((28.0, (0.20, 0.22, 0.26)), (76.0, (0.85, 0.76, 0.52)), (122.0, (0.78, 0.82, 0.88))):
+        cr.rectangle(hs_x + hx_off, hs_y - 4.0, 14.0, 4.5)
+        cr.set_source_rgb(*hcol)
+        cr.fill()
+
+    cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    cr.set_font_size(7.4)
+    cr.set_source_rgb(0.10, 0.12, 0.15)
+    t1 = "4-TRACK SIMUL-SYNC"
+    ext1 = cr.text_extents(t1)
+    cr.move_to(hs_x + (hs_w - ext1.width) * 0.5, hs_y + 12.0)
+    cr.show_text(t1)
+    cr.set_font_size(6.6)
+    cr.set_source_rgb(0.18, 0.20, 0.25)
+    t2 = "PERMALLOY REC / REPRO"
+    ext2 = cr.text_extents(t2)
+    cr.move_to(hs_x + (hs_w - ext2.width) * 0.5, hs_y + 22.5)
+    cr.show_text(t2)
+
+    # Precision Capstan + Rubber Pinch Roller (engages upward in PLAY/REC!)
+    pr_x = hs_x + hs_w + 22.0
+    cap_sy = hs_y + 2.0
+    pr_y = cap_sy + (10.5 if engaged else 15.5)
+    # Capstan steel shaft
+    cr.arc(pr_x, cap_sy, 3.2, 0, 2 * math.pi)
+    cr.set_source_rgb(0.90, 0.93, 0.98)
+    cr.fill()
+    # Rubber pinch roller tire + brass bushing
+    cr.arc(pr_x, pr_y, 8.2, 0, 2 * math.pi)
+    cr.set_source_rgb(0.15, 0.16, 0.18)
+    cr.fill()
+    cr.arc(pr_x, pr_y, 3.6, 0, 2 * math.pi)
+    cr.set_source_rgb(0.78, 0.66, 0.36)
+    cr.fill()
+
+    # Subtle diagonal smoked-acrylic glass reflection streak + recessed bevel
+    cr.save()
+    cr.rectangle(wx, wy, ww, wh)
+    cr.clip()
+    cr.move_to(wx + ww * 0.08, wy)
+    cr.line_to(wx + ww * 0.22, wy)
+    cr.line_to(wx + ww * 0.04, wy + wh)
+    cr.line_to(wx - ww * 0.10, wy + wh)
+    cr.close_path()
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.04)
+    cr.fill()
+    cr.restore()
+
+    # Well sunken 3D bezel
+    cr.set_line_width(2.0)
+    cr.set_source_rgb(0.05, 0.06, 0.08)
+    cr.move_to(wx, wy + wh)
+    cr.line_to(wx, wy)
+    cr.line_to(wx + ww, wy)
+    cr.stroke()
+    cr.set_source_rgb(0.38, 0.42, 0.50)
+    cr.move_to(wx, wy + wh)
+    cr.line_to(wx + ww, wy + wh)
+    cr.line_to(wx + ww, wy)
+    cr.stroke()
+
+
+def _vu_db_to_norm(db: float) -> float:
+    """Authentic VU meter curve mapping (-24..+3 dB -> 0.0..1.0, with 0 dB at 0.74)."""
+    if db <= -24.0:
+        return 0.02
+    if db < -10.0:
+        return 0.02 + (db + 24.0) / 14.0 * 0.24
+    if db < 0.0:
+        return 0.26 + (db + 10.0) / 10.0 * 0.48
+    return min(1.0, 0.74 + (db / 3.2) * 0.26)
+
+
+def render_single_vu_meter(
+    cr: cairo.Context,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    ch_label: str,
+    needle_norm: float,
+    peak_lit: bool,
+):
+    # Outer black studio bezel
+    cr.rectangle(x, y, w, h)
+    cr.set_source_rgb(0.07, 0.08, 0.10)
+    cr.fill()
+
+    mx, my, mw, mh = x + 5.0, y + 5.0, w - 10.0, h - 10.0
+    glow = cairo.RadialGradient(mx + mw * 0.5, my + mh * 0.96, 6.0, mx + mw * 0.5, my + mh * 0.62, mw * 0.80)
+    glow.add_color_stop_rgb(0.0, 1.00, 0.93, 0.70)
+    glow.add_color_stop_rgb(0.62, 0.96, 0.82, 0.48)
+    glow.add_color_stop_rgb(1.0, 0.82, 0.65, 0.33)
+    cr.rectangle(mx, my, mw, mh)
+    cr.set_source(glow)
+    cr.fill()
+
+    piv_x = mx + mw * 0.5
+    piv_y = my + mh + 22.0
+    arc_r = min(mw * 0.56, mh * 0.95)
+    a0 = math.radians(-128.0)
+    a1 = math.radians(-52.0)
+    a_zero = a0 + 0.74 * (a1 - a0)
+
+    # -20 .. 0 dB black scale arc
+    cr.set_line_width(2.0)
+    cr.set_source_rgb(0.14, 0.12, 0.09)
+    cr.arc(piv_x, piv_y, arc_r, a0, a_zero)
+    cr.stroke()
+
+    # 0 .. +3 dB bold crimson overmodulation zone
+    cr.set_line_width(4.2)
+    cr.set_source_rgb(0.80, 0.13, 0.12)
+    cr.arc(piv_x, piv_y, arc_r + 1.0, a_zero, a1)
+    cr.stroke()
+
+    vu_marks = [
+        (0.06, "-20", False),
+        (0.26, "-10", False),
+        (0.40, "-7", False),
+        (0.50, "-5", False),
+        (0.60, "-3", False),
+        (0.69, "-1", False),
+        (0.74, "0", True),
+        (0.83, "+1", True),
+        (0.91, "+2", True),
+        (1.00, "+3", True),
+    ]
+    cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    cr.set_font_size(8.2)
+    for frac, lbl, is_red in vu_marks:
+        ang = a0 + frac * (a1 - a0)
+        cr.set_source_rgb(0.78, 0.12, 0.11) if is_red else cr.set_source_rgb(0.15, 0.12, 0.09)
+        cr.set_line_width(1.6 if lbl in ("-20", "-10", "-5", "0", "+3") else 1.1)
+        cr.move_to(piv_x + (arc_r - 4.5) * math.cos(ang), piv_y + (arc_r - 4.5) * math.sin(ang))
+        cr.line_to(piv_x + (arc_r + 5.5) * math.cos(ang), piv_y + (arc_r + 5.5) * math.sin(ang))
+        cr.stroke()
+
+        tx = piv_x + (arc_r + 14.0) * math.cos(ang)
+        ty = piv_y + (arc_r + 14.0) * math.sin(ang)
+        ext = cr.text_extents(lbl)
+        cr.move_to(tx - ext.width * 0.5, ty + ext.height * 0.38)
+        cr.show_text(lbl)
+
+    # Lower 0..100% modulation legend + classic VU face badge
+    cr.set_font_size(10.5)
+    cr.set_source_rgba(0.20, 0.15, 0.09, 0.85)
+    ext_vu = cr.text_extents("VU")
+    cr.move_to(piv_x - ext_vu.width * 0.5, my + mh * 0.72)
+    cr.show_text("VU")
+
+    cr.set_font_size(8.2)
+    cr.set_source_rgb(0.24, 0.18, 0.10)
+    cr.move_to(mx + 7.0, my + 13.5)
+    cr.show_text(ch_label)
+
+    # Crimson Jewel PEAK Clip LED in upper-right corner
+    lx, ly = mx + mw - 14.0, my + 11.5
+    if peak_lit:
+        halo = cairo.RadialGradient(lx, ly, 1.0, lx, ly, 9.0)
+        halo.add_color_stop_rgba(0.0, 1.0, 0.25, 0.25, 0.95)
+        halo.add_color_stop_rgba(1.0, 1.0, 0.08, 0.08, 0.0)
+        cr.arc(lx, ly, 9.0, 0, 2 * math.pi)
+        cr.set_source(halo)
+        cr.fill()
+        cr.arc(lx, ly, 4.0, 0, 2 * math.pi)
+        cr.set_source_rgb(1.0, 0.22, 0.22)
+        cr.fill()
+    else:
+        cr.arc(lx, ly, 4.0, 0, 2 * math.pi)
+        cr.set_source_rgb(0.32, 0.10, 0.10)
+        cr.fill()
+    cr.set_font_size(7.0)
+    cr.set_source_rgb(0.68, 0.12, 0.12) if peak_lit else cr.set_source_rgb(0.30, 0.22, 0.14)
+    cr.move_to(lx - 29.0, ly + 2.8)
+    cr.show_text("PEAK")
+
+    # Ballistic Needle + Shadow (clipped to meter face)
+    cr.save()
+    cr.rectangle(mx, my, mw, mh)
+    cr.clip()
+    n_ang = a0 + max(0.0, min(1.02, needle_norm)) * (a1 - a0)
+    cr.set_line_width(2.0)
+    cr.set_source_rgba(0.10, 0.07, 0.04, 0.35)
+    cr.move_to(piv_x + 2.0, piv_y + 2.0)
+    cr.line_to(piv_x + 2.0 + (arc_r + 8.0) * math.cos(n_ang), piv_y + 2.0 + (arc_r + 8.0) * math.sin(n_ang))
+    cr.stroke()
+
+    cr.set_line_width(1.9)
+    cr.set_source_rgb(0.14, 0.12, 0.11)
+    cr.move_to(piv_x, piv_y)
+    cr.line_to(piv_x + (arc_r + 8.0) * math.cos(n_ang), piv_y + (arc_r + 8.0) * math.sin(n_ang))
+    cr.stroke()
+    # Red pointer tip
+    cr.set_source_rgb(0.84, 0.12, 0.12)
+    cr.move_to(piv_x + (arc_r - 8.0) * math.cos(n_ang), piv_y + (arc_r - 8.0) * math.sin(n_ang))
+    cr.line_to(piv_x + (arc_r + 8.0) * math.cos(n_ang), piv_y + (arc_r + 8.0) * math.sin(n_ang))
+    cr.stroke()
+
+    cr.arc(piv_x, my + mh + 3.5, 11.0, 0, 2 * math.pi)
+    cr.set_source_rgb(0.15, 0.16, 0.19)
+    cr.fill()
+    cr.restore()
+
+    # Sunken meter frame bevel
+    cr.set_line_width(1.5)
+    cr.set_source_rgb(0.03, 0.03, 0.04)
+    cr.move_to(x, y + h)
+    cr.line_to(x, y)
+    cr.line_to(x + w, y)
+    cr.stroke()
+    cr.set_source_rgb(0.36, 0.40, 0.48)
+    cr.move_to(x, y + h)
+    cr.line_to(x + w, y + h)
+    cr.line_to(x + w, y)
+    cr.stroke()
+
+
+def render_drum_and_vfd_counter(
+    cr: cairo.Context,
+    W: float,
+    H: float,
+    drum_val: float,
+    cur_sec: float,
+    tot_sec: float,
+    mode: str,
+    mem_drum: int,
+    loop_state: int,
+    varispeed_pct: float,
+):
+    """Render 4-digit rolling mechanical odometer drum (0000..9999) + glowing cyan VFD time strip."""
+    cr.rectangle(0, 0, W, H)
+    cr.set_source_rgb(0.11, 0.13, 0.16)
+    cr.fill()
+
+    # Left: 4-Digit Mechanical Rolling Drum Counter
+    dx, dy, dw, dh = 6.0, 6.0, 122.0, H - 12.0
+    cr.rectangle(dx, dy, dw, dh)
+    cr.set_source_rgb(0.04, 0.05, 0.06)
+    cr.fill()
+
+    v = drum_val % 10000.0
+    if v < 0:
+        v += 10000.0
+    int_v = int(math.floor(v))
+    frac = v - int_v
+
+    digits = [
+        (int_v // 1000) % 10,
+        (int_v // 100) % 10,
+        (int_v // 10) % 10,
+        int_v % 10,
+    ]
+    # Cascade roll when lower wheels pass 9 -> 0
+    rolls = [0.0, 0.0, 0.0, frac]
+    if digits[3] == 9:
+        rolls[2] = frac
+        if digits[2] == 9:
+            rolls[1] = frac
+            if digits[1] == 9:
+                rolls[0] = frac
+
+    ww = (dw - 14.0) / 4.0
+    wh = dh - 8.0
+    wy = dy + 4.0
+    cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    cr.set_font_size(15.5)
+
+    for i in range(4):
+        wx = dx + 5.0 + i * (ww + 1.3)
+        cr.save()
+        cr.rectangle(wx, wy, ww, wh)
+        cr.clip()
+
+        # Cylindrical 3D plastic number wheel shading
+        wg = cairo.LinearGradient(wx, wy, wx, wy + wh)
+        wg.add_color_stop_rgb(0.0, 0.06, 0.07, 0.08)
+        wg.add_color_stop_rgb(0.28, 0.20, 0.22, 0.25)
+        wg.add_color_stop_rgb(0.50, 0.26, 0.28, 0.32)
+        wg.add_color_stop_rgb(0.72, 0.18, 0.20, 0.23)
+        wg.add_color_stop_rgb(1.0, 0.05, 0.06, 0.07)
+        cr.rectangle(wx, wy, ww, wh)
+        cr.set_source(wg)
+        cr.fill()
+
+        d_cur = digits[i]
+        d_nxt = (d_cur + 1) % 10
+        r_off = rolls[i] * wh
+
+        cr.set_source_rgb(0.95, 0.94, 0.88) if i < 3 else cr.set_source_rgb(1.0, 0.82, 0.42)
+        for d_num, y_shift in ((d_cur, -r_off), (d_nxt, wh - r_off)):
+            s = str(d_num)
+            ext = cr.text_extents(s)
+            cr.move_to(wx + (ww - ext.width) * 0.5 - ext.x_bearing, wy + wh * 0.5 + ext.height * 0.5 + y_shift - 1.0)
+            cr.show_text(s)
+        cr.restore()
+
+    # Right: Glowing Cyan Vacuum Fluorescent Display (VFD)
+    vx = dx + dw + 8.0
+    vw = max(80.0, W - vx - 6.0)
+    vy, vh = 6.0, H - 12.0
+    cr.rectangle(vx, vy, vw, vh)
+    cr.set_source_rgb(0.03, 0.08, 0.08)
+    cr.fill()
+
+    # Format MM:SS.d
+    mm = int(cur_sec) // 60
+    ss = int(cur_sec) % 60
+    ds = int((cur_sec - math.floor(cur_sec)) * 10.0)
+    t_mm = int(tot_sec) // 60
+    t_ss = int(tot_sec) % 60
+    time_str = f"{mm:02d}:{ss:02d}.{ds:1d}"
+
+    cr.set_font_size(17.5)
+    cr.set_source_rgb(0.32, 0.98, 0.86)
+    cr.move_to(vx + 10.0, vy + 24.0)
+    cr.show_text(time_str)
+
+    cr.set_font_size(8.5)
+    cr.set_source_rgb(0.24, 0.75, 0.68)
+    cr.move_to(vx + 106.0, vy + 16.0)
+    cr.show_text(f"/ {t_mm:02d}:{t_ss:02d}")
+
+    # Mode Annunciator Pill
+    mode_colors = {
+        "PLAY": (0.28, 0.98, 0.62),
+        "REC": (1.00, 0.30, 0.32),
+        "FF": (1.00, 0.78, 0.28),
+        "REW": (1.00, 0.78, 0.28),
+        "RTZ": (0.42, 0.88, 1.00),
+        "PAUSE": (1.00, 0.78, 0.28),
+        "STOP": (0.46, 0.68, 0.66),
+    }
+    mc = mode_colors.get(mode, (0.46, 0.68, 0.66))
+    badge_txt = "SIMUL-REC" if mode == "REC" else mode
+    ext_m = cr.text_extents(badge_txt)
+    bx = vx + vw - ext_m.width - 16.0
+    cr.set_source_rgba(mc[0], mc[1], mc[2], 0.20)
+    cr.rectangle(bx - 4.0, vy + 5.0, ext_m.width + 8.0, 14.0)
+    cr.fill()
+    cr.set_source_rgb(*mc)
+    cr.move_to(bx, vy + 15.0)
+    cr.show_text(badge_txt)
+
+    # Bottom VFD telemetry line: MEM + LOOP + VARISPEED
+    cr.set_font_size(7.8)
+    cr.set_source_rgb(0.36, 0.86, 0.78)
+    loop_txt = {0: "LOOP OFF", 1: "LOOP [A..]", 2: "LOOP [A-B]"}.get(loop_state, "LOOP OFF")
+    sub_txt = f"MEM {mem_drum:04d}  •  {loop_txt}  •  PITCH {varispeed_pct:+.1f}%"
+    cr.move_to(vx + 10.0, vy + vh - 6.5)
+    cr.show_text(sub_txt)
+
+
+# ---------------------------------------------------------------------------
+# Interactive Hardware Widgets: RotaryKnob, ChannelFaderMeter, GraphicEQBank
+# ---------------------------------------------------------------------------
+class RotaryKnob(Gtk.DrawingArea):
+    def __init__(self, label: str, init_val: float, default_val: float, on_change, fmt_fn=None, compact: bool = False):
+        super().__init__()
+        self.label = label
+        self.value = max(0.0, min(1.0, init_val))
+        self.default_val = default_val
+        self.on_change = on_change
+        self.fmt_fn = fmt_fn
+        self.compact = compact
+        self._drag_y = None
+        self._drag_start_val = self.value
+
+        if compact:
+            self.set_size_request(68, 60)
+        else:
+            self.set_size_request(86, 78)
+
+        self.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+            | Gdk.EventMask.SCROLL_MASK
+        )
+        self.connect("draw", self._on_draw)
+        self.connect("button-press-event", self._on_press)
+        self.connect("button-release-event", self._on_release)
+        self.connect("motion-notify-event", self._on_motion)
+        self.connect("scroll-event", self._on_scroll)
+
+    def set_value(self, v: float, notify: bool = False):
+        self.value = max(0.0, min(1.0, v))
+        self.queue_draw()
+        if notify and self.on_change:
+            self.on_change(self.value)
+
+    def _on_press(self, _w, ev):
+        if ev.type == Gdk.EventType._2BUTTON_PRESS:
+            self.set_value(self.default_val, notify=True)
+            return True
+        if ev.button == 1:
+            self._drag_y = ev.y
+            self._drag_start_val = self.value
+            return True
+        return False
+
+    def _on_release(self, _w, _ev):
+        self._drag_y = None
+        return True
+
+    def _on_motion(self, _w, ev):
+        if self._drag_y is not None:
+            dy = self._drag_y - ev.y
+            self.set_value(self._drag_start_val + dy / 100.0, notify=True)
+            return True
+        return False
+
+    def _on_scroll(self, _w, ev):
+        step = 0.04
+        if ev.direction == Gdk.ScrollDirection.UP:
+            self.set_value(self.value + step, notify=True)
+        elif ev.direction == Gdk.ScrollDirection.DOWN:
+            self.set_value(self.value - step, notify=True)
+        elif ev.direction == Gdk.ScrollDirection.SMOOTH:
+            _, _dx, dy = ev.get_scroll_deltas()
+            self.set_value(self.value - dy * 0.03, notify=True)
+        return True
+
+    def _on_draw(self, w, cr: cairo.Context):
+        alloc = w.get_allocation()
+        cx = alloc.width * 0.5
+        cy = 23.0 if self.compact else 29.0
+        r = 14.5 if self.compact else 19.5
+
+        a_start = math.radians(135.0)
+        a_span = math.radians(270.0)
+        for i in range(11):
+            frac = i / 10.0
+            ang = a_start + frac * a_span
+            r0 = r + 2.8
+            r1 = r + (5.8 if i in (0, 5, 10) else 4.2)
+            cr.set_line_width(1.4 if i in (0, 5, 10) else 0.9)
+            if abs(self.default_val - 0.5) < 0.02:
+                lit = (min(0.5, self.value) - 0.01 <= frac <= max(0.5, self.value) + 0.01)
+            else:
+                lit = frac <= self.value + 0.001
+            cr.set_source_rgb(0.36, 0.95, 0.82) if lit else cr.set_source_rgb(0.58, 0.63, 0.72)
+            cr.move_to(cx + r0 * math.cos(ang), cy + r0 * math.sin(ang))
+            cr.line_to(cx + r1 * math.cos(ang), cy + r1 * math.sin(ang))
+            cr.stroke()
+
+        cr.arc(cx + 1.2, cy + 1.8, r + 0.8, 0, 2 * math.pi)
+        cr.set_source_rgba(0.04, 0.05, 0.07, 0.75)
+        cr.fill()
+
+        cr.arc(cx, cy, r, 0, 2 * math.pi)
+        cr.set_source_rgb(0.15, 0.17, 0.21)
+        cr.fill()
+
+        pat = cairo.LinearGradient(cx - r, cy - r, cx + r, cy + r)
+        pat.add_color_stop_rgb(0.0, 0.84, 0.87, 0.93)
+        pat.add_color_stop_rgb(0.5, 0.54, 0.58, 0.66)
+        pat.add_color_stop_rgb(1.0, 0.30, 0.34, 0.41)
+        cr.arc(cx, cy, r - 2.6, 0, 2 * math.pi)
+        cr.set_source(pat)
+        cr.fill()
+
+        val_ang = a_start + self.value * a_span
+        cr.set_line_width(2.2)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_source_rgb(1.0, 0.48, 0.16)
+        cr.move_to(cx + 3.0 * math.cos(val_ang), cy + 3.0 * math.sin(val_ang))
+        cr.line_to(cx + (r - 3.8) * math.cos(val_ang), cy + (r - 3.8) * math.sin(val_ang))
+        cr.stroke()
+
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        sub_txt = self.fmt_fn(self.value) if self.fmt_fn else ""
+        if self.compact:
+            lbl = f"{self.label} {sub_txt}".strip()
+            cr.set_font_size(7.6)
+            ext = cr.text_extents(lbl)
+            cr.set_source_rgb(0.84, 0.90, 0.96)
+            cr.move_to(cx - ext.width * 0.5, 53.0)
+            cr.show_text(lbl)
+        else:
+            cr.set_font_size(8.4)
+            ext = cr.text_extents(self.label)
+            cr.set_source_rgb(0.86, 0.90, 0.96)
+            cr.move_to(cx - ext.width * 0.5, 62.0)
+            cr.show_text(self.label)
+            if sub_txt:
+                cr.set_font_size(7.8)
+                ext2 = cr.text_extents(sub_txt)
+                cr.set_source_rgb(0.45, 0.94, 0.84)
+                cr.move_to(cx - ext2.width * 0.5, 73.5)
+                cr.show_text(sub_txt)
+        return False
+
+
+class ChannelFaderMeter(Gtk.DrawingArea):
+    """Illuminated Vertical Studio Fader + 12-Segment Channel Bar Meter."""
+
+    def __init__(self, init_val: float, on_change):
+        super().__init__()
+        self.value = max(0.0, min(1.0, init_val))
+        self.default_val = 0.78
+        self.meter_db = -60.0
+        self.rec_armed = False
+        self.on_change = on_change
+        self._dragging = False
+
+        self.set_size_request(88, 128)
+        self.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+            | Gdk.EventMask.SCROLL_MASK
+        )
+        self.connect("draw", self._on_draw)
+        self.connect("button-press-event", self._on_press)
+        self.connect("button-release-event", self._on_release)
+        self.connect("motion-notify-event", self._on_motion)
+        self.connect("scroll-event", self._on_scroll)
+
+    def set_value(self, v: float, notify: bool = False):
+        self.value = max(0.0, min(1.0, v))
+        self.queue_draw()
+        if notify and self.on_change:
+            self.on_change(self.value)
+
+    def _y_to_val(self, y: float, h: float) -> float:
+        top, bot = 12.0, h - 12.0
+        return max(0.0, min(1.0, 1.0 - (y - top) / max(1.0, bot - top)))
+
+    def _on_press(self, w, ev):
+        if ev.type == Gdk.EventType._2BUTTON_PRESS:
+            self.set_value(self.default_val, notify=True)
+            return True
+        if ev.button == 1:
+            self._dragging = True
+            self.set_value(self._y_to_val(ev.y, w.get_allocation().height), notify=True)
+            return True
+        return False
+
+    def _on_release(self, _w, _ev):
+        self._dragging = False
+        return True
+
+    def _on_motion(self, w, ev):
+        if self._dragging:
+            self.set_value(self._y_to_val(ev.y, w.get_allocation().height), notify=True)
+            return True
+        return False
+
+    def _on_scroll(self, _w, ev):
+        step = 0.04
+        if ev.direction == Gdk.ScrollDirection.UP:
+            self.set_value(self.value + step, notify=True)
+        elif ev.direction == Gdk.ScrollDirection.DOWN:
+            self.set_value(self.value - step, notify=True)
+        elif ev.direction == Gdk.ScrollDirection.SMOOTH:
+            _, _dx, dy = ev.get_scroll_deltas()
+            self.set_value(self.value - dy * 0.03, notify=True)
+        return True
+
+    def _on_draw(self, w, cr: cairo.Context):
+        alloc = w.get_allocation()
+        W, H = float(alloc.width), float(alloc.height)
+        top, bot = 11.0, H - 11.0
+        span = max(20.0, bot - top)
+
+        fx = W * 0.34
+        # Fader dB tick marks (-inf, -20, -10, -5, 0, +3)
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(6.8)
+        for v_mark, lbl in ((1.0, "+3"), (0.78, " 0"), (0.58, "-5"), (0.38, "-10"), (0.18, "-20"), (0.0, " ∞")):
+            ym = bot - v_mark * span
+            cr.set_line_width(1.4 if v_mark == 0.78 else 0.9)
+            cr.set_source_rgb(0.95, 0.78, 0.42) if v_mark == 0.78 else cr.set_source_rgb(0.62, 0.68, 0.78)
+            cr.move_to(fx - 16.0, ym)
+            cr.line_to(fx - 8.0, ym)
+            cr.stroke()
+            cr.move_to(2.0, ym + 2.5)
+            cr.show_text(lbl)
+
+        # Recessed dark fader slot
+        cr.rectangle(fx - 3.0, top - 2.0, 6.0, span + 4.0)
+        cr.set_source_rgb(0.06, 0.07, 0.09)
+        cr.fill()
+
+        # Illuminated track glow below fader cap
+        cap_y = bot - self.value * span
+        if self.value > 0.01:
+            cr.rectangle(fx - 1.5, cap_y, 3.0, bot - cap_y)
+            cr.set_source_rgb(1.0, 0.32, 0.32) if self.rec_armed else cr.set_source_rgb(0.32, 0.94, 0.80)
+            cr.fill()
+
+        # Sculpted TASCAM-style silver/charcoal fader cap
+        cw, ch = 22.0, 15.0
+        cr.rectangle(fx - cw * 0.5 + 1.5, cap_y - ch * 0.5 + 2.0, cw, ch)
+        cr.set_source_rgba(0.03, 0.04, 0.05, 0.8)
+        cr.fill()
+
+        cg = cairo.LinearGradient(0, cap_y - ch * 0.5, 0, cap_y + ch * 0.5)
+        cg.add_color_stop_rgb(0.0, 0.88, 0.91, 0.96)
+        cg.add_color_stop_rgb(0.45, 0.52, 0.57, 0.65)
+        cg.add_color_stop_rgb(0.55, 0.34, 0.38, 0.45)
+        cg.add_color_stop_rgb(1.0, 0.72, 0.76, 0.84)
+        cr.rectangle(fx - cw * 0.5, cap_y - ch * 0.5, cw, ch)
+        cr.set_source(cg)
+        cr.fill_preserve()
+        cr.set_line_width(1.0)
+        cr.set_source_rgb(0.14, 0.16, 0.20)
+        cr.stroke()
+
+        # Center hairline on fader cap
+        cr.set_line_width(2.0)
+        cr.set_source_rgb(1.0, 0.36, 0.24) if self.rec_armed else cr.set_source_rgb(1.0, 0.78, 0.28)
+        cr.move_to(fx - cw * 0.5 + 2.0, cap_y)
+        cr.line_to(fx + cw * 0.5 - 2.0, cap_y)
+        cr.stroke()
+
+        # Right side: 12-Segment Vertical LED Bar Meter
+        mx = W - 20.0
+        mw = 12.0
+        cr.rectangle(mx - 2.0, top - 2.0, mw + 4.0, span + 4.0)
+        cr.set_source_rgb(0.07, 0.08, 0.10)
+        cr.fill()
+
+        n_segs = 12
+        seg_h = (span - (n_segs - 1) * 2.0) / n_segs
+        norm_lvl = max(0.0, min(1.0, (self.meter_db + 48.0) / 51.0))
+        lit_count = int(round(norm_lvl * n_segs))
+
+        for s in range(n_segs):
+            # s=0 bottom .. s=11 top
+            sy = bot - (s + 1) * seg_h - s * 2.0
+            is_lit = s < lit_count
+            if s >= 10:
+                col_on, col_off = (1.0, 0.22, 0.22), (0.28, 0.10, 0.10)
+            elif s >= 7:
+                col_on, col_off = (1.0, 0.78, 0.22), (0.28, 0.22, 0.09)
+            else:
+                col_on, col_off = (0.25, 0.95, 0.52), (0.09, 0.24, 0.14)
+            cr.rectangle(mx, sy, mw, seg_h)
+            cr.set_source_rgb(*(col_on if is_lit else col_off))
+            cr.fill()
+        return False
+
+
+class GraphicEQBank(Gtk.DrawingArea):
+    """Interactive 10-Band Illuminated Studio Graphic Equalizer (±12 dB)."""
+
+    def __init__(self, on_band_change):
+        super().__init__()
+        self.gains = [0.0] * 10  # -12.0 .. +12.0 dB
+        self.on_band_change = on_band_change
+        self._active_band: int | None = None
+
+        self.set_size_request(268, 178)
+        self.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+            | Gdk.EventMask.SCROLL_MASK
+        )
+        self.connect("draw", self._on_draw)
+        self.connect("button-press-event", self._on_press)
+        self.connect("button-release-event", self._on_release)
+        self.connect("motion-notify-event", self._on_motion)
+        self.connect("scroll-event", self._on_scroll)
+
+    def set_gains(self, gains: list[float], notify: bool = True):
+        for i in range(min(10, len(gains))):
+            self.gains[i] = max(-12.0, min(12.0, float(gains[i])))
+        self.queue_draw()
+        if notify and self.on_band_change:
+            self.on_band_change(list(self.gains))
+
+    def _band_at_x(self, x: float, w: float) -> int:
+        left = 26.0
+        col_w = max(12.0, (w - left - 6.0) / 10.0)
+        return max(0, min(9, int((x - left) / col_w)))
+
+    def _y_to_db(self, y: float, h: float) -> float:
+        top, bot = 14.0, h - 22.0
+        frac = 1.0 - max(0.0, min(1.0, (y - top) / max(1.0, bot - top)))
+        return -12.0 + frac * 24.0
+
+    def _on_press(self, w, ev):
+        alloc = w.get_allocation()
+        b = self._band_at_x(ev.x, alloc.width)
+        if ev.type == Gdk.EventType._2BUTTON_PRESS:
+            self.gains[b] = 0.0
+            self.queue_draw()
+            if self.on_band_change:
+                self.on_band_change(list(self.gains))
+            return True
+        if ev.button == 1:
+            self._active_band = b
+            self.gains[b] = self._y_to_db(ev.y, alloc.height)
+            self.queue_draw()
+            if self.on_band_change:
+                self.on_band_change(list(self.gains))
+            return True
+        return False
+
+    def _on_release(self, _w, _ev):
+        self._active_band = None
+        return True
+
+    def _on_motion(self, w, ev):
+        if self._active_band is not None:
+            alloc = w.get_allocation()
+            b = self._band_at_x(ev.x, alloc.width)
+            self._active_band = b
+            self.gains[b] = self._y_to_db(ev.y, alloc.height)
+            self.queue_draw()
+            if self.on_band_change:
+                self.on_band_change(list(self.gains))
+            return True
+        return False
+
+    def _on_scroll(self, w, ev):
+        alloc = w.get_allocation()
+        b = self._band_at_x(ev.x, alloc.width)
+        step = 1.0
+        if ev.direction == Gdk.ScrollDirection.UP:
+            self.gains[b] = min(12.0, self.gains[b] + step)
+        elif ev.direction == Gdk.ScrollDirection.DOWN:
+            self.gains[b] = max(-12.0, self.gains[b] - step)
+        elif ev.direction == Gdk.ScrollDirection.SMOOTH:
+            _, _dx, dy = ev.get_scroll_deltas()
+            self.gains[b] = max(-12.0, min(12.0, self.gains[b] - dy * 0.8))
+        self.queue_draw()
+        if self.on_band_change:
+            self.on_band_change(list(self.gains))
+        return True
+
+    def _on_draw(self, w, cr: cairo.Context):
+        alloc = w.get_allocation()
+        W, H = float(alloc.width), float(alloc.height)
+        cr.rectangle(0, 0, W, H)
+        cr.set_source_rgb(0.14, 0.16, 0.20)
+        cr.fill()
+
+        left = 26.0
+        top, bot = 14.0, H - 22.0
+        span = max(20.0, bot - top)
+        mid_y = top + span * 0.5
+        col_w = (W - left - 6.0) / 10.0
+
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(6.8)
+        for db_v, lbl in ((12.0, "+12"), (6.0, " +6"), (0.0, "  0"), (-6.0, " -6"), (-12.0, "-12")):
+            yy = top + (1.0 - (db_v + 12.0) / 24.0) * span
+            cr.set_line_width(1.2 if db_v == 0.0 else 0.7)
+            cr.set_source_rgba(0.95, 0.76, 0.36, 0.55) if db_v == 0.0 else cr.set_source_rgba(0.55, 0.62, 0.72, 0.28)
+            cr.move_to(left, yy)
+            cr.line_to(W - 6.0, yy)
+            cr.stroke()
+            cr.set_source_rgb(0.78, 0.83, 0.90)
+            cr.move_to(2.0, yy + 2.5)
+            cr.show_text(lbl)
+
+        # Draw connected amber frequency response curve glow behind sliders
+        pts = []
+        for i in range(10):
+            cx = left + (i + 0.5) * col_w
+            cy = top + (1.0 - (self.gains[i] + 12.0) / 24.0) * span
+            pts.append((cx, cy))
+        cr.set_line_width(1.6)
+        cr.set_source_rgba(0.38, 0.96, 0.84, 0.45)
+        cr.move_to(*pts[0])
+        for px, py in pts[1:]:
+            cr.line_to(px, py)
+        cr.stroke()
+
+        # Individual band slots + illuminated LED thumb caps
+        for i, (cx, cy) in enumerate(pts):
+            cr.rectangle(cx - 2.0, top, 4.0, span)
+            cr.set_source_rgb(0.06, 0.07, 0.09)
+            cr.fill()
+
+            # Boost/cut bar from 0dB center line
+            y0, y1 = min(mid_y, cy), max(mid_y, cy)
+            if y1 - y0 > 1.0:
+                cr.rectangle(cx - 1.2, y0, 2.4, y1 - y0)
+                cr.set_source_rgb(0.32, 0.94, 0.82)
+                cr.fill()
+
+            # Thumb cap with glowing amber center LED
+            tw, th = min(16.0, col_w - 3.0), 9.0
+            cr.rectangle(cx - tw * 0.5, cy - th * 0.5, tw, th)
+            cr.set_source_rgb(0.66, 0.71, 0.80)
+            cr.fill_preserve()
+            cr.set_line_width(0.9)
+            cr.set_source_rgb(0.12, 0.14, 0.18)
+            cr.stroke()
+
+            cr.rectangle(cx - tw * 0.32, cy - 1.2, tw * 0.64, 2.4)
+            cr.set_source_rgb(1.0, 0.68, 0.18)
+            cr.fill()
+
+            # Band frequency label at bottom
+            flbl = EQ_BANDS_LABELS[i]
+            ext = cr.text_extents(flbl)
+            cr.set_source_rgb(0.84, 0.88, 0.95)
+            cr.move_to(cx - ext.width * 0.5, H - 6.0)
+            cr.show_text(flbl)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Main dtDeck 4-Track Tape & Aircheck Studio Window
+# ---------------------------------------------------------------------------
+class DtDeckWindow(Gtk.Window):
+    def __init__(self, initial_file: str | None = None, self_test: bool = False):
+        super().__init__(title="dtDeck — 4-Track Simul-Sync Tape & Aircheck Studio")
+        self.set_default_size(1120, 660)
+        self.set_resizable(True)
+        self._self_test = self_test
+
+        for icon_cand in (
+            HOME / ".dt" / "icons" / "dtdeck.pm",
+            Path(__file__).resolve().parent / "icons" / "dtdeck.pm",
+        ):
+            if icon_cand.is_file():
+                try:
+                    self.set_icon_from_file(str(icon_cand))
+                    break
+                except Exception:
+                    pass
+
+        chrome, sel, well = load_cde_palette()
+        prov = Gtk.CssProvider()
+        prov.load_from_data(build_deck_css(chrome, sel, well))
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        # Visual animation & ballistic VU state (30 fps)
+        self.reel_mode = "nab"          # "nab" (7" Reel-to-Reel) | "cassette" (Studio Cassette Shell)
+        self.reel_angle_l = 0.35
+        self.reel_angle_r = 1.10
+        self.tension_pos = 0.0
+        self.tension_vel = 0.0
+        self._last_mode = "STOP"
+
+        self.vu_target_l = 0.03
+        self.vu_target_r = 0.03
+        self.vu_needle_l = 0.03
+        self.vu_needle_r = 0.03
+        self.peak_hold_l = 0.0
+        self.peak_hold_r = 0.0
+
+        self._updating_seek = False
+        self.browser_filter = "ALL"
+        self.input_sources = discover_record_sources()
+
+        self.engine = TapeDeckEngine(self._on_vu_telemetry, self._set_status, headless=False)
+
+        self._build_ui()
+        loaded_prev = self._load_state()
+        if initial_file and Path(initial_file).is_file():
+            self._load_file_into_track(0, Path(initial_file))
+        elif not loaded_prev:
+            # Load the 4-stem analog demo tape out of the box so pressing PLAY works immediately!
+            self._load_demo_4track(auto_play=False)
+
+        self._refresh_library_list()
+        self._sync_all_controls()
+
+        GLib.timeout_add(33, self._tick_30fps)
+        self.connect("destroy", self._on_destroy)
+        self.connect("key-press-event", self._on_key_press)
+
+        if self._self_test:
+            GLib.timeout_add(250, self._run_gui_self_test, 0)
+
+    # ---- UI Construction ----
+    def _build_ui(self):
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(root)
+
+        cab = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        cab.get_style_context().add_class("deck-cabinet")
+        root.pack_start(cab, True, True, 0)
+
+        # 1. Top Engraved Studio Nameplate & Master Action Bar
+        hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        hdr.get_style_context().add_class("deck-module")
+        cab.pack_start(hdr, False, False, 0)
+
+        badge = Gtk.Label(label="dtDeck MODEL 424  •  4-TRACK SIMUL-SYNC TAPE & AIRCHECK STUDIO")
+        badge.get_style_context().add_class("engraved-title")
+        badge.set_xalign(0.0)
+        hdr.pack_start(badge, True, True, 4)
+
+        lbl_shell = Gtk.Label(label="WELL:")
+        lbl_shell.get_style_context().add_class("engraved")
+        hdr.pack_start(lbl_shell, False, False, 2)
+
+        self.btn_nab = Gtk.Button(label='◎ 7" NAB REELS')
+        self.btn_nab.connect("clicked", lambda _b: self._set_reel_mode("nab"))
+        hdr.pack_start(self.btn_nab, False, False, 0)
+
+        self.btn_cas = Gtk.Button(label="⊞ STUDIO CASSETTE")
+        self.btn_cas.connect("clicked", lambda _b: self._set_reel_mode("cassette"))
+        hdr.pack_start(self.btn_cas, False, False, 0)
+
+        hdr.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 3)
+
+        btn_demo = Gtk.Button(label="★ LOAD DEMO 4-TRACK TAPE")
+        btn_demo.get_style_context().add_class("btn-gold")
+        btn_demo.set_tooltip_text("Synthesize & load a 4-stem 1980s analog demo reel onto TRK 1..4")
+        btn_demo.connect("clicked", lambda _b: self._load_demo_4track(auto_play=True))
+        hdr.pack_start(btn_demo, False, False, 0)
+
+        btn_bounce = Gtk.Button(label="⬇ BOUNCE MASTER .WAV")
+        btn_bounce.get_style_context().add_class("btn-bounce")
+        btn_bounce.set_tooltip_text("Mix active tracks (with Fader, Pan, Varispeed & Bias) into ~/Music/dtDeck/")
+        btn_bounce.connect("clicked", self._on_bounce_clicked)
+        hdr.pack_start(btn_bounce, False, False, 0)
+
+        # 2. Upper Studio Bridge: Left Backlit Tape Well + Right Dual VU Meters & Counter Module
+        upper = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        cab.pack_start(upper, False, False, 0)
+
+        # 2A. Centerpiece Backlit Mechanical Tape Well (30 fps Cairo)
+        self.well_area = Gtk.DrawingArea()
+        self.well_area.set_size_request(488, 224)
+        self.well_area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.well_area.set_tooltip_text('Click well to toggle 7" NAB Reels / Studio Cassette Shell')
+        self.well_area.connect("draw", self._on_draw_well)
+        self.well_area.connect(
+            "button-press-event",
+            lambda _w, ev: self._set_reel_mode("cassette" if self.reel_mode == "nab" else "nab") if ev.button == 1 else False,
+        )
+        upper.pack_start(self.well_area, True, True, 0)
+
+        # 2B. Right Bridge: Dual Ballistic VU Meters + Mechanical Drum / Cyan VFD Counter
+        bridge_r = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        bridge_r.get_style_context().add_class("deck-module")
+        upper.pack_start(bridge_r, True, True, 0)
+
+        self.vu_area = Gtk.DrawingArea()
+        self.vu_area.set_size_request(590, 152)
+        self.vu_area.connect("draw", self._on_draw_vu)
+        bridge_r.pack_start(self.vu_area, True, True, 0)
+
+        cnt_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        bridge_r.pack_start(cnt_row, False, False, 0)
+
+        self.counter_area = Gtk.DrawingArea()
+        self.counter_area.set_size_request(405, 56)
+        self.counter_area.connect("draw", self._on_draw_counter)
+        cnt_row.pack_start(self.counter_area, True, True, 0)
+
+        cnt_btns = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        cnt_row.pack_start(cnt_btns, False, False, 0)
+
+        cnt_top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        cnt_btns.pack_start(cnt_top, True, True, 0)
+        btn_rst = Gtk.Button(label="RESET 0000")
+        btn_rst.set_tooltip_text("Zero the 4-digit mechanical tape counter at current tape position")
+        btn_rst.connect("clicked", self._on_counter_reset)
+        cnt_top.pack_start(btn_rst, True, True, 0)
+
+        btn_mem = Gtk.Button(label="MEMORY")
+        btn_mem.set_tooltip_text("Store current tape position into Auto-Locator Memory")
+        btn_mem.connect("clicked", self._on_counter_memory)
+        cnt_top.pack_start(btn_mem, True, True, 0)
+
+        cnt_bot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        cnt_btns.pack_start(cnt_bot, True, True, 0)
+        self.btn_rtz = Gtk.Button(label="◀ RTZ (0000)")
+        self.btn_rtz.set_tooltip_text("Return-to-Zero: high-speed wind to 0000 and auto-stop")
+        self.btn_rtz.connect("clicked", lambda _b: self._trigger_rtz(to_memory=False))
+        cnt_bot.pack_start(self.btn_rtz, True, True, 0)
+
+        btn_rtm = Gtk.Button(label="LOC MEM")
+        btn_rtm.set_tooltip_text("High-speed wind to stored MEMORY cue point and auto-stop")
+        btn_rtm.connect("clicked", lambda _b: self._trigger_rtz(to_memory=True))
+        cnt_bot.pack_start(btn_rtm, False, False, 0)
+
+        # 3. Chunky Mechanical Piano-Key Transport Bar + Scrub Bar + Live Input Source
+        trans_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        trans_bar.get_style_context().add_class("deck-module")
+        cab.pack_start(trans_bar, False, False, 0)
+
+        self.btn_rew = self._make_piano_btn("◀◀ REW", lambda _b: self._set_transport("REW"))
+        self.btn_play = self._make_piano_btn("▶ PLAY", lambda _b: self._set_transport("PLAY"))
+        self.btn_stop = self._make_piano_btn("■ STOP", lambda _b: self._set_transport("STOP"))
+        self.btn_ff = self._make_piano_btn("▶▶ FF", lambda _b: self._set_transport("FF"))
+        self.btn_rec = self._make_piano_btn("● REC", lambda _b: self._set_transport("REC"), extra_cls="piano-rec")
+        self.btn_pause = self._make_piano_btn("⏸ PAUSE", lambda _b: self._set_transport("PAUSE"))
+        self.btn_loop = self._make_piano_btn("A-B LOOP", self._on_loop_clicked)
+
+        for b in (self.btn_rew, self.btn_play, self.btn_stop, self.btn_ff, self.btn_rec, self.btn_pause, self.btn_loop):
+            trans_bar.pack_start(b, False, False, 0)
+
+        self.seek_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 1000.0, 1.0)
+        self.seek_scale.set_draw_value(False)
+        self.seek_scale.set_hexpand(True)
+        self.seek_scale.set_tooltip_text("Tape Shuttle / Position Scrub")
+        self.seek_scale.connect("change-value", self._on_seek_drag)
+        trans_bar.pack_start(self.seek_scale, True, True, 6)
+
+        lbl_in = Gtk.Label(label="REC IN:")
+        lbl_in.get_style_context().add_class("engraved")
+        trans_bar.pack_start(lbl_in, False, False, 0)
+
+        self.in_combo = Gtk.ComboBoxText()
+        for _sid, slbl in self.input_sources:
+            self.in_combo.append_text(slbl)
+        self.in_combo.set_active(0)
+        self.in_combo.set_tooltip_text("Select Microphone or Desktop Audio Monitor for Live Simul-Sync Recording")
+        self.in_combo.connect("changed", self._on_input_source_changed)
+        trans_bar.pack_start(self.in_combo, False, False, 0)
+
+        # 4. Lower Studio Console: 4-Track Mixer + 10-Band EQ/Varispeed + Aircheck Quick-Browser
+        lower = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        cab.pack_start(lower, True, True, 0)
+
+        # ---- Module 4A: 4-Track Simul-Sync Studio Mixer (TRK 1..4) ----
+        mixer_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        mixer_box.get_style_context().add_class("deck-module")
+        lower.pack_start(mixer_box, False, False, 0)
+
+        self.strip_widgets: list[dict] = []
+        for idx in range(4):
+            trk = self.engine.tracks[idx]
+            st = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            st.get_style_context().add_class("deck-strip")
+            st.set_size_request(104, -1)
+            mixer_box.pack_start(st, False, False, 0)
+
+            hdr_lbl = Gtk.Label(label=f"TRK {idx+1}")
+            hdr_lbl.get_style_context().add_class("engraved")
+            st.pack_start(hdr_lbl, False, False, 0)
+
+            stem_lbl = Gtk.Label(label=trk.name[:12])
+            stem_lbl.get_style_context().add_class("stem-badge")
+            stem_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+            stem_lbl.set_max_width_chars(12)
+            st.pack_start(stem_lbl, False, False, 0)
+
+            pan_knob = RotaryKnob(
+                "PAN",
+                trk.pan,
+                0.5,
+                lambda v, i=idx: self._on_track_pan(i, v),
+                fmt_fn=self._fmt_pan,
+                compact=True,
+            )
+            st.pack_start(pan_knob, False, False, 0)
+
+            fader = ChannelFaderMeter(trk.fader, lambda v, i=idx: self._on_track_fader(i, v))
+            st.pack_start(fader, True, True, 0)
+
+            row_ms = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+            st.pack_start(row_ms, False, False, 0)
+
+            btn_arm = Gtk.Button(label="● ARM")
+            btn_arm.get_style_context().add_class("mini-btn")
+            btn_arm.set_tooltip_text(f"Record-Arm Track {idx+1} for Simul-Sync overdubbing")
+            btn_arm.connect("clicked", lambda _b, i=idx: self._toggle_track_arm(i))
+            row_ms.pack_start(btn_arm, True, True, 0)
+
+            btn_mute = Gtk.Button(label="M")
+            btn_mute.get_style_context().add_class("mini-btn")
+            btn_mute.set_tooltip_text(f"Mute Track {idx+1}")
+            btn_mute.connect("clicked", lambda _b, i=idx: self._toggle_track_mute(i))
+            row_ms.pack_start(btn_mute, False, False, 0)
+
+            btn_solo = Gtk.Button(label="S")
+            btn_solo.get_style_context().add_class("mini-btn")
+            btn_solo.set_tooltip_text(f"Solo Track {idx+1}")
+            btn_solo.connect("clicked", lambda _b, i=idx: self._toggle_track_solo(i))
+            row_ms.pack_start(btn_solo, False, False, 0)
+
+            row_io = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+            st.pack_start(row_io, False, False, 0)
+
+            btn_load = Gtk.Button(label="LOAD")
+            btn_load.get_style_context().add_class("mini-btn")
+            btn_load.set_tooltip_text(f"Load WAV/MP3/FLAC/OGG audio file onto Track {idx+1}")
+            btn_load.connect("clicked", lambda _b, i=idx: self._choose_file_for_track(i))
+            row_io.pack_start(btn_load, True, True, 0)
+
+            btn_clr = Gtk.Button(label="CLR")
+            btn_clr.get_style_context().add_class("mini-btn")
+            btn_clr.set_tooltip_text(f"Clear Track {idx+1}")
+            btn_clr.connect("clicked", lambda _b, i=idx: self._clear_track(i))
+            row_io.pack_start(btn_clr, False, False, 0)
+
+            self.strip_widgets.append(
+                {
+                    "stem_lbl": stem_lbl,
+                    "pan": pan_knob,
+                    "fader": fader,
+                    "arm": btn_arm,
+                    "mute": btn_mute,
+                    "solo": btn_solo,
+                }
+            )
+
+        # ---- Module 4B: 10-Band Graphic Equalizer + Varispeed & Tape Character ----
+        dsp_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        dsp_box.get_style_context().add_class("deck-module")
+        lower.pack_start(dsp_box, False, False, 0)
+
+        eq_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        dsp_box.pack_start(eq_col, True, True, 0)
+
+        eq_hdr = Gtk.Label(label="10-BAND GRAPHIC EQUALIZER (±12 dB)")
+        eq_hdr.get_style_context().add_class("engraved")
+        eq_col.pack_start(eq_hdr, False, False, 0)
+
+        self.eq_bank = GraphicEQBank(self._on_eq_changed)
+        eq_col.pack_start(self.eq_bank, True, True, 0)
+
+        eq_pre_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        eq_col.pack_start(eq_pre_row, False, False, 0)
+        for pname in ("FLAT", "VOICE/SSB", "WARM TAPE", "LOUDNESS"):
+            pb = Gtk.Button(label=pname)
+            pb.get_style_context().add_class("mini-btn")
+            pb.connect("clicked", lambda _b, p=pname: self._apply_eq_preset(p))
+            eq_pre_row.pack_start(pb, True, True, 0)
+
+        vari_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        vari_col.get_style_context().add_class("deck-strip")
+        dsp_box.pack_start(vari_col, False, False, 0)
+
+        self.knob_vari = RotaryKnob(
+            "VARISPEED",
+            0.50,
+            0.50,
+            self._on_varispeed_knob,
+            fmt_fn=lambda v: f"{(v - 0.5) * 40.0:+.1f}%",
+        )
+        self.knob_vari.set_tooltip_text("Real Tape Speed & Pitch Control (-20% .. +20%, double-click for 0.0%)")
+        vari_col.pack_start(self.knob_vari, False, False, 0)
+
+        self.knob_master = RotaryKnob(
+            "MASTER",
+            self.engine.master_gain,
+            0.82,
+            self._on_master_knob,
+            fmt_fn=lambda v: f"{int(v * 100):d}%",
+        )
+        vari_col.pack_start(self.knob_master, False, False, 0)
+
+        lbl_bias = Gtk.Label(label="BIAS / NR")
+        lbl_bias.get_style_context().add_class("engraved")
+        vari_col.pack_start(lbl_bias, False, False, 0)
+
+        self.bias_btns: dict[str, Gtk.Button] = {}
+        bias_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        vari_col.pack_start(bias_box, False, False, 0)
+        for bm in ("FLAT", "WARM", "DOLBY-B"):
+            bb = Gtk.Button(label=bm)
+            bb.get_style_context().add_class("mini-btn")
+            bb.connect("clicked", lambda _b, m=bm: self._set_bias_mode(m))
+            self.bias_btns[bm] = bb
+            bias_box.pack_start(bb, False, False, 0)
+
+        # ---- Module 4C: Aircheck & Tape Reel Quick-Browser Sidebar ----
+        lib_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        lib_box.get_style_context().add_class("deck-module")
+        lib_box.set_size_request(238, -1)
+        lower.pack_start(lib_box, True, True, 0)
+
+        lib_hdr = Gtk.Label(label="AIRCHECK & REEL BROWSER")
+        lib_hdr.get_style_context().add_class("engraved")
+        lib_hdr.set_xalign(0.0)
+        lib_box.pack_start(lib_hdr, False, False, 0)
+
+        flt_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        lib_box.pack_start(flt_row, False, False, 0)
+        self.flt_btns: dict[str, Gtk.Button] = {}
+        for fk in ("ALL", "dtRadio", "dtDeck", "Music"):
+            fb = Gtk.Button(label=fk)
+            fb.get_style_context().add_class("mini-btn")
+            fb.connect("clicked", lambda _b, k=fk: self._set_browser_filter(k))
+            self.flt_btns[fk] = fb
+            flt_row.pack_start(fb, True, True, 0)
+
+        btn_ref = Gtk.Button(label="↻")
+        btn_ref.get_style_context().add_class("mini-btn")
+        btn_ref.set_tooltip_text("Rescan ~/Music/dtRadio, ~/Music/dtDeck, and ~/Music")
+        btn_ref.connect("clicked", lambda _b: self._refresh_library_list())
+        flt_row.pack_start(btn_ref, False, False, 0)
+
+        self.lib_store = Gtk.ListStore(str, str, str)  # display_name, tag, full_path
+        self.lib_view = Gtk.TreeView(model=self.lib_store)
+        self.lib_view.set_headers_visible(False)
+        self.lib_view.connect("row-activated", self._on_lib_row_activated)
+
+        r_tag = Gtk.CellRendererText()
+        r_tag.set_property("foreground", "#63f5d4")
+        c_tag = Gtk.TreeViewColumn("Src", r_tag, text=1)
+        self.lib_view.append_column(c_tag)
+
+        r_nm = Gtk.CellRendererText()
+        r_nm.set_property("ellipsize", Pango.EllipsizeMode.MIDDLE)
+        c_nm = Gtk.TreeViewColumn("File", r_nm, text=0)
+        c_nm.set_expand(True)
+        self.lib_view.append_column(c_nm)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.add(self.lib_view)
+        lib_box.pack_start(sw, True, True, 0)
+
+        send_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        lib_box.pack_start(send_row, False, False, 0)
+        lbl_to = Gtk.Label(label="LOAD->")
+        lbl_to.get_style_context().add_class("engraved")
+        send_row.pack_start(lbl_to, False, False, 1)
+        for idx in range(4):
+            sb = Gtk.Button(label=f"T{idx+1}")
+            sb.get_style_context().add_class("mini-btn")
+            sb.set_tooltip_text(f"Load selected browser audio onto Track {idx+1}")
+            sb.connect("clicked", lambda _b, i=idx: self._load_selected_to_track(i))
+            send_row.pack_start(sb, True, True, 0)
+
+        # 5. Sunken CDE Status Bar
+        st_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        st_bar.get_style_context().add_class("cde-status")
+        root.pack_start(st_bar, False, False, 0)
+
+        self.status_lbl = Gtk.Label(label="READY — 4-TRACK SIMUL-SYNC STUDIO (44.1 kHz / 16-BIT)")
+        self.status_lbl.set_xalign(0.0)
+        self.status_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        st_bar.pack_start(self.status_lbl, True, True, 0)
+
+        self.spec_lbl = Gtk.Label(label="44.1 kHz • BIAS: WARM • VARI: +0.0%")
+        self.spec_lbl.set_xalign(1.0)
+        st_bar.pack_end(self.spec_lbl, False, False, 0)
+
+    def _make_piano_btn(self, label: str, cb, extra_cls: str | None = None) -> Gtk.Button:
+        b = Gtk.Button(label=label)
+        b.get_style_context().add_class("piano-key")
+        if extra_cls:
+            b.get_style_context().add_class(extra_cls)
+        b.connect("clicked", cb)
+        return b
+
+    @staticmethod
+    def _fmt_pan(v: float) -> str:
+        if abs(v - 0.5) < 0.04:
+            return "C"
+        if v < 0.5:
+            return f"L{int(round((0.5 - v) * 200))}"
+        return f"R{int(round((v - 0.5) * 200))}"
+
+    @staticmethod
+    def _toggle_cls(widget: Gtk.Widget, cls_name: str, enabled: bool):
+        ctx = widget.get_style_context()
+        if enabled:
+            ctx.add_class(cls_name)
+        else:
+            ctx.remove_class(cls_name)
+
+    # ---- Cairo Draw Callbacks ----
+    def _on_draw_well(self, w, cr: cairo.Context):
+        alloc = w.get_allocation()
+        render_tape_well(
+            cr,
+            float(alloc.width),
+            float(alloc.height),
+            self.reel_mode,
+            self.engine.progress_fraction(),
+            self.reel_angle_l,
+            self.reel_angle_r,
+            self.engine.mode,
+            self.tension_pos,
+        )
+        return False
+
+    def _on_draw_vu(self, w, cr: cairo.Context):
+        alloc = w.get_allocation()
+        W, H = float(alloc.width), float(alloc.height)
+        gap = 8.0
+        mw = (W - gap) * 0.5
+        now = time.monotonic()
+        render_single_vu_meter(cr, 0.0, 0.0, mw, H, "CH L", self.vu_needle_l, now < self.peak_hold_l)
+        render_single_vu_meter(cr, mw + gap, 0.0, mw, H, "CH R", self.vu_needle_r, now < self.peak_hold_r)
+        return False
+
+    def _on_draw_counter(self, w, cr: cairo.Context):
+        alloc = w.get_allocation()
+        # 1 drum count = 0.25 sec of standard 1x tape travel (classic 4 counts/sec mechanical feel)
+        drum_val = (self.engine.playhead - self.engine.counter_zero_sample) / (SAMPLE_RATE * 0.25)
+        mem_drum = int(round((self.engine.memory_sample - self.engine.counter_zero_sample) / (SAMPLE_RATE * 0.25))) % 10000
+        render_drum_and_vfd_counter(
+            cr,
+            float(alloc.width),
+            float(alloc.height),
+            drum_val,
+            self.engine.playhead / float(SAMPLE_RATE),
+            self.engine.total_samples() / float(SAMPLE_RATE),
+            self.engine.mode,
+            mem_drum,
+            self.engine.loop_state,
+            self.engine.varispeed_pct,
+        )
+        return False
+
+    # ---- 30 fps Animation, Reel Physics, Tension Arm Spring & Ballistic VU Loop ----
+    def _tick_30fps(self):
+        dt = 0.033
+        m = self.engine.mode
+        p = self.engine.progress_fraction()
+
+        # Impulse tension arm flex on transport transitions
+        if m != self._last_mode:
+            if m in ("PLAY", "REC"):
+                self.tension_vel += 7.5
+            elif m in ("FF", "RTZ"):
+                self.tension_vel += 11.0
+            elif m == "REW":
+                self.tension_vel -= 11.0
+            else:
+                self.tension_vel -= 5.0
+            self._last_mode = m
+            self._sync_transport_buttons()
+
+        # Spring-damper physics for mechanical tension arms
+        steady = 0.32 if m in ("PLAY", "REC") else (0.58 if m in ("FF", "REW", "RTZ") else 0.0)
+        force = -42.0 * (self.tension_pos - steady) - 7.5 * self.tension_vel
+        self.tension_vel += force * dt
+        self.tension_pos = max(-1.0, min(1.0, self.tension_pos + self.tension_vel * dt))
+
+        # Angular velocity inversely proportional to instantaneous reel pack radius!
+        vari = max(0.80, min(1.20, 1.0 + self.engine.varispeed_pct / 100.0))
+        if m in ("PLAY", "REC"):
+            lin_v = 1.65 * vari
+        elif m == "FF":
+            lin_v = 1.65 * 6.0
+        elif m == "REW":
+            lin_v = -1.65 * 6.0
+        elif m == "RTZ":
+            lin_v = 1.65 * 6.0 * (1.0 if self.engine.rtz_target_sample >= self.engine.playhead else -1.0)
+        else:
+            lin_v = 0.0
+
+        r_l_norm = math.sqrt(1.0 * (1.0 - p) + 0.22 * p)
+        r_r_norm = math.sqrt(0.22 * (1.0 - p) + 1.0 * p)
+        self.reel_angle_l = (self.reel_angle_l + (lin_v / r_l_norm) * dt) % (2.0 * math.pi)
+        self.reel_angle_r = (self.reel_angle_r + (lin_v / r_r_norm) * dt) % (2.0 * math.pi)
+
+        # Ballistic VU needles: fast 10ms-class attack, smooth 300ms damped release
+        for attr_t, attr_n in (("vu_target_l", "vu_needle_l"), ("vu_target_r", "vu_needle_r")):
+            tgt = getattr(self, attr_t)
+            cur = getattr(self, attr_n)
+            diff = tgt - cur
+            cur += diff * (0.48 if diff > 0 else 0.16)
+            setattr(self, attr_n, cur)
+            setattr(self, attr_t, max(0.02, tgt * 0.92))
+
+        # Update channel strip LED meters
+        for idx, sw in enumerate(self.strip_widgets):
+            fader_w: ChannelFaderMeter = sw["fader"]
+            trk = self.engine.tracks[idx]
+            if abs(fader_w.meter_db - trk.meter_db) > 0.3:
+                fader_w.meter_db = trk.meter_db
+                fader_w.queue_draw()
+
+        # Update shuttle slider without triggering seek loop
+        if not self._updating_seek:
+            self._updating_seek = True
+            self.seek_scale.set_value(p * 1000.0)
+            self._updating_seek = False
+
+        self.well_area.queue_draw()
+        self.vu_area.queue_draw()
+        self.counter_area.queue_draw()
+        return True
+
+    def _on_vu_telemetry(self, rms_l: float, rms_r: float, pk_l: float, pk_r: float):
+        if self.engine.mode not in ("PLAY", "REC"):
+            return
+        self.vu_target_l = _vu_db_to_norm(rms_l + 3.0)
+        self.vu_target_r = _vu_db_to_norm(rms_r + 3.0)
+        now = time.monotonic()
+        if pk_l > -1.2:
+            self.peak_hold_l = now + 0.35
+        if pk_r > -1.2:
+            self.peak_hold_r = now + 0.35
+
+    # ---- Interactive Handlers ----
+    def _set_reel_mode(self, mode: str):
+        self.reel_mode = mode
+        self._toggle_cls(self.btn_nab, "sw-active", mode == "nab")
+        self._toggle_cls(self.btn_cas, "sw-active", mode == "cassette")
+        self.well_area.queue_draw()
+
+    def _set_transport(self, mode: str):
+        self.engine.set_mode(mode)
+        self._sync_transport_buttons()
+        self._sync_strip_buttons()
+        if mode == "REC":
+            armed = [f"TRK {t.index+1}" for t in self.engine.tracks if t.rec_arm]
+            self._set_status(f"● SIMUL-SYNC RECORDING ON {', '.join(armed)} -> ~/Music/dtDeck/")
+        elif mode == "PLAY":
+            self._set_status("▶ PLAYING 4-TRACK MASTER BUS")
+        elif mode == "STOP":
+            self._refresh_library_list()
+            self._set_status("■ TRANSPORT STOPPED")
+        elif mode in ("FF", "REW"):
+            self._set_status(f"HIGH-SPEED TAPE WIND ({mode} 6x)")
+        elif mode == "PAUSE":
+            self._set_status("⏸ TRANSPORT PAUSED")
+
+    def _sync_transport_buttons(self):
+        m = self.engine.mode
+        self._toggle_cls(self.btn_play, "piano-play-on", m == "PLAY")
+        self._toggle_cls(self.btn_rew, "piano-wind-on", m in ("REW", "RTZ"))
+        self._toggle_cls(self.btn_ff, "piano-wind-on", m == "FF")
+        self._toggle_cls(self.btn_rec, "piano-rec-on", m == "REC")
+        self._toggle_cls(self.btn_pause, "piano-wind-on", m == "PAUSE")
+        self._toggle_cls(self.btn_rtz, "sw-amber", m == "RTZ")
+        self._toggle_cls(self.btn_loop, "sw-active", self.engine.loop_state > 0)
+        if self.engine.loop_state == 1:
+            self.btn_loop.set_label("LOOP [A..]")
+        elif self.engine.loop_state == 2:
+            self.btn_loop.set_label("LOOP [A-B]")
+        else:
+            self.btn_loop.set_label("A-B LOOP")
+
+    def _on_loop_clicked(self, _b):
+        if self.engine.loop_state == 0:
+            self.engine.loop_a = self.engine.playhead
+            self.engine.loop_state = 1
+            self._set_status(f"LOOP POINT [A] MARKED AT {self.engine.loop_a / SAMPLE_RATE:.1f}s — CLICK AGAIN TO SET [B]")
+        elif self.engine.loop_state == 1:
+            if self.engine.playhead > self.engine.loop_a + SAMPLE_RATE * 0.25:
+                self.engine.loop_b = self.engine.playhead
+                self.engine.loop_state = 2
+                self._set_status(
+                    f"A-B REPEAT ACTIVE ({self.engine.loop_a / SAMPLE_RATE:.1f}s .. {self.engine.loop_b / SAMPLE_RATE:.1f}s)"
+                )
+            else:
+                self.engine.loop_state = 0
+                self._set_status("A-B LOOP CLEARED")
+        else:
+            self.engine.loop_state = 0
+            self._set_status("A-B LOOP CLEARED")
+        self._sync_transport_buttons()
+
+    def _on_counter_reset(self, _b):
+        self.engine.counter_zero_sample = self.engine.playhead
+        self._set_status("TAPE COUNTER ZEROED [0000]")
+        self.counter_area.queue_draw()
+
+    def _on_counter_memory(self, _b):
+        self.engine.memory_sample = self.engine.playhead
+        self._set_status(f"AUTO-LOCATOR MEMORY MARKED AT {self.engine.playhead / SAMPLE_RATE:.1f}s")
+        self.counter_area.queue_draw()
+
+    def _trigger_rtz(self, to_memory: bool = False):
+        self.engine.start_rtz(to_memory=to_memory)
+        self._sync_transport_buttons()
+        self._set_status("RTZ AUTO-LOCATOR WINDING TO MEMORY..." if to_memory else "RTZ AUTO-LOCATOR WINDING TO [0000]...")
+
+    def _on_seek_drag(self, _scale, _scroll, val: float):
+        frac = max(0.0, min(1.0, val / 1000.0))
+        with self.engine._lock:
+            self.engine.playhead = frac * float(self.engine.total_samples())
+        return False
+
+    def _on_input_source_changed(self, combo):
+        idx = combo.get_active()
+        if 0 <= idx < len(self.input_sources):
+            self.engine.input_source_id = self.input_sources[idx][0]
+            self._set_status(f"REC INPUT SOURCE -> {self.input_sources[idx][1]}")
+
+    # ---- Mixer Strip Callbacks ----
+    def _on_track_fader(self, idx: int, val: float):
+        self.engine.tracks[idx].fader = val
+
+    def _on_track_pan(self, idx: int, val: float):
+        self.engine.tracks[idx].pan = val
+
+    def _toggle_track_arm(self, idx: int):
+        t = self.engine.tracks[idx]
+        t.rec_arm = not t.rec_arm
+        self._sync_strip_buttons()
+
+    def _toggle_track_mute(self, idx: int):
+        t = self.engine.tracks[idx]
+        t.muted = not t.muted
+        self._sync_strip_buttons()
+
+    def _toggle_track_solo(self, idx: int):
+        t = self.engine.tracks[idx]
+        t.solo = not t.solo
+        self._sync_strip_buttons()
+
+    def _sync_strip_buttons(self):
+        for idx, sw in enumerate(self.strip_widgets):
+            t = self.engine.tracks[idx]
+            sw["stem_lbl"].set_text(t.name[:12])
+            sw["stem_lbl"].set_tooltip_text(t.path or t.name)
+            sw["fader"].rec_armed = t.rec_arm
+            sw["fader"].queue_draw()
+            self._toggle_cls(sw["arm"], "sw-arm-on", t.rec_arm)
+            self._toggle_cls(sw["mute"], "sw-amber", t.muted)
+            self._toggle_cls(sw["solo"], "sw-active", t.solo)
+
+    def _load_file_into_track(self, idx: int, path: Path):
+        if not path.is_file():
+            self._set_status(f"FILE NOT FOUND: {path}")
+            return
+        self._set_status(f"LOADING {path.name} -> TRK {idx+1}...")
+        arr = load_audio_to_mono_f32(path)
+        if len(arr) == 0:
+            self._set_status(f"UNABLE TO DECODE AUDIO: {path.name}")
+            return
+        with self.engine._lock:
+            trk = self.engine.tracks[idx]
+            trk.samples = arr
+            trk.name = path.stem[:14].upper()
+            trk.path = str(path)
+        self._sync_strip_buttons()
+        self._set_status(f"LOADED TRK {idx+1}: {path.name} ({len(arr)/SAMPLE_RATE:.1f}s)")
+
+    def _choose_file_for_track(self, idx: int):
+        dlg = Gtk.FileChooserDialog(
+            title=f"Load Audio Stem onto Track {idx+1}",
+            parent=self,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dlg.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
+        start_dir = RADIO_DIR if RADIO_DIR.is_dir() else (MUSIC_DIR if MUSIC_DIR.is_dir() else HOME)
+        dlg.set_current_folder(str(start_dir))
+
+        flt = Gtk.FileFilter()
+        flt.set_name("Audio Files (WAV, MP3, FLAC, OGG, M4A)")
+        for pat in ("*.wav", "*.WAV", "*.mp3", "*.MP3", "*.flac", "*.ogg", "*.m4a", "*.opus"):
+            flt.add_pattern(pat)
+        dlg.add_filter(flt)
+
+        if dlg.run() == Gtk.ResponseType.OK:
+            fn = dlg.get_filename()
+            if fn:
+                self._load_file_into_track(idx, Path(fn))
+        dlg.destroy()
+
+    def _clear_track(self, idx: int):
+        with self.engine._lock:
+            t = self.engine.tracks[idx]
+            t.samples = np.zeros(0, dtype=np.float32)
+            t.name = "EMPTY"
+            t.path = ""
+            t.rec_arm = False
+            t.meter_db = -60.0
+        self._sync_strip_buttons()
+        self._set_status(f"CLEARED TRK {idx+1}")
+
+    def _load_demo_4track(self, auto_play: bool = True):
+        stems = ensure_demo_4track_stems()
+        pans = (0.38, 0.64, 0.46, 0.56)
+        faders = (0.80, 0.76, 0.78, 0.78)
+        with self.engine._lock:
+            for idx, (label, path, arr) in enumerate(stems):
+                trk = self.engine.tracks[idx]
+                trk.name = label
+                trk.path = str(path)
+                trk.samples = arr.copy()
+                trk.pan = pans[idx]
+                trk.fader = faders[idx]
+                trk.muted = False
+                trk.solo = False
+                trk.rec_arm = False
+                self.strip_widgets[idx]["pan"].set_value(trk.pan, notify=False)
+                self.strip_widgets[idx]["fader"].set_value(trk.fader, notify=False)
+            self.engine.playhead = 0.0
+            self.engine.counter_zero_sample = 0.0
+        self._sync_strip_buttons()
+        if auto_play:
+            self._set_transport("PLAY")
+            self._set_status("★ PLAYING 4-STEM 1980s ANALOG DEMO REEL (SOLO/MUTE TRK 1..4 OR SWEEP EQ!)")
+        else:
+            self._set_status("READY — 4-STEM DEMO REEL LOADED ON TRK 1..4 (PRESS ▶ PLAY!)")
+
+    def _on_bounce_clicked(self, _b):
+        DECK_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_p = DECK_DIR / f"dtdeck_master_{ts}.wav"
+        ok, msg, nframes = bounce_tracks_numpy(
+            self.engine.tracks,
+            out_p,
+            varispeed_pct=self.engine.varispeed_pct,
+            bias_mode=self.engine.bias_mode,
+            master_gain=self.engine.master_gain,
+        )
+        if ok:
+            self._refresh_library_list()
+            self._set_status(f"★ BOUNCED STEREO 16-BIT MASTER ({nframes/SAMPLE_RATE:.1f}s) -> {msg}")
+        else:
+            self._set_status(msg)
+
+    # ---- EQ, Varispeed & Tape Bias Callbacks ----
+    def _on_eq_changed(self, gains: list[float]):
+        self.engine.eq_gains = gains
+        self.engine.apply_dsp()
+
+    def _apply_eq_preset(self, pname: str):
+        vals = EQ_PRESETS.get(pname, EQ_PRESETS["FLAT"])
+        self.eq_bank.set_gains(vals, notify=True)
+        self._set_status(f"10-BAND EQ PRESET -> {pname}")
+
+    def _on_varispeed_knob(self, v: float):
+        self.engine.varispeed_pct = (v - 0.5) * 40.0
+        self._update_spec_badge()
+        self.counter_area.queue_draw()
+
+    def _on_master_knob(self, v: float):
+        self.engine.master_gain = v
+        self.engine.apply_dsp()
+
+    def _set_bias_mode(self, mode: str):
+        self.engine.bias_mode = mode
+        self.engine.apply_dsp()
+        for bm, bb in self.bias_btns.items():
+            self._toggle_cls(bb, "sw-active", bm == mode)
+        self._update_spec_badge()
+        self._set_status(f"TAPE BIAS / NR -> {mode}")
+
+    def _update_spec_badge(self):
+        self.spec_lbl.set_text(
+            f"44.1 kHz • BIAS: {self.engine.bias_mode} • VARI: {self.engine.varispeed_pct:+.1f}%"
+        )
+
+    # ---- Aircheck & Library Browser ----
+    def _set_browser_filter(self, flt_key: str):
+        self.browser_filter = flt_key
+        for k, fb in self.flt_btns.items():
+            self._toggle_cls(fb, "sw-active", k == flt_key)
+        self._refresh_library_list()
+
+    def _refresh_library_list(self):
+        self.lib_store.clear()
+        DECK_DIR.mkdir(parents=True, exist_ok=True)
+        RADIO_DIR.mkdir(parents=True, exist_ok=True)
+
+        roots: list[tuple[str, Path]] = []
+        if self.browser_filter in ("ALL", "dtRadio"):
+            roots.append(("RAD", RADIO_DIR))
+        if self.browser_filter in ("ALL", "dtDeck"):
+            roots.append(("DCK", DECK_DIR))
+        if self.browser_filter in ("ALL", "Music"):
+            roots.append(("MUS", MUSIC_DIR))
+
+        seen: set[Path] = set()
+        items: list[tuple[float, str, str, str]] = []
+        for tag, rdir in roots:
+            if not rdir.is_dir():
+                continue
+            try:
+                entries = list(rdir.iterdir()) if tag == "MUS" else list(rdir.rglob("*"))
+            except Exception:
+                continue
+            for p in entries:
+                if p.is_file() and p.suffix.lower() in AUDIO_EXTS:
+                    rp = p.resolve()
+                    if rp in seen:
+                        continue
+                    seen.add(rp)
+                    try:
+                        mt = p.stat().st_mtime
+                    except Exception:
+                        mt = 0.0
+                    items.append((mt, p.name, tag, str(rp)))
+
+        items.sort(reverse=True)
+        for _mt, nm, tag, full in items[:120]:
+            self.lib_store.append([nm, f"[{tag}]", full])
+
+        if len(self.lib_store) == 0:
+            for label, p, _arr in ensure_demo_4track_stems():
+                self.lib_store.append([p.name, "[DEMO]", str(p)])
+
+    def _on_lib_row_activated(self, tv, path, _col):
+        it = self.lib_store.get_iter(path)
+        if it:
+            fp = self.lib_store.get_value(it, 2)
+            # Load onto first empty track or Track 1
+            empty = [t.index for t in self.engine.tracks if len(t.samples) == 0]
+            target = empty[0] if empty else 0
+            self._load_file_into_track(target, Path(fp))
+
+    def _load_selected_to_track(self, track_idx: int):
+        sel = self.lib_view.get_selection()
+        model, it = sel.get_selected()
+        if it is not None:
+            fp = model.get_value(it, 2)
+            self._load_file_into_track(track_idx, Path(fp))
+        else:
+            self._set_status("SELECT AN AIRCHECK OR WAV FILE IN THE BROWSER FIRST")
+
+    def _sync_all_controls(self):
+        self._set_reel_mode(self.reel_mode)
+        self._set_bias_mode(self.engine.bias_mode)
+        self._set_browser_filter(self.browser_filter)
+        self._sync_transport_buttons()
+        self._sync_strip_buttons()
+        self._update_spec_badge()
+
+    def _set_status(self, txt: str):
+        self.status_lbl.set_text(txt)
+
+    def _on_key_press(self, _w, ev):
+        if ev.keyval == Gdk.KEY_space:
+            self._set_transport("STOP" if self.engine.mode in ("PLAY", "REC") else "PLAY")
+            return True
+        return False
+
+    # ---- State Persistence ----
+    def _load_state(self) -> bool:
+        if not STATE_FILE.is_file():
+            return False
+        try:
+            st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            self.reel_mode = st.get("reel_mode", "nab")
+            self.engine.bias_mode = st.get("bias_mode", "WARM")
+            eq = st.get("eq_gains", [0.0] * 10)
+            if isinstance(eq, list) and len(eq) == 10:
+                self.eq_bank.set_gains([float(x) for x in eq], notify=True)
+            vari_v = float(st.get("varispeed_knob", 0.50))
+            self.knob_vari.set_value(vari_v, notify=True)
+            mast_v = float(st.get("master_gain", 0.82))
+            self.knob_master.set_value(mast_v, notify=True)
+
+            loaded_any = False
+            for idx, td in enumerate(st.get("tracks", [])[:4]):
+                p_str = td.get("path", "")
+                trk = self.engine.tracks[idx]
+                trk.fader = float(td.get("fader", trk.fader))
+                trk.pan = float(td.get("pan", trk.pan))
+                trk.muted = bool(td.get("muted", False))
+                self.strip_widgets[idx]["fader"].set_value(trk.fader, notify=False)
+                self.strip_widgets[idx]["pan"].set_value(trk.pan, notify=False)
+                if p_str and Path(p_str).is_file():
+                    arr = load_audio_to_mono_f32(Path(p_str))
+                    if len(arr) > 0:
+                        trk.samples = arr
+                        trk.path = p_str
+                        trk.name = td.get("name", Path(p_str).stem[:12].upper())
+                        loaded_any = True
+            return loaded_any
+        except Exception:
+            return False
+
+    def _save_state(self):
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            st = {
+                "reel_mode": self.reel_mode,
+                "bias_mode": self.engine.bias_mode,
+                "eq_gains": self.engine.eq_gains,
+                "varispeed_knob": self.knob_vari.value,
+                "master_gain": self.knob_master.value,
+                "tracks": [
+                    {
+                        "name": t.name,
+                        "path": t.path,
+                        "fader": t.fader,
+                        "pan": t.pan,
+                        "muted": t.muted,
+                    }
+                    for t in self.engine.tracks
+                ],
+            }
+            STATE_FILE.write_text(json.dumps(st, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    # ---- GUI Self-Test Mode (when X11 Display is present) ----
+    def _run_gui_self_test(self, step: int):
+        if step == 0:
+            self._load_demo_4track(auto_play=True)
+            self._apply_eq_preset("WARM TAPE")
+            self.knob_vari.set_value(0.56, notify=True)
+            GLib.timeout_add(450, self._run_gui_self_test, 1)
+        elif step == 1:
+            self._set_reel_mode("cassette")
+            self._set_bias_mode("DOLBY-B")
+            out_test = CACHE_DIR / "selftest_bounce.wav"
+            ok, _msg, nframes = bounce_tracks_numpy(
+                self.engine.tracks, out_test, varispeed_pct=4.0, bias_mode="WARM"
+            )
+            assert ok and nframes > SAMPLE_RATE, "4-track bounce failed"
+            out_test.unlink(missing_ok=True)
+            GLib.timeout_add(350, self._run_gui_self_test, 2)
+        else:
+            self._set_reel_mode("nab")
+            self._set_transport("STOP")
+            print("DTDECK_SELF_TEST_OK")
+            sys.stdout.flush()
+            self.destroy()
+        return False
+
+    def _on_destroy(self, _w):
+        if not self._self_test:
+            self._save_state()
+        self.engine.shutdown()
+        Gtk.main_quit()
+
+
+# ---------------------------------------------------------------------------
+# Headless / Sandbox Self-Test Runner (--self-test without X11 DISPLAY)
+# ---------------------------------------------------------------------------
+def run_headless_self_test() -> int:
+    vu_events: list[tuple[float, float, float, float]] = []
+
+    def on_vu(rl, rr, pl, pr):
+        vu_events.append((rl, rr, pl, pr))
+
+    eng = TapeDeckEngine(on_vu, None, headless=True)
+    try:
+        # 1. Synthesize 4-track demo stems & load into engine
+        stems = ensure_demo_4track_stems()
+        assert len(stems) == 4
+        for idx, (lbl, path, arr) in enumerate(stems):
+            eng.tracks[idx].name = lbl
+            eng.tracks[idx].path = str(path)
+            eng.tracks[idx].samples = arr.copy()
+
+        # 2. Exercise GStreamer 10-band EQ + Tape Bias + Varispeed + Level telemetry
+        eng.eq_gains = list(EQ_PRESETS["WARM TAPE"])
+        eng.varispeed_pct = 5.0
+        eng.bias_mode = "WARM"
+        eng.apply_dsp()
+        eng.set_mode("PLAY")
+
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 0.55:
+            eng.poll_bus_sync()
+            time.sleep(0.03)
+
+        assert eng.playhead > SAMPLE_RATE * 0.2, "Playhead did not advance"
+        assert len(vu_events) > 0, "GStreamer level element did not post RMS/peak messages"
+
+        # 3. Verify 4-track numpy bounce math & stereo 16-bit WAV output
+        bounce_out = CACHE_DIR / "selftest_headless_master.wav"
+        ok, _msg, nframes = bounce_tracks_numpy(
+            eng.tracks, bounce_out, varispeed_pct=5.0, bias_mode="WARM", master_gain=0.85
+        )
+        assert ok and nframes > SAMPLE_RATE * 10, "Numpy 4-track bounce failed"
+        with wave.open(str(bounce_out), "rb") as wf:
+            assert wf.getnchannels() == 2 and wf.getsampwidth() == 2 and wf.getframerate() == SAMPLE_RATE
+        bounce_out.unlink(missing_ok=True)
+
+        # 4. Verify Cairo Tape Well (both 7" NAB & Studio Cassette), Dual VU Meters & Mechanical Drum Counter
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 520, 240)
+        cr = cairo.Context(surf)
+        render_tape_well(cr, 520.0, 240.0, "nab", 0.35, 0.8, 1.4, "PLAY", 0.32)
+        render_tape_well(cr, 520.0, 240.0, "cassette", 0.65, 1.8, 2.4, "REC", 0.25)
+        render_single_vu_meter(cr, 0.0, 0.0, 250.0, 150.0, "CH L", 0.78, True)
+        render_single_vu_meter(cr, 260.0, 0.0, 250.0, 150.0, "CH R", 0.62, False)
+        render_drum_and_vfd_counter(cr, 420.0, 56.0, 128.6, 32.15, 16.0, "PLAY", 42, 2, 5.0)
+    finally:
+        eng.shutdown()
+
+    print("DTDECK_SELF_TEST_OK")
+    sys.stdout.flush()
+    return 0
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a != "--self-test"]
+    self_test = "--self-test" in sys.argv[1:]
+    init_file = args[0] if args else None
+
+    has_display = Gtk.init_check(sys.argv)[0]
+    if self_test and not has_display:
+        sys.exit(run_headless_self_test())
+
+    if not has_display:
+        sys.stderr.write("dtDeck: cannot open X11 display (set DISPLAY or run --self-test).\n")
+        sys.exit(1)
+
+    win = DtDeckWindow(initial_file=init_file, self_test=self_test)
+    win.show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

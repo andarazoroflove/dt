@@ -1,0 +1,12 @@
+set DtDbVersion=1.0
+
+ACTION dtDecoder
+{
+     LABEL         dtDecoder
+     ARG_COUNT     0
+     ICON          dtdecoder
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtdecoder
+     DESCRIPTION   dtDecoder — Vintage HF Digital, CW/Morse, RTTY, SAME/EAS, WEFAX & SSTV Multimode Decoder.
+}

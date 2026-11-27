@@ -1,0 +1,3379 @@
+#!/usr/bin/env python3
+"""
+dtMaps — Vintage CDE Tactical Slippy-Map Atlas, GridTracker & Live PSKReporter Propagation Map
+
+Features:
+  - Authentic 1990s CDE / OSF-Motif 3D beveled workstation cabinet + glowing cyan-green VFD telemetry
+  - Pre-configured Home QTH: Callsign W1AW, Maidenhead Grid FN31pr (41.7292° N, -72.7083° W, Newington, CT)
+  - Smooth Zoomable Slippy-Tile Map Engine (z=2..15) with cursor-anchored wheel zoom & click-drag panning
+  - Multi-threaded async HTTP tile engine (OpenStreetMap & OpenTopoMap) + SQLite tile cache (~/.cache/dtmaps/tiles.sqlite)
+  - Built-in compressed vector world continents, islands, lakes & US/country outlines for crisp offline field operation
+  - 5 Switchable Tactical Cartography Modes:
+      1. GRIDTRACKER DARK (deep midnight navy oceans #0b1524, charcoal land #1b2432, neon overlays)
+      2. TOPOGRAPHIC (OpenTopoMap elevation & terrain contours)
+      3. DAYLIGHT ATLAS (crisp OpenStreetMap)
+      4. AMBER PHOSPHOR (vintage monochrome amber CRT tactical display)
+      5. NIGHT-VISION RED (dark-shack red-light preservation mode)
+  - Dual Live PSKReporter Engine:
+      * Engine A: Dedicated W1AW 24h Historical XML Query (retrieve.pskreporter.info, >=300s polite cache)
+      * Engine B: Pure-stdlib MQTT v3.1.1 Live Stream (mqtt.pskreporter.info:1883) for W1AW, FN31 & Global FT8/All-Mode
+  - Engine C: Local ADIF (.adi) Log Importer + Live WSJT-X UDP (127.0.0.1:2237) Decode Listener
+  - Tactical Overlays: Adaptive 2/4/6-char Maidenhead Grid, Astronomical Solar Greyline Terminator,
+    Interactive Range & Bearing Ruler, Band Filter Legend Bar, and Collapsible Greenbar Live Spot Roster
+"""
+
+from __future__ import annotations
+
+import base64
+import collections
+import datetime
+import io
+import json
+import math
+import os
+import queue
+import random
+import re
+import socket
+import sqlite3
+import struct
+import subprocess
+import sys
+import threading
+import time
+import xml.etree.ElementTree as ET
+import zlib
+from pathlib import Path
+from typing import Any
+
+import cairo
+import gi
+import numpy as np
+import requests
+from PIL import Image
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Pango", "1.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango
+
+HOME = Path.home()
+CONFIG_DIR = HOME / ".config" / "dtmaps"
+CACHE_DIR = HOME / ".cache" / "dtmaps"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+WORKED_FILE = CONFIG_DIR / "worked_grids.json"
+TILE_DB_FILE = CACHE_DIR / "tiles.sqlite"
+WSJTX_DEFAULT_ADI = HOME / ".local/share/WSJT-X/wsjtx_log.adi"
+
+UA = "dtMaps/1.0 (CDE Amateur Radio GridTracker; W1AW)"
+DEFAULT_CALLSIGN = "W1AW"
+DEFAULT_GRID = "FN31pr"
+DEFAULT_LAT = 41.729167
+DEFAULT_LON = -72.708333
+
+EARTH_RADIUS_KM = 6371.0088
+KM_TO_MI = 0.62137119
+TILE_SIZE = 256
+MIN_ZOOM = 2
+MAX_ZOOM = 15
+
+# ---------------------------------------------------------------------------
+# Amateur Radio Bands & GridTracker Color Palette
+# ---------------------------------------------------------------------------
+BAND_DEFS: list[tuple[str, float, float, tuple[float, float, float], str]] = [
+    ("160m", 1.800, 2.000, (0.58, 0.36, 0.96), "#945cf5"),
+    ("80m",  3.500, 4.000, (0.90, 0.33, 0.78), "#e654c7"),
+    ("60m",  5.250, 5.450, (0.38, 0.56, 0.98), "#618ffa"),
+    ("40m",  7.000, 7.300, (0.26, 0.65, 1.00), "#42a6ff"),
+    ("30m", 10.100, 10.150, (0.18, 0.86, 0.78), "#2edbc7"),
+    ("20m", 14.000, 14.350, (1.00, 0.74, 0.18), "#ffbd2e"),
+    ("17m", 18.068, 18.168, (0.96, 0.92, 0.28), "#f5eb47"),
+    ("15m", 21.000, 21.450, (1.00, 0.52, 0.20), "#ff8533"),
+    ("12m", 24.890, 24.990, (0.98, 0.34, 0.34), "#fa5757"),
+    ("10m", 28.000, 29.700, (0.32, 0.95, 0.48), "#52f27a"),
+    ("6m",  50.000, 54.000, (1.00, 0.30, 0.62), "#ff4d9e"),
+    ("2m", 144.000, 148.000, (0.45, 0.96, 0.98), "#73f5fa"),
+]
+BAND_COLOR_MAP: dict[str, tuple[float, float, float]] = {
+    b[0]: b[3] for b in BAND_DEFS
+}
+BAND_HEX_MAP: dict[str, str] = {
+    b[0]: b[4] for b in BAND_DEFS
+}
+BAND_ORDER = [b[0] for b in BAND_DEFS]
+
+MAP_MODES = [
+    ("dark", "GRIDTRACKER DARK"),
+    ("topo", "TOPOGRAPHIC"),
+    ("day", "DAYLIGHT ATLAS"),
+    ("amber", "AMBER PHOSPHOR"),
+    ("red", "NIGHT-VISION RED"),
+]
+
+MODE_FILTERS = [
+    "ALL MODES",
+    "FT8 ONLY",
+    "FT4",
+    "JS8",
+    "CW",
+    "WSPR",
+    "HOME CALL ONLY",
+    "HOME GRID ONLY",
+]
+
+# ---------------------------------------------------------------------------
+# Embedded Compact Vector World Geography + US State & Border Polylines
+# ---------------------------------------------------------------------------
+WORLD_VEC_B64 = (
+    "eNpVWm+IHNlxr5ZWu6vVSiumiXW68518JN3YwQmJHIeeD3EgkQ6yvQ45wVkiMAMBffH6Q2YgXIKjyZfZOOQIzIDx5N+Fg54LSPmQ"
+    "c2B7Q7IbB+4+TMcEyQQTQndiW8acHNs9d0G6P7ZP81L1q3q9Yy2op1/3e69evapf/apef5roL0/8849eOH+fahdR5eaucEMK+W7f"
+    "xST/Cle6yqXcIr9r/itcSDGVfJ87+ZNfxH0rvkbcVnFLbm3y9OWFtBRul8e8wjMQ9526jK9Tbi/dACO3MfrMJTxCSGPX4/4x/075"
+    "2qGEf8uvkP+X5zWPLCOI1G1+OuP+B9xecn+Rp+LrgO+lRwFZavf1Rch95bn0Tpv2Eb834NEK9K+xrsLkv0Mtvs65l4xUQiq5vwN9"
+    "1Kwjkah2Il+EZ6W9G1OC+xbt8PvbLCGRziqzFdCcaLPi9bf4/TlWP3IyeuUu87pGrkuX8U5M8k7JumtDwop1GfKIMx4ntnUkJlHl"
+    "xriWfJV9OOC7fciUsIb6pGuW+wnLI+toUcbjVk40lbC8tZtQlyWKsKI2P02xupotI+a/ro0xxNpL7ldhl0TixPQj1y7/xZhnl+dQ"
+    "e5J3O9jZAveyczVWM8fcCdoz2Nwu9q9F17G+HZZEJErZNgrTU+lm2OuYRraXfWhh7LyMPZ5RrKWGxkvYTIHfqoXKdJabziqMk7nr"
+    "+FW5AtYtPURPY1yldZ+vY5Yiphu8U/pOtSSPaENsmmgbGiogQUy3bLSBi8z2dL9LeIXMOYKHyLV26n8RScuMe9dm2WqXCfVZt2L/"
+    "BfyodlexD94uu9yuVnOVdS57HJPqXm00pR58KmXdxtD0jPUXQnJvJynfdTF/zTYsuhzZ3o4hT4dCvLdjK23DGsWOxM4zd99+3+V3"
+    "unzfh9bHTlYuXlbYldjSdQ1T1oJiTcZPpvxrl68zp14vWs9Ny5f4T2xdZFL95bxS0fOY+4aUkEcn3ZuMNaG7UuPt62xhBNvNWDZF"
+    "jct4MyLpP2XrKVli8YwWay4GAnRh1wX2L+G/LvxFcWACPArpDj/rseak9aWg4Bl2edUZrDKBRkQzei8+0oJ2aqf41oWHiaW3zUs7"
+    "2EW1HMW8KfxfMay2FVwFZvRJdHCZZc+xyjZsXHB1znKOuL2AX0XsVxN+pisn/MrMvkr4oNhZjd3xmKoeO+L5RM7KdlrmLzFmwutM"
+    "WTZdZ4aocWTrUksp3T32mG1ecZvfHcIaBdsUERLKbT0F0DKhNxeyDwnNzBuPMZuATeoZM5NTPD83HXmfjqDhEPIQEEhxV6yQbA8i"
+    "+IBGHJVF3rhk60t4niHaJS6FQMyQ26TnkHtuQrYIMuoeiW22+MkA1iOr3jcEGhvK7jb+fp//ZubjJTQcw0O9TiN43Vogs3ZpBy2l"
+    "WwsI9tVvcI6AxSlWWmFV8uu+aX9CZNGzBprfDDQ2JdZ6F7iewPcnQNsS+B4Z5qSGG5HtvOgjhGdo7OkhVsyBeLJStcja+TgtrbIG"
+    "QYoh7D0B6ojdR5g1RMzMXAv9M+xlSheDyHiAzjPhOVLoqXA9i7xz03sGDUa2Rwn0eGj4JLKEhn+ybhlHvDoGlqqO7kLT2zzqHFiU"
+    "GpKm5ONzYTEswjhyHVoEkbGHxhX6poMBnswQ50uOw2PYXQmvCI3PeLnlzdeDGh4ge7fHqxgCp6dOuZh6m/ITWb/IkzW66GC1Nawr"
+    "aqymhz0loJRyoSEQJQU7OYTNaDxvYQ9irCm1OJ2Q2rX46sB85skgAqORWWLGOcWOiK7w0wMgaw2kFsu6Q97f+PK5E5/94IXz3lx/"
+    "FIRw+G/Z/ZOBN89jeiL3b6zo1sxP6H18UlV8hHCTu2vWr2db2Lft/fOTIlTllt1Dnn880NDo51BCqKB8LSgRHm4GSjteD+ZODO/I"
+    "aIrSuzZUkgBSavd8oGAhWyOhXVykf1LD5WQpFMu7dxEUZLMPjJ78cCFQJVvuafBVDnjXnRK5wuDqklNiEjJoFE1orPn9Xai6dBNb"
+    "fYgg3ec/De/y5ymwAGIC+iF0Y98pQOZmej6sfGoxt6BcguZ4ipqC+moAjI3mRg3NLeEabWx0wQYvso7cFJRpLagg4z7o/tTlBoe5"
+    "kZ2xG4AQ7yJQy360jU614Bwjk3HO1xaALIcEKWXmEKVBRw0QrSB7gnHE3TVwVUbvZNYhjFWMvUTLFKtUMlJamBkthRo1/YG5b4Kg"
+    "T4AqH5BzNwGgzwwOB0h3xkYUS6cEqWjopoQiWcM+3pBEZQICOwaVrFgihd3cglNhwaKGDvtYqcLzhO/nrPErTnfmhu2jD/EakhQ8"
+    "dmGRiYF2ZNKmoAFKO2rMG7N99vjpAYfqDKH6EXmLHhg9IuojKOTokYJg7TqvYWINX3Ua+ErMXNveyntifftINL3n9U2mDtK4yq0G"
+    "OYAuxl6HoCpDnmfe2KmM8mAhSYUA2NQdU1rdSyUBQvkypkIHfL/P+6GwnlmCJzqSdHXHMKODVUbAkMSCsKaoM+57if17AEsZg3Tq"
+    "SpXwF9hH3adboLuylzJai+8lqdZwULJdjZwGs8/x/Qzvbbo3FzJW1tib4lNmNKYwyiDooSmF2E8HJECTtgnonQQ7CSoRfL5r0L1j"
+    "4VG8VGlmYemJpz6KT0fw6F2WNePdlxVe51+7eLdGOlQspdYZVjGBHAWStzsUwS+GsFyhmh3qw64S0hAufrNHEYLuHIlFyiGiD/uZ"
+    "Oo8oCWiPJs8T7MKngNl9nmebRtCN0rGwSUVbjKRkGJCSD2KFJdxKsSPaprBJfTSc7yOMtiwlEEK9bSWQLghrDyP2gPkJxuxCVxJ2"
+    "lSbOMILu+MzSyhz2KX6xx/SrRz1SfxNar/RM8WPHwu4RtBRxbAot5VLE/nigXvfQcFWCqqZiHYosVoaGvSqX0BHFex8XhyCrPhTP"
+    "OQaVRmK2Efrb/P82/EYs6YpT4luBQGlyL9psmV5j8mUQjYVKYVQzc6de06KHoI87JLH9CKWbwuJdCIrtKYb82rMdH5p8E9ISUmEl"
+    "JPHzyBAoNHrVs7h6XIYgi3jzpq2F9LdGCposcQpZw32jylLkyA0LM/hRSr+10D04azFnZNoQKTedpgADaEepqiaPxzFUnv/9QpAq"
+    "BP+oEYtiWHlo5bCRYfLAqe1msLjI7iOkG8ljiQ5lM+aLC8GdLnUe+1KWytey+z9d6Hu/8mNF2tcWmj7VIIm6phuGJxH0WCGezBA7"
+    "SysZtUEXMed92g9feajMUPM+qSTs8O/bVmfqNuzR53cqgt+CflN5yZ3PMroAIV8Zk6ymZdU0zWruGTUb2hgdu14L5gCfLly4akwg"
+    "xXwz9BfXvWfthwhWOSiOhPJLzrvJ3C3TS0/R9mze20uUjXgj//0Nou+8I23XAl/xS08q3fBU8xBZT0IvBkqI+ja2rimirgVddc0W"
+    "fbupG2j75RMKmOoSEaBAXUEraxNsVodl3QFjl/U+H6icvx8UTSYhBneIumibNIwlkHO7kUfm0Uqeum276Texat8RYFFcb46QeVx9"
+    "Ko0cHVgurgG0bzq52xAEXct9a79oMHQzEAIUMzS0EBA0m2xD/x3+ewRJYwPGqLGlXw2OYUN0t2cw8RLbTYs0wB6ZHfoM+KVA230Y"
+    "H5rbJw1shJYSHGd9Mqe/X4aqNjJbvb9na0rMJ7ydf+SEuvZDA0uCnSdNxj2Enbab1OZ4foVSD4WJ/R+bffRkfb9Brz/18HFCtbGG"
+    "HGUdxYsK6NYFGgtTVLzsA4+0pDJ3u5ZLZK74ieKabG6B0nCJBDVG0ShDHOyAdQluHYCV9CizQvqDRQ0GVRhLvmKGMGoMJWnYx4iN"
+    "IGQYGfLvR6TlcS1giEqGVnjUIwONiDsUmUr8diUoX3n11IjUlVNI6ZOW68HafpYGFwkWrnXH3CVNziua1rr5BMgyNtoZUdwInJj2"
+    "9TzCJwsDA9/Skq4JKYUcgdLuWdDPGDxbEHQMMO1gAQNQ9NiqBiFsQOpmdIkOLxydTJHzDbB7MZyqRjakBbApnK8yTK6sDF5i8tYS"
+    "O9W45Pmd5nrCScQ1fKmwB9Fi0zc9TS899ex6YtWE0FI5rW8PQFEJGKKtFcLczE5G8uaZJMYtq+63zGYVf0Joc0hxQy3FdOlJmn3o"
+    "ZqB7WTHLqp1nLr4AL2VFEWPucnd8CCNZdQR2mFvxsbDA04Ordq1AFVFsjIQu0L2T/7GVwHtLd7hUw5KzlNQq8WMQtDbSBVHrLRB0"
+    "qYBquhuZfQyBWGqm8NQL9Benv/RYzUUPKNQfMmQ2MskMOWtlsbtlkmuYlDCVgC3doaQxu9gsn+8+RO9tfmxraCcWr+HkrETqWaAq"
+    "Vpmt6fMSqTOhQqoUWwbZtvR/h9oWg1DSCOnJp/5q63YTnpdDrFZUhAE/YObwi2b4U8vbbtl9BmUlgGuJKP+7stVHHY6WaG2JMwGh"
+    "U9L9lpGjsV3zhjx5YhUpQQ7p3bf+ZqULDWmWEyJoli5sFqvd/dGdGOe+6XiAHCuCJgHMW/S1H3zxXGI7H1mJZtrAYWyVqxgWQDhF"
+    "UVve0+6dC7W7Z91nBgBtHFz4Q54UfG4fTp8iQ1N3YjM5R7MPNs76RF265nYup/AZUtYkslo9lCEuyi6dZa73vY2+lfLUZnK44AHm"
+    "VjghSpuDSQl+3O0/n/2FH3YhlpwB6GmintceNKA9t6qyREWkf5v05afeXo+sHrAHxlqY+2vNKTeByXJLOkPnHz19/tBUs+sUQeT3"
+    "1Aiyuq8lZ2foH55deb8L/i6eMXZ6HDECyciAVYmV33n0DfrkmY3zEah8ixI7u5CkTOz8Gau8S8pEp+lrp9/fav9EkVkihK8UtQm2"
+    "fpq++n+PTu41SY4/EVJ7vIXkFaO9/MSLi8Ryr11smNZ7tJRqAfw0Pffhlfe3zWn6SEPltHJukUHTCFqnX3v36fOxUYUDCyillWdB"
+    "Q9dpcuHmQkea2e4UZk4GZ+v0xx9pPU4MpPWww9tEjdFojRbvvnD+QUCkhZcWrmf5EQpPa/Sb7zx9vguErdzM/LjyzrdGf/C939vy"
+    "DG8AA6PjxHqN/nXru0FKWrvTWps/DOjK4+ef6BpbzXBa4lP3u9r7p376Bx+oT0xRk1Hw0gyeH3/+7OffTZryVGWD11pgWqV/+/6f"
+    "bB2aH1SoR9iBwypNv/uxrYktZeZ8iS6WR5/55isbXmN5s+aWPHot+O119fIacKHVeZJHty/8eEXBIuPdOuBmPe7jRw+e6BlPnoIZ"
+    "+y8g+NFzl55fpHaYWJndIQat0luXPvNB1xJ3fUHPkvjRJx+9906/EUPZk6ySTlHrzVc22s2XFlYEPcWCn1tPkbEVdoQQS/Nf3390"
+    "MrIzhLnNwc2/HhZ2DFPaITkG4QC8OJ62VGReoS9svr+VLBkhN736/ZWtxCjHgTatP/ONc4d22HZVZF2h//rv8+e6yycYK/SVt35n"
+    "MzGYt7H+8JtvnxH7kiJlqR1/+X9+fiMl/3kI3vqzjfGJ2DDL3vqleYiqe2m1NW56/YkBkNzTBm76uWceLFKD8X1t+vIzL2NTBOUP"
+    "WFHBDv3RiVfXtbY0db5qkpia5+Y06u/KL8dOP3z4EjC2TZc4xEnN3vuBfoyROc3cNfofE8eqYd1HdkC4tnRKoR+yjLCqllUF+ngv"
+    "c2kDUp3mwEZranmT8t5pUlchMxN4Yr70gYsPKgW/mVmdMjZUG2F9ERx85PQY7xbeT8xA23DA4KP08oMvntMjGqGlM5cZwo+aIiVZ"
+    "YVA59nQJlC47jQ0TiF/aQcjcaYFZmeLRUpZMOHXTbekbZ78ZCKZ0rHQ8dzes0ByR4jUn2899+J/Otej4PEcOV5Nmd2M7zp01mrsW"
+    "6MdDrwVqe3EjToIE+I5ViaQ+9nWrp4yMHOSGnDdsmb/7OLTjYF9t2kHOFfwMvbHylU39ToIsXdHjmtz583gpOc7c1BWNn4cWbjML"
+    "FAfQqhBlBbI9Y9pd02SHtMClWY6yUz0GkVPtNmi/z4CCi/Tt1bfXQ2CU0oB93grN/Y5T+xLOMkPpxR8sJ6iszdxtKF3PZeQTin2r"
+    "SMeWrN7i3sEF+pfVT5wKDRESfL00hfXoN09jczl1veWzY6nfFDjh3Cb9jmNCB5iu13ytwQn/6Y0Tp7X6qjILFMudVKsrq7wqoTz+"
+    "VGvOqtOcqdt8fhFs0RdOv3qqh1L9cTjsW96tIdsX7/0XaJFJyM5xhv5u9b3NuOH2tdXRNWGQLbhun+uIrgMO4qv50lrV+HTXtRQb"
+    "rNGr80+f9seusdWFK8v5g1X66FtfXW/ZMV5tvoieq7T+9j+uh/bBgh6i57DqYIU+cepvz3SJmvPz/wf5JELD"
+)
+
+# Supplemental crisp geopolitical & US state border polylines (lon, lat) for offline zoom
+BORDER_POLYLINES: list[list[tuple[float, float]]] = [
+    # US - Canada Border (49th parallel + Great Lakes + Maine + Alaska/Yukon)
+    [(-123.2, 49.0), (-95.15, 49.0), (-89.5, 48.0), (-84.5, 46.5), (-82.4, 43.0),
+     (-79.0, 43.2), (-76.3, 44.2), (-74.7, 45.0), (-71.5, 45.0), (-69.2, 47.4), (-67.8, 47.1), (-67.0, 45.2)],
+    [(-141.0, 69.6), (-141.0, 60.3), (-139.0, 60.0), (-135.0, 59.5), (-130.0, 56.0)],
+    # US - Mexico Border
+    [(-117.1, 32.55), (-114.8, 32.7), (-111.1, 31.33), (-108.2, 31.33), (-106.5, 31.78),
+     (-104.0, 29.5), (-103.0, 29.0), (-101.4, 29.8), (-99.5, 27.5), (-97.15, 25.95)],
+    # Regional US state boundary polyline
+    [(-117.0, 49.0), (-116.05, 49.0), (-116.05, 47.98), (-115.7, 47.45), (-114.9, 46.8),
+     (-114.3, 46.6), (-114.5, 45.8), (-113.8, 45.6), (-113.0, 44.45), (-111.4, 44.5),
+     (-111.05, 44.65), (-111.05, 42.0), (-117.02, 42.0), (-117.02, 43.8), (-117.2, 44.3),
+     (-116.45, 45.6), (-116.92, 46.0), (-117.0, 46.4), (-117.0, 49.0)],
+    # Western & Central US State Grid Lines
+    [(-124.2, 42.0), (-111.05, 42.0)],  # OR/CA, NV/ID, UT/ID
+    [(-124.0, 46.2), (-119.0, 46.0), (-117.0, 46.0)],  # WA/OR
+    [(-120.0, 42.0), (-120.0, 39.0), (-114.6, 35.0)],  # CA/NV
+    [(-114.05, 42.0), (-114.05, 36.0)],  # NV/UT, NV/AZ
+    [(-111.05, 45.0), (-104.05, 45.0)],  # MT/WY
+    [(-111.05, 41.0), (-102.05, 41.0)],  # UT/WY, CO/WY, CO/NE
+    [(-109.05, 41.0), (-109.05, 31.33)],  # UT/CO, AZ/NM
+    [(-114.8, 37.0), (-94.6, 37.0)],  # UT/AZ, CO/NM, KS/OK, MO/AR
+    [(-104.05, 49.0), (-104.05, 41.0)],  # MT/ND/SD, WY/SD/NE
+    [(-102.05, 41.0), (-102.05, 36.5)],  # CO/KS
+    [(-103.0, 37.0), (-103.0, 32.0), (-106.6, 32.0)],  # NM/TX
+    [(-100.0, 36.5), (-100.0, 34.5), (-94.5, 33.6)],  # OK/TX
+    [(-96.6, 49.0), (-96.4, 43.5), (-95.8, 40.0), (-94.6, 37.0), (-94.0, 29.7)],  # Plains N-S
+    [(-104.05, 45.94), (-96.6, 45.94)],  # ND/SD
+    [(-104.05, 43.0), (-96.5, 43.0)],  # SD/NE
+    [(-102.05, 40.0), (-95.3, 40.0)],  # NE/KS
+    [(-90.6, 42.5), (-87.5, 42.5)],  # WI/IL
+    [(-87.5, 41.7), (-80.5, 41.7)],  # MI/IN/OH
+    [(-80.52, 42.2), (-80.52, 39.7), (-75.0, 39.7)],  # PA W & S (Mason-Dixon)
+    [(-84.8, 39.1), (-84.8, 41.7)],  # IN/OH
+    [(-94.6, 36.5), (-75.9, 36.5)],  # MO/AR-TN-NC/VA
+    [(-88.5, 35.0), (-81.0, 35.0)],  # TN/MS-AL-GA
+    [(-88.4, 35.0), (-88.1, 30.2)],  # MS/AL
+    [(-85.6, 35.0), (-85.0, 31.0), (-87.5, 31.0)],  # AL/GA/FL
+    # Major Eurasian / African / South American reference borders
+    [(-5.5, 43.4), (3.1, 42.4)],  # Pyrenees
+    [(7.6, 47.6), (6.1, 46.2), (7.0, 45.8), (6.7, 45.0), (7.5, 43.8)],  # France/Alps
+    [(14.8, 53.9), (14.6, 51.0), (12.2, 50.3), (13.8, 48.8)],  # Central Europe
+    [(24.0, 54.0), (23.5, 49.0), (28.2, 45.5)],  # Eastern Europe
+    [(25.0, 22.0), (35.0, 22.0)],  # Egypt/Sudan
+    [(-70.0, -18.0), (-68.5, -24.0), (-70.3, -33.0), (-71.8, -42.0), (-72.5, -51.5)],  # Andes Chile/Arg
+]
+
+
+def decode_embedded_world_polygons() -> list[tuple[bool, list[tuple[float, float]]]]:
+    raw = zlib.decompress(base64.b64decode(WORLD_VEC_B64))
+    off = 0
+    (npolys,) = struct.unpack_from("<H", raw, off)
+    off += 2
+    out: list[tuple[bool, list[tuple[float, float]]]] = []
+    for _ in range(npolys):
+        is_hole, npts = struct.unpack_from("<BH", raw, off)
+        off += 3
+        px, py = 0, 0
+        pts: list[tuple[float, float]] = []
+        for _ in range(npts):
+            dx, dy = struct.unpack_from("<hh", raw, off)
+            off += 4
+            px += dx
+            py += dy
+            pts.append((px / 50.0, py / 50.0))
+        out.append((bool(is_hole), pts))
+    return out
+
+
+WORLD_POLYGONS = decode_embedded_world_polygons()
+
+
+# ---------------------------------------------------------------------------
+# CDE Palette Loader & Vintage Motif Tactical CSS
+# ---------------------------------------------------------------------------
+def load_cde_palette() -> tuple[str, str, str]:
+    chrome, sel, well = "#aeb2c3", "#2c567e", "#fff7e9"
+    try:
+        out = subprocess.check_output(["xrdb", "-query"], text=True, stderr=subprocess.DEVNULL)
+        pal_name = "Crimson.dp"
+        for ln in out.splitlines():
+            if "ColorPalette:" in ln:
+                pal_name = ln.split(":", 1)[1].strip()
+                break
+        for pdir in (HOME / ".dt/palettes", Path("/usr/dt/palettes")):
+            pf = pdir / pal_name
+            if pf.is_file():
+                hexes = [l.strip() for l in pf.read_text().splitlines() if l.strip().startswith("#")]
+                if len(hexes) >= 4:
+                    def norm16(h: str) -> str:
+                        h = h.lstrip("#")
+                        return f"#{h[0:2]}{h[4:6]}{h[8:10]}" if len(h) == 12 else "#" + h[:6]
+                    chrome, sel, well = norm16(hexes[1]), norm16(hexes[2]), norm16(hexes[3])
+                break
+    except Exception:
+        pass
+    return chrome, sel, well
+
+
+def build_maps_css(chrome: str, sel: str, well: str) -> bytes:
+    css = f"""
+    window, dialog, .background {{
+        background-color: {chrome};
+        color: #101216;
+        font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+        font-size: 8.5pt;
+    }}
+    .maps-cabinet {{
+        background-color: #2f343f;
+        border-top: 2px solid #5c6578;
+        border-left: 2px solid #5c6578;
+        border-right: 2px solid #16191f;
+        border-bottom: 2px solid #16191f;
+        padding: 4px;
+    }}
+    .maps-strip {{
+        background-color: #383e4b;
+        border-top: 2px solid #586073;
+        border-left: 2px solid #586073;
+        border-right: 2px solid #1b1f27;
+        border-bottom: 2px solid #1b1f27;
+        padding: 3px 6px;
+    }}
+    .maps-bezel {{
+        background-color: #141820;
+        border-top: 2px solid #101319;
+        border-left: 2px solid #101319;
+        border-right: 2px solid #5c6578;
+        border-bottom: 2px solid #5c6578;
+    }}
+    .rx-engraved {{
+        color: #d7deeb;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8pt;
+    }}
+    entry.qth-entry {{
+        background-color: #0b1818;
+        color: #5efce0;
+        caret-color: #5efce0;
+        border-top: 2px solid #060d0d;
+        border-left: 2px solid #060d0d;
+        border-right: 2px solid #496666;
+        border-bottom: 2px solid #496666;
+        border-radius: 0px;
+        padding: 2px 5px;
+        min-height: 22px;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8.5pt;
+    }}
+    button {{
+        background-image: none;
+        background-color: #464d5c;
+        color: #edf2f7;
+        border-top: 2px solid #757f94;
+        border-left: 2px solid #757f94;
+        border-right: 2px solid #1d2129;
+        border-bottom: 2px solid #1d2129;
+        border-radius: 0px;
+        padding: 2px 6px;
+        min-height: 22px;
+        box-shadow: none;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8pt;
+    }}
+    button label {{
+        color: #edf2f7;
+    }}
+    button:hover {{
+        background-color: #535c6e;
+    }}
+    button:active, button:checked {{
+        background-color: #262b35;
+        border-top: 2px solid #161920;
+        border-left: 2px solid #161920;
+        border-right: 2px solid #6d768a;
+        border-bottom: 2px solid #6d768a;
+    }}
+    button.sw-active {{
+        background-color: #1f4a3c;
+        color: #64fadb;
+        border-top: 2px solid #112921;
+        border-left: 2px solid #112921;
+        border-right: 2px solid #4fa88d;
+        border-bottom: 2px solid #4fa88d;
+    }}
+    button.sw-active label {{
+        color: #64fadb;
+    }}
+    button.btn-home {{
+        background-color: #7d5314;
+        border-top: 2px solid #cfa04c;
+        border-left: 2px solid #cfa04c;
+        border-right: 2px solid #382305;
+        border-bottom: 2px solid #382305;
+    }}
+    button.btn-home label {{
+        color: #ffe7a3;
+    }}
+    button.btn-psk {{
+        background-color: #1c5373;
+        border-top: 2px solid #5bb0db;
+        border-left: 2px solid #5bb0db;
+        border-right: 2px solid #0b2433;
+        border-bottom: 2px solid #0b2433;
+    }}
+    button.btn-psk label {{
+        color: #d9f6ff;
+    }}
+    button.band-btn {{
+        padding: 1px 5px;
+        font-size: 7.5pt;
+        min-height: 20px;
+    }}
+    button.band-off {{
+        background-color: #252932;
+        opacity: 0.52;
+    }}
+    combobox button.combo {{
+        background-color: #1f242d;
+        color: #64fadb;
+        border-top: 2px solid #12151b;
+        border-left: 2px solid #12151b;
+        border-right: 2px solid #626b7f;
+        border-bottom: 2px solid #626b7f;
+        padding: 2px 5px;
+        min-height: 22px;
+    }}
+    combobox button.combo label, combobox cellview {{
+        color: #64fadb;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8pt;
+    }}
+    menu {{
+        background-color: #2b303b;
+        color: #edf2f7;
+        border: 1px solid #6c758a;
+    }}
+    menuitem {{
+        color: #edf2f7;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8pt;
+        padding: 3px 8px;
+    }}
+    menuitem:hover {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    treeview.spot-roster {{
+        background-color: #0d161b;
+        color: #d6f5ec;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 7.8pt;
+    }}
+    treeview.spot-roster:selected {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    treeview.spot-roster header button {{
+        background-color: #323846;
+        color: #d7deeb;
+        font-size: 7.5pt;
+        padding: 2px 4px;
+    }}
+    .cde-status {{
+        background-color: {chrome};
+        color: #101216;
+        padding: 2px 8px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8pt;
+    }}
+    """
+    return css.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Maidenhead Locator, Geodesic & Solar Greyline Astronomical Math
+# ---------------------------------------------------------------------------
+GRID_RE = re.compile(r"^[A-Ra-r]{2}[0-9]{2}([A-Xa-x]{2}([0-9]{2})?)?$")
+
+
+def is_valid_maidenhead(grid: str) -> bool:
+    return bool(grid and GRID_RE.match(grid.strip()))
+
+
+def maidenhead_to_latlon(grid: str) -> tuple[float, float] | None:
+    """Convert 4, 6, or 8-char Maidenhead locator to center (lat, lon)."""
+    g = (grid or "").strip()
+    if len(g) >= 8 and GRID_RE.match(g[:8]):
+        g = g[:8]
+    elif len(g) >= 6 and GRID_RE.match(g[:6]):
+        g = g[:6]
+    elif len(g) >= 4 and GRID_RE.match(g[:4]):
+        g = g[:4]
+    else:
+        return None
+
+    u = g.upper()
+    lon = (ord(u[0]) - ord("A")) * 20.0 - 180.0
+    lat = (ord(u[1]) - ord("A")) * 10.0 - 90.0
+    lon += (ord(u[2]) - ord("0")) * 2.0
+    lat += (ord(u[3]) - ord("0")) * 1.0
+
+    if len(u) == 4:
+        return (lat + 0.5, lon + 1.0)
+
+    lon += (ord(u[4]) - ord("A")) * (2.0 / 24.0)
+    lat += (ord(u[5]) - ord("A")) * (1.0 / 24.0)
+    if len(u) == 6:
+        return (lat + 0.5 / 24.0, lon + 1.0 / 24.0)
+
+    lon += (ord(u[6]) - ord("0")) * (2.0 / 240.0)
+    lat += (ord(u[7]) - ord("0")) * (1.0 / 240.0)
+    return (lat + 0.5 / 240.0, lon + 1.0 / 240.0)
+
+
+def latlon_to_maidenhead(lat: float, lon: float, chars: int = 6) -> str:
+    """Convert (lat, lon) to 2, 4, 6, or 8-char Maidenhead locator."""
+    lon_w = ((lon + 180.0) % 360.0)
+    lat_c = max(-89.9999, min(89.9999, lat)) + 90.0
+
+    f_lon = int(lon_w // 20.0)
+    f_lat = int(lat_c // 10.0)
+    out = chr(ord("A") + f_lon) + chr(ord("A") + f_lat)
+    if chars <= 2:
+        return out
+
+    r_lon = lon_w - f_lon * 20.0
+    r_lat = lat_c - f_lat * 10.0
+    s_lon = int(r_lon // 2.0)
+    s_lat = int(r_lat // 1.0)
+    out += f"{s_lon}{s_lat}"
+    if chars <= 4:
+        return out
+
+    r_lon -= s_lon * 2.0
+    r_lat -= s_lat * 1.0
+    sub_lon = min(23, int(r_lon * 12.0))
+    sub_lat = min(23, int(r_lat * 24.0))
+    out += chr(ord("a") + sub_lon) + chr(ord("a") + sub_lat)
+    if chars <= 6:
+        return out
+
+    r_lon -= sub_lon / 12.0
+    r_lat -= sub_lat / 24.0
+    ext_lon = min(9, int(r_lon * 120.0))
+    ext_lat = min(9, int(r_lat * 240.0))
+    return out + f"{ext_lon}{ext_lat}"
+
+
+def grid4_bounds(g4: str) -> tuple[float, float, float, float] | None:
+    """Return (lat0, lon0, lat1, lon1) bounds of a 4-char Maidenhead grid square."""
+    if not g4 or len(g4) < 4:
+        return None
+    u = g4[:4].upper()
+    if not ("A" <= u[0] <= "R" and "A" <= u[1] <= "R" and u[2].isdigit() and u[3].isdigit()):
+        return None
+    lon0 = (ord(u[0]) - ord("A")) * 20.0 - 180.0 + int(u[2]) * 2.0
+    lat0 = (ord(u[1]) - ord("A")) * 10.0 - 90.0 + int(u[3]) * 1.0
+    return (lat0, lon0, lat0 + 1.0, lon0 + 2.0)
+
+
+def geodesic_distance_bearing(
+    lat1: float, lon1: float, lat2: float, lon2: float
+) -> tuple[float, float, float]:
+    """Return (distance_km, short_path_deg, long_path_deg) from (lat1, lon1) to (lat2, lon2)."""
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(((lon2 - lon1 + 180.0) % 360.0) - 180.0)
+
+    a = math.sin(dp * 0.5) ** 2 + math.cos(p1) * math.cos(p2) * (math.sin(dl * 0.5) ** 2)
+    c = 2.0 * math.atan2(math.sqrt(min(1.0, a)), math.sqrt(max(0.0, 1.0 - a)))
+    dist_km = EARTH_RADIUS_KM * c
+
+    if c < 1e-9:
+        return (0.0, 0.0, 180.0)
+
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    sp_deg = (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+    lp_deg = (sp_deg + 180.0) % 360.0
+    return (dist_km, sp_deg, lp_deg)
+
+
+def great_circle_unwrapped(
+    lat1: float, lon1: float, lat2: float, lon2: float, steps: int = 44
+) -> list[tuple[float, float]]:
+    """
+    Compute spherical-linear-interpolated great-circle points (lat, lon_unwrapped)
+    with continuous unwrapped longitudes so Pacific/antimeridian paths never streak!
+    """
+    p1, l1 = math.radians(lat1), math.radians(lon1)
+    p2, l2 = math.radians(lat2), math.radians(lon2)
+
+    x1, y1, z1 = math.cos(p1) * math.cos(l1), math.cos(p1) * math.sin(l1), math.sin(p1)
+    x2, y2, z2 = math.cos(p2) * math.cos(l2), math.cos(p2) * math.sin(l2), math.sin(p2)
+
+    dot = max(-1.0, min(1.0, x1 * x2 + y1 * y2 + z1 * z2))
+    omega = math.acos(dot)
+    if omega < 1e-6:
+        return [(lat1, lon1), (lat2, lon2)]
+
+    sin_om = math.sin(omega)
+    pts: list[tuple[float, float]] = []
+    prev_lon = lon1
+    for i in range(steps + 1):
+        t = i / steps
+        if sin_om < 1e-5:
+            # Nearly antipodal fallback via polar arc
+            a = 1.0 - t
+            b = t
+            x = a * x1 + b * x2
+            y = a * y1 + b * y2
+            z = a * z1 + b * z2 + 0.25 * math.sin(t * math.pi)
+            nm = math.sqrt(x * x + y * y + z * z) or 1.0
+            x, y, z = x / nm, y / nm, z / nm
+        else:
+            a = math.sin((1.0 - t) * omega) / sin_om
+            b = math.sin(t * omega) / sin_om
+            x = a * x1 + b * x2
+            y = a * y1 + b * y2
+            z = a * z1 + b * z2
+
+        lat = max(-84.8, min(84.8, math.degrees(math.asin(max(-1.0, min(1.0, z))))))
+        lon = math.degrees(math.atan2(y, x))
+        while lon - prev_lon > 180.0:
+            lon -= 360.0
+        while lon - prev_lon < -180.0:
+            lon += 360.0
+        prev_lon = lon
+        pts.append((lat, lon))
+    return pts
+
+
+def freq_to_band(freq_hz_or_mhz: float, band_hint: str = "") -> str:
+    if band_hint:
+        bh = band_hint.strip()
+        if bh in BAND_COLOR_MAP:
+            return bh
+    mhz = freq_hz_or_mhz / 1_000_000.0 if freq_hz_or_mhz > 2000.0 else freq_hz_or_mhz
+    for name, lo, hi, _, _ in BAND_DEFS:
+        if (lo - 0.08) <= mhz <= (hi + 0.08):
+            return name
+    if 0.13 <= mhz <= 0.14:
+        return "2200m"
+    if 0.47 <= mhz <= 0.48:
+        return "630m"
+    if 420.0 <= mhz <= 450.0:
+        return "70cm"
+    return "20m" if mhz <= 0 else f"{mhz:.1f}M"
+
+
+def compute_solar_subsolar(utc_dt: datetime.datetime | None = None) -> tuple[float, float]:
+    """Return (subsolar_lat_deg, subsolar_lon_deg) for given UTC datetime."""
+    if utc_dt is None:
+        utc_dt = datetime.datetime.now(datetime.timezone.utc)
+    # Days since J2000.0 (2000-01-01 12:00:00 UTC)
+    j2000 = datetime.datetime(2000, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    d = (utc_dt - j2000).total_seconds() / 86400.0
+
+    # Mean longitude & mean anomaly of the Sun
+    L = (280.460 + 0.9856474 * d) % 360.0
+    g = math.radians((357.528 + 0.9856003 * d) % 360.0)
+    lam = math.radians(L + 1.915 * math.sin(g) + 0.020 * math.sin(2.0 * g))
+    eps = math.radians(23.439 - 0.0000004 * d)
+
+    decl = math.degrees(math.asin(math.sin(eps) * math.sin(lam)))
+    ra = math.degrees(math.atan2(math.cos(eps) * math.sin(lam), math.cos(lam))) % 360.0
+    eot_deg = ((L - ra + 180.0) % 360.0) - 180.0
+
+    utc_hours = utc_dt.hour + utc_dt.minute / 60.0 + utc_dt.second / 3600.0
+    sub_lon = ((12.0 - utc_hours) * 15.0 - eot_deg + 180.0) % 360.0 - 180.0
+    return (decl, sub_lon)
+
+
+def compute_terminator_curve(
+    sub_lat: float, sub_lon: float, step_deg: int = 3
+) -> list[tuple[float, float]]:
+    """Return list of (lat, lon) points along the solar day/night terminator from -180..+180."""
+    dec_r = math.radians(sub_lat)
+    tan_dec = math.tan(dec_r)
+    if abs(tan_dec) < 1e-5:
+        tan_dec = 1e-5 if tan_dec >= 0 else -1e-5
+
+    pts: list[tuple[float, float]] = []
+    for lon_i in range(-180, 181, step_deg):
+        ha = math.radians(lon_i - sub_lon)
+        lat = math.degrees(math.atan(-math.cos(ha) / tan_dec))
+        pts.append((max(-85.0, min(85.0, lat)), float(lon_i)))
+    return pts
+
+
+# ---------------------------------------------------------------------------
+# Web Mercator Projection Helpers
+# ---------------------------------------------------------------------------
+def latlon_to_world_px(lat: float, lon: float, zoom: float) -> tuple[float, float]:
+    scale = TILE_SIZE * (2.0 ** zoom)
+    x = ((lon + 180.0) / 360.0) * scale
+    lat_c = max(-85.05112878, min(85.05112878, lat))
+    sin_lat = math.sin(math.radians(lat_c))
+    y = (0.5 - math.log((1.0 + sin_lat) / (1.0 - sin_lat)) / (4.0 * math.pi)) * scale
+    return (x, y)
+
+
+def world_px_to_latlon(wx: float, wy: float, zoom: float) -> tuple[float, float]:
+    scale = TILE_SIZE * (2.0 ** zoom)
+    lon = ((wx / scale) * 360.0 - 180.0 + 180.0) % 360.0 - 180.0
+    n = math.pi - 2.0 * math.pi * max(0.0, min(1.0, wy / scale))
+    lat = math.degrees(math.atan(math.sinh(n)))
+    return (lat, lon)
+
+
+# ---------------------------------------------------------------------------
+# Multi-Mode Tile Color Transform & SQLite Persistent Cache
+# ---------------------------------------------------------------------------
+def apply_map_mode_to_rgb(rgb_arr: np.ndarray, mode: str) -> np.ndarray:
+    """
+    Transform an HxWx3 uint8 RGB tile array into one of the 5 tactical visual modes:
+      dark, topo, day, amber, red
+    """
+    if mode in ("day", "topo"):
+        return rgb_arr
+
+    f = rgb_arr.astype(np.float32)
+    r, g, b = f[:, :, 0], f[:, :, 1], f[:, :, 2]
+    lum = 0.299 * r + 0.587 * g + 0.114 * b
+
+    if mode == "dark":
+        # Detect OSM blue water bodies (oceans, rivers, lakes) vs land/roads/labels
+        is_water = (b > r + 14.0) & (b > g - 6.0) & (b > 110.0)
+        # Invert bright OSM land into charcoal #1b2432 while preserving crisp road/border contrast
+        inv = 255.0 - lum
+        nr = np.clip(20.0 + inv * 0.26, 14.0, 92.0)
+        ng = np.clip(28.0 + inv * 0.34, 20.0, 118.0)
+        nb = np.clip(40.0 + inv * 0.46, 28.0, 152.0)
+        # Subtle green park tint preservation
+        is_park = (g > r + 12.0) & (g > b + 8.0) & ~is_water
+        ng = np.where(is_park, ng + 10.0, ng)
+        # Crisp midnight navy ocean #0b1524
+        nr = np.where(is_water, 11.0 + (255.0 - b) * 0.04, nr)
+        ng = np.where(is_water, 21.0 + (255.0 - b) * 0.06, ng)
+        nb = np.where(is_water, 36.0 + (255.0 - b) * 0.10, nb)
+        return np.stack([nr, ng, nb], axis=-1).astype(np.uint8)
+
+    if mode == "amber":
+        is_water = (b > r + 14.0) & (b > g - 6.0) & (b > 110.0)
+        v = np.where(is_water, 0.10, np.clip((260.0 - lum) / 220.0, 0.16, 1.0))
+        nr = np.clip(14.0 + v * 238.0, 0.0, 255.0)
+        ng = np.clip(8.0 + (v ** 1.18) * 166.0, 0.0, 255.0)
+        nb = np.clip(2.0 + (v ** 2.2) * 36.0, 0.0, 255.0)
+        return np.stack([nr, ng, nb], axis=-1).astype(np.uint8)
+
+    if mode == "red":
+        is_water = (b > r + 14.0) & (b > g - 6.0) & (b > 110.0)
+        v = np.where(is_water, 0.08, np.clip((260.0 - lum) / 220.0, 0.14, 1.0))
+        nr = np.clip(12.0 + v * 224.0, 0.0, 255.0)
+        ng = np.clip(2.0 + (v ** 2.4) * 34.0, 0.0, 255.0)
+        nb = np.clip(2.0 + (v ** 2.6) * 28.0, 0.0, 255.0)
+        return np.stack([nr, ng, nb], axis=-1).astype(np.uint8)
+
+    return rgb_arr
+
+
+def rgb_to_cairo_surface(rgb_arr: np.ndarray) -> cairo.ImageSurface:
+    h, w, _ = rgb_arr.shape
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+    bgra = np.empty((h, w, 4), dtype=np.uint8)
+    bgra[:, :, 0] = rgb_arr[:, :, 2]
+    bgra[:, :, 1] = rgb_arr[:, :, 1]
+    bgra[:, :, 2] = rgb_arr[:, :, 0]
+    bgra[:, :, 3] = 255
+    buf = surf.get_data()
+    raw = bgra.tobytes()
+    buf[:len(raw)] = raw
+    surf.mark_dirty()
+    return surf
+
+
+class TileCacheEngine:
+    """Persistent SQLite Slippy-Tile Cache + Polite Multi-Threaded HTTP Downloader."""
+
+    TILE_URLS = {
+        "osm": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        "topo": "https://a.tile.opentopomap.org/{z}/{x}/{y}.png",
+    }
+
+    def __init__(self, db_path: Path, on_tile_ready=None, max_workers: int = 3):
+        self.db_path = db_path
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.on_tile_ready = on_tile_ready
+        self._db_lock = threading.Lock()
+        self._mem_lock = threading.Lock()
+        self._raw_cache: collections.OrderedDict[tuple[str, int, int, int], np.ndarray] = collections.OrderedDict()
+        self._surf_cache: collections.OrderedDict[tuple[str, int, int, int], cairo.ImageSurface] = collections.OrderedDict()
+        self._inflight: set[tuple[str, int, int, int]] = set()
+        self._failed_until: dict[tuple[str, int, int, int], float] = {}
+        self._stack: list[tuple[str, int, int, int]] = []
+        self._cond = threading.Condition()
+        self._stop = False
+        self.online_ok = False
+        self.tiles_cached_count = 0
+
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        with self._db_lock:
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS tiles ("
+                "source TEXT, z INTEGER, x INTEGER, y INTEGER, png BLOB, ts INTEGER, "
+                "PRIMARY KEY (source, z, x, y))"
+            )
+            self._conn.commit()
+            cur = self._conn.execute("SELECT COUNT(*) FROM tiles")
+            row = cur.fetchone()
+            self.tiles_cached_count = int(row[0]) if row else 0
+
+        self._workers: list[threading.Thread] = []
+        for i in range(max_workers):
+            t = threading.Thread(target=self._worker_loop, name=f"dtmaps-tile-{i}", daemon=True)
+            t.start()
+            self._workers.append(t)
+
+    def shutdown(self) -> None:
+        with self._cond:
+            self._stop = True
+            self._cond.notify_all()
+
+    @staticmethod
+    def source_for_mode(mode: str) -> str:
+        return "topo" if mode == "topo" else "osm"
+
+    def get_surface(self, mode: str, z: int, x: int, y: int) -> tuple[cairo.ImageSurface | None, int]:
+        """
+        Return (surface, overzoom_shift). If exact tile is ready, overzoom_shift=0.
+        Otherwise queues download and attempts parent overzoom fallback (or returns None for vector base).
+        """
+        n = 1 << z
+        if y < 0 or y >= n:
+            return (None, 0)
+        x = x % n
+        sk = (mode, z, x, y)
+        with self._mem_lock:
+            surf = self._surf_cache.get(sk)
+            if surf is not None:
+                self._surf_cache.move_to_end(sk)
+                return (surf, 0)
+
+        src = self.source_for_mode(mode)
+        rk = (src, z, x, y)
+        rgb = self._get_or_load_raw(rk)
+        if rgb is not None:
+            styled = apply_map_mode_to_rgb(rgb, mode)
+            surf = rgb_to_cairo_surface(styled)
+            with self._mem_lock:
+                self._surf_cache[sk] = surf
+                while len(self._surf_cache) > 520:
+                    self._surf_cache.popitem(last=False)
+            return (surf, 0)
+
+        # Queue async download
+        self._enqueue(rk)
+
+        # Check up to 2 parent zoom levels in memory/SQLite for smooth zoom transitions
+        for dz in (1, 2):
+            pz = z - dz
+            if pz < MIN_ZOOM:
+                break
+            px, py = x >> dz, y >> dz
+            psk = (mode, pz, px, py)
+            with self._mem_lock:
+                psurf = self._surf_cache.get(psk)
+            if psurf is not None:
+                return (psurf, dz)
+        return (None, 0)
+
+    def _get_or_load_raw(self, rk: tuple[str, int, int, int]) -> np.ndarray | None:
+        with self._mem_lock:
+            arr = self._raw_cache.get(rk)
+            if arr is not None:
+                self._raw_cache.move_to_end(rk)
+                return arr
+
+        src, z, x, y = rk
+        blob = None
+        try:
+            with self._db_lock:
+                cur = self._conn.execute(
+                    "SELECT png FROM tiles WHERE source=? AND z=? AND x=? AND y=?",
+                    (src, z, x, y),
+                )
+                row = cur.fetchone()
+                if row:
+                    blob = row[0]
+        except Exception:
+            blob = None
+
+        if not blob:
+            return None
+
+        try:
+            im = Image.open(io.BytesIO(blob)).convert("RGB")
+            if im.size != (TILE_SIZE, TILE_SIZE):
+                im = im.resize((TILE_SIZE, TILE_SIZE), Image.Resampling.BILINEAR)
+            arr = np.array(im, dtype=np.uint8)
+            with self._mem_lock:
+                self._raw_cache[rk] = arr
+                while len(self._raw_cache) > 360:
+                    self._raw_cache.popitem(last=False)
+            return arr
+        except Exception:
+            return None
+
+    def _enqueue(self, rk: tuple[str, int, int, int]) -> None:
+        now = time.monotonic()
+        with self._cond:
+            if rk in self._inflight:
+                return
+            until = self._failed_until.get(rk, 0.0)
+            if now < until:
+                return
+            if rk in self._stack:
+                self._stack.remove(rk)
+            self._stack.append(rk)
+            while len(self._stack) > 64:
+                self._stack.pop(0)
+            self._cond.notify()
+
+    def _worker_loop(self) -> None:
+        sess = requests.Session()
+        sess.headers.update({"User-Agent": UA})
+        while True:
+            with self._cond:
+                while not self._stop and not self._stack:
+                    self._cond.wait(timeout=2.0)
+                if self._stop:
+                    return
+                rk = self._stack.pop()
+                self._inflight.add(rk)
+
+            src, z, x, y = rk
+            url = self.TILE_URLS[src].format(z=z, x=x, y=y)
+            ok = False
+            try:
+                resp = sess.get(url, timeout=(3.5, 6.0))
+                if resp.status_code == 200 and resp.content:
+                    im = Image.open(io.BytesIO(resp.content)).convert("RGB")
+                    if im.size != (TILE_SIZE, TILE_SIZE):
+                        im = im.resize((TILE_SIZE, TILE_SIZE), Image.Resampling.BILINEAR)
+                    arr = np.array(im, dtype=np.uint8)
+                    with self._db_lock:
+                        self._conn.execute(
+                            "INSERT OR REPLACE INTO tiles (source, z, x, y, png, ts) VALUES (?, ?, ?, ?, ?, ?)",
+                            (src, z, x, y, sqlite3.Binary(resp.content), int(time.time())),
+                        )
+                        self._conn.commit()
+                        self.tiles_cached_count += 1
+                    with self._mem_lock:
+                        self._raw_cache[rk] = arr
+                        while len(self._raw_cache) > 360:
+                            self._raw_cache.popitem(last=False)
+                    self.online_ok = True
+                    ok = True
+            except Exception:
+                ok = False
+
+            with self._cond:
+                self._inflight.discard(rk)
+                if not ok:
+                    self._failed_until[rk] = time.monotonic() + 25.0
+
+            if ok and self.on_tile_ready is not None:
+                GLib.idle_add(self.on_tile_ready)
+
+
+# ---------------------------------------------------------------------------
+# Propagation Spot Model & Parsers (PSKReporter XML, MQTT v3.1.1, ADIF, WSJT-X)
+# ---------------------------------------------------------------------------
+class Spot:
+    __slots__ = (
+        "key", "tx_call", "tx_grid", "tx_lat", "tx_lon",
+        "rx_call", "rx_grid", "rx_lat", "rx_lon",
+        "freq_hz", "band", "mode", "snr", "ts", "dist_km",
+        "source", "is_home_call", "is_home_grid", "arc_pts",
+    )
+
+    def __init__(
+        self,
+        tx_call: str,
+        tx_grid: str,
+        tx_lat: float,
+        tx_lon: float,
+        rx_call: str,
+        rx_grid: str,
+        rx_lat: float,
+        rx_lon: float,
+        freq_hz: float,
+        band: str,
+        mode: str,
+        snr: int | None,
+        ts: int,
+        source: str,
+        home_call: str,
+        home_grid4: str,
+    ):
+        self.tx_call = tx_call.upper().strip()
+        self.tx_grid = tx_grid.strip()
+        self.tx_lat = tx_lat
+        self.tx_lon = tx_lon
+        self.rx_call = rx_call.upper().strip()
+        self.rx_grid = rx_grid.strip()
+        self.rx_lat = rx_lat
+        self.rx_lon = rx_lon
+        self.freq_hz = freq_hz
+        self.band = band
+        self.mode = (mode or "FT8").upper().strip()
+        self.snr = snr
+        self.ts = ts
+        self.source = source
+        hc = home_call.upper().strip()
+        hg = home_grid4.upper()[:4]
+        base_tx = self.tx_call.split("/")[0]
+        base_rx = self.rx_call.split("/")[0]
+        self.is_home_call = bool(hc and (self.tx_call == hc or self.rx_call == hc or base_tx == hc or base_rx == hc))
+        self.is_home_grid = bool(hg and (self.tx_grid[:4].upper() == hg or self.rx_grid[:4].upper() == hg))
+        self.dist_km, _, _ = geodesic_distance_bearing(tx_lat, tx_lon, rx_lat, rx_lon)
+        self.key = f"{self.tx_call}>{self.rx_call}:{self.band}:{self.mode}"
+        self.arc_pts: list[tuple[float, float]] | None = None
+
+    def get_arc(self) -> list[tuple[float, float]]:
+        if self.arc_pts is None:
+            self.arc_pts = great_circle_unwrapped(self.tx_lat, self.tx_lon, self.rx_lat, self.rx_lon, steps=40)
+        return self.arc_pts
+
+
+def parse_pskreporter_xml(xml_text: str, home_call: str, home_grid4: str) -> list[Spot]:
+    """Parse PSKReporter retrieve XML <receptionReport> entries into Spot objects."""
+    spots: list[Spot] = []
+    if not xml_text or "<receptionReport" not in xml_text:
+        return spots
+    try:
+        root = ET.fromstring(xml_text)
+        elems = root.iter("receptionReport")
+    except ET.ParseError:
+        # Resilient fallback regex if XML stream was truncated
+        elems = []
+        for m in re.finditer(r"<receptionReport\b([^>]*)/?>", xml_text):
+            attrs = dict(re.findall(r'(\w+)="([^"]*)"', m.group(1)))
+            elems.append(type("Elem", (), {"attrib": attrs})())
+
+    now_ts = int(time.time())
+    for el in elems:
+        a = el.attrib
+        sc = a.get("senderCallsign", "").strip()
+        sl = a.get("senderLocator", "").strip()
+        rc = a.get("receiverCallsign", "").strip()
+        rl = a.get("receiverLocator", "").strip()
+        if not sc or not rc or not sl or not rl:
+            continue
+        p_tx = maidenhead_to_latlon(sl)
+        p_rx = maidenhead_to_latlon(rl)
+        if not p_tx or not p_rx:
+            continue
+        try:
+            f_hz = float(a.get("frequency", "0") or 0)
+        except ValueError:
+            f_hz = 0.0
+        mode = a.get("mode", "FT8") or "FT8"
+        snr_raw = a.get("sNR")
+        try:
+            snr = int(float(snr_raw)) if snr_raw not in (None, "") else None
+        except ValueError:
+            snr = None
+        try:
+            ts = int(a.get("flowStartSeconds", str(now_ts)) or now_ts)
+        except ValueError:
+            ts = now_ts
+        band = freq_to_band(f_hz)
+        spots.append(
+            Spot(
+                sc, sl, p_tx[0], p_tx[1],
+                rc, rl, p_rx[0], p_rx[1],
+                f_hz, band, mode, snr, ts,
+                "PSK24H", home_call, home_grid4,
+            )
+        )
+    spots.sort(key=lambda s: s.ts, reverse=True)
+    return spots
+
+
+def parse_mqtt_spot_json(payload: bytes, home_call: str, home_grid4: str) -> Spot | None:
+    """Parse PSKReporter MQTT JSON payload into a Spot."""
+    try:
+        d = json.loads(payload.decode("utf-8", errors="ignore"))
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    sc = str(d.get("sc") or "").strip()
+    sl = str(d.get("sl") or "").strip()
+    rc = str(d.get("rc") or "").strip()
+    rl = str(d.get("rl") or "").strip()
+    if not sc or not rc or not sl or not rl:
+        return None
+    p_tx = maidenhead_to_latlon(sl)
+    p_rx = maidenhead_to_latlon(rl)
+    if not p_tx or not p_rx:
+        return None
+    try:
+        f_hz = float(d.get("f") or 0.0)
+    except (ValueError, TypeError):
+        f_hz = 0.0
+    band = freq_to_band(f_hz, str(d.get("b") or ""))
+    mode = str(d.get("md") or "FT8")
+    rp = d.get("rp")
+    try:
+        snr = int(rp) if rp is not None else None
+    except (ValueError, TypeError):
+        snr = None
+    try:
+        ts = int(d.get("t") or time.time())
+    except (ValueError, TypeError):
+        ts = int(time.time())
+
+    return Spot(
+        sc, sl, p_tx[0], p_tx[1],
+        rc, rl, p_rx[0], p_rx[1],
+        f_hz, band, mode, snr, ts,
+        "MQTT", home_call, home_grid4,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pure-Stdlib MQTT v3.1.1 Packet Builder & Streaming Client (mqtt.pskreporter.info:1883)
+# ---------------------------------------------------------------------------
+def mqtt_encode_varlen(length: int) -> bytes:
+    out = bytearray()
+    while True:
+        digit = length % 128
+        length //= 128
+        if length > 0:
+            digit |= 0x80
+        out.append(digit)
+        if length == 0:
+            break
+    return bytes(out)
+
+
+def mqtt_encode_utf8(s: str) -> bytes:
+    b = s.encode("utf-8")
+    return struct.pack("!H", len(b)) + b
+
+
+def mqtt_build_connect(client_id: str, keepalive: int = 60) -> bytes:
+    var_hdr = mqtt_encode_utf8("MQTT") + struct.pack("!BBH", 4, 0x02, keepalive)
+    payload = mqtt_encode_utf8(client_id)
+    rem = var_hdr + payload
+    return b"\x10" + mqtt_encode_varlen(len(rem)) + rem
+
+
+def mqtt_build_subscribe(pkt_id: int, topics: list[str]) -> bytes:
+    var_hdr = struct.pack("!H", pkt_id)
+    payload = b"".join(mqtt_encode_utf8(t) + b"\x00" for t in topics)
+    rem = var_hdr + payload
+    return b"\x82" + mqtt_encode_varlen(len(rem)) + rem
+
+
+def mqtt_build_pingreq() -> bytes:
+    return b"\xc0\x00"
+
+
+def mqtt_try_decode_packet(buf: bytearray) -> tuple[int, str, bytes, int] | None:
+    """
+    Attempt to decode one complete MQTT packet from `buf`.
+    Returns (packet_type_nib, topic, payload_bytes, total_consumed_len) or None if incomplete.
+    """
+    if len(buf) < 2:
+        return None
+    first = buf[0]
+    pkt_type = (first >> 4) & 0x0F
+    flags = first & 0x0F
+
+    mult = 1
+    rem_len = 0
+    idx = 1
+    while True:
+        if idx >= len(buf):
+            return None
+        b = buf[idx]
+        idx += 1
+        rem_len += (b & 0x7F) * mult
+        mult *= 128
+        if mult > 128 * 128 * 128:
+            raise ValueError("Malformed MQTT variable length")
+        if (b & 0x80) == 0:
+            break
+
+    total_len = idx + rem_len
+    if len(buf) < total_len:
+        return None
+
+    body = bytes(buf[idx:total_len])
+    topic = ""
+    payload = body
+    if pkt_type == 3:  # PUBLISH
+        if len(body) < 2:
+            return (pkt_type, "", b"", total_len)
+        tlen = struct.unpack("!H", body[:2])[0]
+        pos = 2 + tlen
+        topic = body[2:pos].decode("utf-8", errors="replace")
+        qos = (flags >> 1) & 0x03
+        if qos > 0:
+            pos += 2
+        payload = body[pos:]
+    return (pkt_type, topic, payload, total_len)
+
+
+class PSKReporterMQTTClient:
+    """Resilient non-blocking MQTT v3.1.1 live spot stream from mqtt.pskreporter.info:1883."""
+
+    HOST = "mqtt.pskreporter.info"
+    PORT = 1883
+
+    def __init__(self, get_qth_fn, on_spot_batch_fn, on_state_fn):
+        self._get_qth = get_qth_fn
+        self._on_spot_batch = on_spot_batch_fn
+        self._on_state = on_state_fn
+        self._stop = threading.Event()
+        self._reconnect = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="dtmaps-mqtt", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def trigger_resubscribe(self) -> None:
+        self._reconnect.set()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._reconnect.set()
+
+    def _build_topics(self, call: str, grid4: str) -> list[str]:
+        c = call.upper().strip() or DEFAULT_CALLSIGN
+        g = grid4.upper()[:4] or "FN31"
+        return [
+            f"pskr/filter/v2/+/+/{c}/#",
+            f"pskr/filter/v2/+/+/+/{c}/#",
+            f"pskr/filter/v2/+/+/+/+/{g}/#",
+            f"pskr/filter/v2/+/+/+/+/+/{g}/#",
+            "pskr/filter/v2/+/FT8/#",
+            "pskr/filter/v2/+/FT4/#",
+            "pskr/filter/v2/+/JS8/#",
+            "pskr/filter/v2/+/CW/#",
+            "pskr/filter/v2/+/WSPR/#",
+        ]
+
+    def _run(self) -> None:
+        backoff = 3.0
+        while not self._stop.is_set():
+            self._reconnect.clear()
+            call, grid = self._get_qth()
+            grid4 = grid[:4].upper() if len(grid) >= 4 else "FN31"
+            cid = f"dtmaps_{call.lower()}_{random.randint(10000, 99999)}"
+            sock = None
+            try:
+                self._on_state("CONNECTING")
+                sock = socket.create_connection((self.HOST, self.PORT), timeout=6.0)
+                sock.settimeout(1.0)
+                sock.sendall(mqtt_build_connect(cid, keepalive=60))
+
+                buf = bytearray()
+                # Wait for CONNACK (packet type 2)
+                deadline = time.monotonic() + 6.0
+                conn_ok = False
+                while time.monotonic() < deadline and not self._stop.is_set():
+                    try:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            break
+                        buf.extend(chunk)
+                        pkt = mqtt_try_decode_packet(buf)
+                        if pkt:
+                            ptype, _, pl, consumed = pkt
+                            del buf[:consumed]
+                            if ptype == 2 and len(pl) >= 2 and pl[1] == 0:
+                                conn_ok = True
+                                break
+                    except socket.timeout:
+                        continue
+
+                if not conn_ok:
+                    raise OSError("MQTT CONNACK failed")
+
+                topics = self._build_topics(call, grid4)
+                sock.sendall(mqtt_build_subscribe(1, topics))
+                self._on_state("LIVE MQTT")
+                backoff = 3.0
+
+                last_ping = time.monotonic()
+                last_flush = time.monotonic()
+                last_global_emit = 0.0
+                batch: list[Spot] = []
+
+                while not self._stop.is_set() and not self._reconnect.is_set():
+                    now = time.monotonic()
+                    if now - last_ping >= 28.0:
+                        sock.sendall(mqtt_build_pingreq())
+                        last_ping = now
+
+                    try:
+                        chunk = sock.recv(65536)
+                        if not chunk:
+                            raise OSError("MQTT EOF")
+                        buf.extend(chunk)
+                        if len(buf) > 524288:
+                            # Prevent unbounded buffer growth on bursty global FT8 streams
+                            buf.clear()
+                    except socket.timeout:
+                        pass
+
+                    while True:
+                        pkt = mqtt_try_decode_packet(buf)
+                        if pkt is None:
+                            break
+                        ptype, topic, pl, consumed = pkt
+                        del buf[:consumed]
+                        if ptype == 3 and pl:
+                            is_priority = (call.upper() in topic.upper()) or (grid4 in topic.upper()) or ("/FT8/" not in topic)
+                            t_now = time.monotonic()
+                            # Keep 100% of W1AW, FN31, FT4, JS8, CW, WSPR; smoothly pace global FT8 flood (~35 spots/sec)
+                            if is_priority or (t_now - last_global_emit >= 0.028):
+                                sp = parse_mqtt_spot_json(pl, call, grid4)
+                                if sp is not None:
+                                    if not sp.is_home_call and not sp.is_home_grid and sp.mode == "FT8":
+                                        last_global_emit = t_now
+                                    batch.append(sp)
+
+                    now = time.monotonic()
+                    if batch and (now - last_flush >= 0.25 or len(batch) >= 24):
+                        self._on_spot_batch(batch)
+                        batch = []
+                        last_flush = now
+
+            except Exception:
+                self._on_state("OFFLINE / STANDBY")
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+
+            if not self._stop.is_set() and not self._reconnect.is_set():
+                self._stop.wait(timeout=backoff)
+                backoff = min(30.0, backoff * 1.6)
+
+
+# ---------------------------------------------------------------------------
+# Engine C: Local ADIF (.adi) Parser & WSJT-X UDP (127.0.0.1:2237) Listener
+# ---------------------------------------------------------------------------
+ADIF_FIELD_RE = re.compile(r"<([A-Za-z0-9_]+):(\d+)(?::[^>]+)?>(.*?)(?=<[A-Za-z0-9_]+|\Z)", re.DOTALL)
+
+
+def parse_adif_worked_grids(adif_text: str) -> tuple[set[str], set[str], int]:
+    """
+    Parse ADIF log content and return (worked_grids4, confirmed_grids4, qso_count).
+    """
+    worked: set[str] = set()
+    confirmed: set[str] = set()
+    qsos = 0
+    # Split past header if <EOH> present
+    idx = adif_text.upper().find("<EOH>")
+    body = adif_text[idx + 5:] if idx >= 0 else adif_text
+
+    for rec in re.split(r"<EOR>", body, flags=re.IGNORECASE):
+        if "<" not in rec:
+            continue
+        fields: dict[str, str] = {}
+        pos = 0
+        while True:
+            m = re.search(r"<([A-Za-z0-9_]+):(\d+)(?::[^>]*)?>", rec[pos:])
+            if not m:
+                break
+            fname = m.group(1).upper()
+            flen = int(m.group(2))
+            vstart = pos + m.end()
+            val = rec[vstart:vstart + flen].strip()
+            fields[fname] = val
+            pos = vstart + flen
+
+        if not fields:
+            continue
+        if "CALL" in fields or "GRIDSQUARE" in fields:
+            qsos += 1
+        gs = fields.get("GRIDSQUARE", "").strip()
+        if len(gs) >= 4 and is_valid_maidenhead(gs[:4]):
+            g4 = gs[:4].upper()
+            worked.add(g4)
+            is_cfm = any(
+                fields.get(k, "").upper().startswith("Y")
+                for k in ("QSL_RCVD", "LOTW_QSL_RCVD", "EQSL_QSL_RCVD")
+            )
+            if is_cfm:
+                confirmed.add(g4)
+    return (worked, confirmed, qsos)
+
+
+class WSJTXUdpListener:
+    """Non-blocking WSJT-X UDP listener on 127.0.0.1:2237 for live local rig decodes."""
+
+    MAGIC = 0xADBCCBDA
+
+    def __init__(self, get_qth_fn, on_spot_fn):
+        self._get_qth = get_qth_fn
+        self._on_spot = on_spot_fn
+        self._stop = threading.Event()
+        self.dial_freq_hz = 14_074_000.0
+        self.wsjtx_mode = "FT8"
+        self._thread = threading.Thread(target=self._run, name="dtmaps-wsjtx", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    @staticmethod
+    def _read_utf8(data: bytes, off: int) -> tuple[str, int]:
+        if off + 4 > len(data):
+            return ("", len(data))
+        (slen,) = struct.unpack_from("!I", data, off)
+        off += 4
+        if slen == 0xFFFFFFFF or slen == 0:
+            return ("", off)
+        s = data[off:off + slen].decode("utf-8", errors="replace")
+        return (s, off + slen)
+
+    def _run(self) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", 2237))
+            sock.settimeout(1.0)
+        except Exception:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return
+
+        while not self._stop.is_set():
+            try:
+                pkt, _ = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+
+            if len(pkt) < 12:
+                continue
+            magic, _schema, mtype = struct.unpack_from("!III", pkt, 0)
+            if magic != self.MAGIC:
+                continue
+            off = 12
+            _client_id, off = self._read_utf8(pkt, off)
+
+            if mtype == 1 and off + 8 <= len(pkt):
+                # Status packet: uint64 dial frequency + utf8 mode
+                (dfreq,) = struct.unpack_from("!Q", pkt, off)
+                off += 8
+                md, _ = self._read_utf8(pkt, off)
+                if dfreq > 0:
+                    self.dial_freq_hz = float(dfreq)
+                if md:
+                    self.wsjtx_mode = md
+            elif mtype == 2 and off + 21 <= len(pkt):
+                # Decode packet: bool new, uint32 ms, int32 snr, float64 dt, uint32 df, utf8 mode, utf8 message
+                _is_new = pkt[off]
+                off += 1
+                _ms, snr, _dt, df = struct.unpack_from("!IidI", pkt, off)
+                off += 20
+                _md_ch, off = self._read_utf8(pkt, off)
+                msg, off = self._read_utf8(pkt, off)
+                self._parse_wsjtx_message(msg.strip(), snr, float(df))
+
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    def _parse_wsjtx_message(self, msg: str, snr: int, df: float) -> None:
+        # e.g. "CQ W7ABC CN87" or "CQ DX JA1XYZ PM95" or "W1AW K1ABC FN42"
+        parts = msg.split()
+        if len(parts) < 3:
+            return
+        grid_tok = parts[-1]
+        if len(grid_tok) != 4 or grid_tok in ("RR73", "RRR", "73") or not is_valid_maidenhead(grid_tok):
+            return
+        tx_call = parts[-2]
+        if not re.match(r"^[A-Z0-9/]{3,12}$", tx_call):
+            return
+        p_tx = maidenhead_to_latlon(grid_tok)
+        home_call, home_grid = self._get_qth()
+        p_rx = maidenhead_to_latlon(home_grid)
+        if not p_tx or not p_rx:
+            return
+        f_hz = self.dial_freq_hz + df
+        sp = Spot(
+            tx_call, grid_tok, p_tx[0], p_tx[1],
+            home_call, home_grid, p_rx[0], p_rx[1],
+            f_hz, freq_to_band(f_hz), self.wsjtx_mode, snr, int(time.time()),
+            "WSJTX", home_call, home_grid[:4],
+        )
+        self._on_spot([sp])
+
+
+# ---------------------------------------------------------------------------
+# Main dtMaps Application Window
+# ---------------------------------------------------------------------------
+class DtMapsWindow(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="dtMaps — Amateur Radio GridTracker & PSKReporter Propagation Atlas")
+        self.set_default_size(1140, 660)
+        self.set_position(Gtk.WindowPosition.CENTER)
+
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+        self.chrome_col, self.sel_col, self.well_col = load_cde_palette()
+        prov = Gtk.CssProvider()
+        prov.load_from_data(build_maps_css(self.chrome_col, self.sel_col, self.well_col))
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        self._try_load_window_icon()
+
+        # Station & Viewport State
+        cfg = self._load_config()
+        self.home_call: str = str(cfg.get("callsign") or DEFAULT_CALLSIGN).upper().strip()
+        self.home_grid: str = str(cfg.get("grid") or DEFAULT_GRID).strip()
+        pt = maidenhead_to_latlon(self.home_grid)
+        if pt is None:
+            self.home_grid = DEFAULT_GRID
+            self.home_lat, self.home_lon = DEFAULT_LAT, DEFAULT_LON
+        else:
+            self.home_lat, self.home_lon = pt
+
+        self.zoom: int = max(MIN_ZOOM, min(MAX_ZOOM, int(cfg.get("zoom", 3))))
+        self.center_lat: float = float(cfg.get("center_lat", 26.0))
+        self.center_lon: float = float(cfg.get("center_lon", -42.0))
+        self.map_mode: str = str(cfg.get("map_mode", "dark"))
+        if self.map_mode not in {m[0] for m in MAP_MODES}:
+            self.map_mode = "dark"
+
+        self.show_grid: bool = bool(cfg.get("show_grid", True))
+        self.show_greyline: bool = bool(cfg.get("show_greyline", True))
+        self.show_arcs: bool = bool(cfg.get("show_arcs", True))
+        self.show_squares: bool = bool(cfg.get("show_squares", True))
+        self.ruler_active: bool = False
+        self.ruler_anchor: tuple[float, float] | None = None
+        self.ruler_target: tuple[float, float] | None = None
+
+        # Cursor & Drag State
+        self.cursor_lat: float = self.home_lat
+        self.cursor_lon: float = self.home_lon
+        self.cursor_in_map: bool = False
+        self._dragging: bool = False
+        self._drag_moved: bool = False
+        self._drag_last_xy: tuple[float, float] = (0.0, 0.0)
+
+        # Propagation Spots, Filters & Worked Grids
+        self._spots_lock = threading.Lock()
+        self.psk24h_spots: list[Spot] = []
+        self.psk24h_status: str = "POLLING..."
+        self.psk24h_last_poll: float = 0.0
+        self.mqtt_state: str = "STARTING"
+        self.live_spots: collections.OrderedDict[str, Spot] = collections.OrderedDict()
+        self.selected_spot_key: str | None = None
+
+        self.enabled_bands: set[str] = set(BAND_ORDER)
+        self.mode_filter: str = "ALL MODES"
+
+        self.worked_grids: set[str] = set()
+        self.confirmed_grids: set[str] = set()
+        self.adif_qso_count: int = 0
+        self._load_worked_grids()
+
+        # Animation Phase for W1AW Pulsing Beacons
+        self.anim_phase: float = 0.0
+        self._roster_dirty: bool = True
+        self._last_roster_sync: float = 0.0
+
+        # Tile Cache Engine
+        self.tile_engine = TileCacheEngine(TILE_DB_FILE, on_tile_ready=self._queue_map_redraw, max_workers=3)
+
+        # Build UI
+        self._build_ui()
+
+        # Auto-load WSJT-X log if present
+        if WSJTX_DEFAULT_ADI.is_file():
+            self._import_adif_file(WSJTX_DEFAULT_ADI, save_copy=True, quiet=True)
+
+        # Start Background Engines (PSKReporter 24h XML, Live MQTT, WSJT-X UDP)
+        self._start_psk24h_poll(force_network=False)
+        self.mqtt_client = PSKReporterMQTTClient(
+            get_qth_fn=lambda: (self.home_call, self.home_grid),
+            on_spot_batch_fn=self._on_incoming_spots_threadsafe,
+            on_state_fn=self._on_mqtt_state_threadsafe,
+        )
+        self.mqtt_client.start()
+
+        self.wsjtx_listener = WSJTXUdpListener(
+            get_qth_fn=lambda: (self.home_call, self.home_grid),
+            on_spot_fn=self._on_incoming_spots_threadsafe,
+        )
+        self.wsjtx_listener.start()
+
+        # Timers: 100ms smooth animation & UI batch tick + 60s PSKReporter 24h auto-check
+        GLib.timeout_add(100, self._on_anim_tick)
+        GLib.timeout_add_seconds(30, self._on_periodic_psk_check)
+        self.connect("destroy", self._on_destroy)
+
+    # -----------------------------------------------------------------------
+    # Configuration & Persistence
+    # -----------------------------------------------------------------------
+    def _try_load_window_icon(self) -> None:
+        here = Path(__file__).resolve().parent
+        for cand in (
+            here / "icons" / "dtmaps.pm",
+            HOME / ".dt" / "icons" / "dtmaps.pm",
+            here.parent / "assets" / "icons" / "dtmaps.png",
+        ):
+            if cand.is_file():
+                try:
+                    self.set_icon_from_file(str(cand))
+                    return
+                except Exception:
+                    pass
+
+    def _load_config(self) -> dict[str, Any]:
+        if CONFIG_FILE.is_file():
+            try:
+                return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {}
+
+    def _save_config(self) -> None:
+        data = {
+            "callsign": self.home_call,
+            "grid": self.home_grid,
+            "zoom": self.zoom,
+            "center_lat": round(self.center_lat, 5),
+            "center_lon": round(self.center_lon, 5),
+            "map_mode": self.map_mode,
+            "show_grid": self.show_grid,
+            "show_greyline": self.show_greyline,
+            "show_arcs": self.show_arcs,
+            "show_squares": self.show_squares,
+        }
+        try:
+            CONFIG_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _load_worked_grids(self) -> None:
+        if WORKED_FILE.is_file():
+            try:
+                d = json.loads(WORKED_FILE.read_text(encoding="utf-8"))
+                self.worked_grids = set(d.get("worked", []))
+                self.confirmed_grids = set(d.get("confirmed", []))
+                self.adif_qso_count = int(d.get("qso_count", 0))
+            except Exception:
+                pass
+
+    def _save_worked_grids(self) -> None:
+        try:
+            WORKED_FILE.write_text(
+                json.dumps(
+                    {
+                        "worked": sorted(self.worked_grids),
+                        "confirmed": sorted(self.confirmed_grids),
+                        "qso_count": self.adif_qso_count,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    # -----------------------------------------------------------------------
+    # UI Construction (Motif Chrome, VFD Telemetry, Canvas, Band Bar, Roster)
+    # -----------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(outer)
+
+        cab = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        cab.get_style_context().add_class("maps-cabinet")
+        outer.pack_start(cab, True, True, 0)
+
+        # 1. Glowing Top VFD Telemetry Strip (Custom Cairo DrawingArea)
+        vfd_bezel = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        vfd_bezel.get_style_context().add_class("maps-bezel")
+        self.vfd_area = Gtk.DrawingArea()
+        self.vfd_area.set_size_request(-1, 50)
+        self.vfd_area.connect("draw", self._on_draw_vfd)
+        vfd_bezel.pack_start(self.vfd_area, True, True, 0)
+        cab.pack_start(vfd_bezel, False, False, 0)
+
+        # 2. Tactical Control Strip (Home Station QTH, Nav Presets, Map Mode, Overlays, ADIF)
+        ctrl = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        ctrl.get_style_context().add_class("maps-strip")
+
+        lbl_de = Gtk.Label(label="CALL:")
+        lbl_de.get_style_context().add_class("rx-engraved")
+        ctrl.pack_start(lbl_de, False, False, 0)
+
+        self.ent_call = Gtk.Entry()
+        self.ent_call.set_width_chars(8)
+        self.ent_call.set_max_length(12)
+        self.ent_call.set_text(self.home_call)
+        self.ent_call.get_style_context().add_class("qth-entry")
+        self.ent_call.connect("activate", self._on_apply_qth)
+        ctrl.pack_start(self.ent_call, False, False, 0)
+
+        lbl_gr = Gtk.Label(label="GRID:")
+        lbl_gr.get_style_context().add_class("rx-engraved")
+        ctrl.pack_start(lbl_gr, False, False, 0)
+
+        self.ent_grid = Gtk.Entry()
+        self.ent_grid.set_width_chars(7)
+        self.ent_grid.set_max_length(8)
+        self.ent_grid.set_text(self.home_grid)
+        self.ent_grid.get_style_context().add_class("qth-entry")
+        self.ent_grid.connect("activate", self._on_apply_qth)
+        ctrl.pack_start(self.ent_grid, False, False, 0)
+
+        btn_set = Gtk.Button(label="SET QTH")
+        btn_set.get_style_context().add_class("btn-psk")
+        btn_set.set_tooltip_text("Save Home Callsign & Grid and re-query PSKReporter")
+        btn_set.connect("clicked", self._on_apply_qth)
+        ctrl.pack_start(btn_set, False, False, 0)
+
+        # Zoom & Viewport Presets
+        btn_zin = Gtk.Button(label="+")
+        btn_zin.set_tooltip_text("Zoom In")
+        btn_zin.connect("clicked", lambda *_: self._set_zoom(self.zoom + 1))
+        ctrl.pack_start(btn_zin, False, False, 0)
+
+        btn_zout = Gtk.Button(label="-")
+        btn_zout.set_tooltip_text("Zoom Out")
+        btn_zout.connect("clicked", lambda *_: self._set_zoom(self.zoom - 1))
+        ctrl.pack_start(btn_zout, False, False, 0)
+
+        self.btn_home = Gtk.Button(label=f"HOME {self.home_grid}")
+        self.btn_home.get_style_context().add_class("btn-home")
+        self.btn_home.set_tooltip_text("Center on Home QTH (configured Maidenhead locator)")
+        self.btn_home.connect("clicked", self._on_jump_home)
+        ctrl.pack_start(self.btn_home, False, False, 0)
+
+        btn_usa = Gtk.Button(label="USA")
+        btn_usa.set_tooltip_text("Fit North America / USA")
+        btn_usa.connect("clicked", lambda *_: self._jump_to(39.5, -98.5, 4))
+        ctrl.pack_start(btn_usa, False, False, 0)
+
+        btn_world = Gtk.Button(label="WORLD")
+        btn_world.set_tooltip_text("World Propagation Overview")
+        btn_world.connect("clicked", lambda *_: self._jump_to(22.0, -25.0, 2))
+        ctrl.pack_start(btn_world, False, False, 0)
+
+        # Map Mode Combo
+        self.cmb_map_mode = Gtk.ComboBoxText()
+        for idx, (mkey, mtitle) in enumerate(MAP_MODES):
+            self.cmb_map_mode.append(mkey, mtitle)
+            if mkey == self.map_mode:
+                self.cmb_map_mode.set_active(idx)
+        self.cmb_map_mode.set_tooltip_text("Switch Cartography Visual Mode")
+        self.cmb_map_mode.connect("changed", self._on_map_mode_changed)
+        ctrl.pack_start(self.cmb_map_mode, False, False, 0)
+
+        # Mode / Spot Scope Filter Combo
+        self.cmb_mode_filter = Gtk.ComboBoxText()
+        for idx, mf in enumerate(MODE_FILTERS):
+            self.cmb_mode_filter.append_text(mf)
+        self.cmb_mode_filter.set_active(0)
+        self.cmb_mode_filter.set_tooltip_text("Filter Live Propagation Spots by Mode or Station")
+        self.cmb_mode_filter.connect("changed", self._on_mode_filter_changed)
+        ctrl.pack_start(self.cmb_mode_filter, False, False, 0)
+
+        # Tactical Overlay Switches
+        self.btn_grid = self._make_switch_btn("GRID", self.show_grid, self._on_toggle_grid, "Toggle Adaptive 2/4/6-char Maidenhead Grid")
+        ctrl.pack_start(self.btn_grid, False, False, 0)
+
+        self.btn_grey = self._make_switch_btn("GREYLINE", self.show_greyline, self._on_toggle_greyline, "Toggle Astronomical Solar Terminator & Subsolar Marker")
+        ctrl.pack_start(self.btn_grey, False, False, 0)
+
+        self.btn_arcs = self._make_switch_btn("ARCS", self.show_arcs, self._on_toggle_arcs, "Toggle Great-Circle Propagation Arcs")
+        ctrl.pack_start(self.btn_arcs, False, False, 0)
+
+        self.btn_ruler = self._make_switch_btn("RULER", self.ruler_active, self._on_toggle_ruler, "Interactive Range & Bearing Geodesic Ruler (click map to set anchor)")
+        ctrl.pack_start(self.btn_ruler, False, False, 0)
+
+        btn_adif = Gtk.Button(label="ADIF")
+        btn_adif.set_tooltip_text("Import Local ADIF (.adi) Log to Highlight Worked/Confirmed Grids")
+        btn_adif.connect("clicked", self._on_click_import_adif)
+        ctrl.pack_end(btn_adif, False, False, 0)
+
+        self.btn_roster = self._make_switch_btn("ROSTER", True, self._on_toggle_roster, "Show/Hide Right-Hand Live Spot Roster")
+        ctrl.pack_end(self.btn_roster, False, False, 0)
+
+        cab.pack_start(ctrl, False, False, 0)
+
+        # 3. Main Split Workspace: Slippy Map Canvas (Left) + Collapsible Spot Roster (Right)
+        self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        cab.pack_start(self.paned, True, True, 0)
+
+        map_bezel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        map_bezel.get_style_context().add_class("maps-bezel")
+
+        self.map_area = Gtk.DrawingArea()
+        self.map_area.set_hexpand(True)
+        self.map_area.set_vexpand(True)
+        self.map_area.set_can_focus(True)
+        self.map_area.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+            | Gdk.EventMask.SCROLL_MASK
+            | Gdk.EventMask.LEAVE_NOTIFY_MASK
+            | Gdk.EventMask.KEY_PRESS_MASK
+        )
+        self.map_area.connect("draw", self._on_draw_map)
+        self.map_area.connect("button-press-event", self._on_map_button_press)
+        self.map_area.connect("button-release-event", self._on_map_button_release)
+        self.map_area.connect("motion-notify-event", self._on_map_motion)
+        self.map_area.connect("scroll-event", self._on_map_scroll)
+        self.map_area.connect("leave-notify-event", self._on_map_leave)
+        map_bezel.pack_start(self.map_area, True, True, 0)
+        self.paned.pack1(map_bezel, resize=True, shrink=False)
+
+        # Right-hand Collapsible Live Spot Roster
+        self.roster_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        self.roster_box.get_style_context().add_class("maps-strip")
+        self.roster_box.set_size_request(330, -1)
+
+        r_hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.lbl_roster_title = Gtk.Label(label="LIVE PROPAGATION ROSTER")
+        self.lbl_roster_title.get_style_context().add_class("rx-engraved")
+        r_hdr.pack_start(self.lbl_roster_title, False, False, 2)
+
+        btn_poll = Gtk.Button(label="POLL 24H")
+        btn_poll.get_style_context().add_class("btn-psk")
+        btn_poll.set_tooltip_text("Refresh 24h PSKReporter history (respects 5-min minimum poll cache)")
+        btn_poll.connect("clicked", lambda *_: self._start_psk24h_poll(force_network=True))
+        r_hdr.pack_end(btn_poll, False, False, 0)
+
+        btn_clr = Gtk.Button(label="CLR")
+        btn_clr.set_tooltip_text("Clear transient MQTT buffer (keeps 24h Home Callsign spots)")
+        btn_clr.connect("clicked", self._on_clear_live_spots)
+        r_hdr.pack_end(btn_clr, False, False, 0)
+
+        self.roster_box.pack_start(r_hdr, False, False, 0)
+
+        # ListStore: key, age_s, band, mode, tx_call, tx_grid, rx_call, rx_grid, snr_str, km_str, bg_hex, fg_hex
+        self.roster_store = Gtk.ListStore(str, str, str, str, str, str, str, str, str, str, str, str)
+        self.roster_view = Gtk.TreeView(model=self.roster_store)
+        self.roster_view.get_style_context().add_class("spot-roster")
+        self.roster_view.set_headers_visible(True)
+        self.roster_view.connect("cursor-changed", self._on_roster_row_selected)
+        self.roster_view.connect("row-activated", self._on_roster_row_activated)
+
+        cols = [
+            ("AGE", 1, 38),
+            ("BAND", 2, 42),
+            ("MD", 3, 38),
+            ("TX", 4, 64),
+            ("GRID", 5, 44),
+            ("RX", 6, 64),
+            ("dB", 8, 34),
+            ("KM", 9, 48),
+        ]
+        for title, cidx, minw in cols:
+            rend = Gtk.CellRendererText()
+            rend.set_property("xpad", 3)
+            rend.set_property("ypad", 1)
+            col = Gtk.TreeViewColumn(title, rend, text=cidx, cell_background=10, foreground=11)
+            col.set_min_width(minw)
+            col.set_resizable(True)
+            self.roster_view.append_column(col)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw.add(self.roster_view)
+        self.roster_box.pack_start(sw, True, True, 0)
+        self.paned.pack2(self.roster_box, resize=False, shrink=False)
+        self.paned.set_position(785)
+
+        # 4. Interactive Clickable Band Filter Legend Bar
+        band_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        band_bar.get_style_context().add_class("maps-strip")
+
+        lbl_bf = Gtk.Label(label="BANDS:")
+        lbl_bf.get_style_context().add_class("rx-engraved")
+        band_bar.pack_start(lbl_bf, False, False, 2)
+
+        btn_all_b = Gtk.Button(label="ALL")
+        btn_all_b.get_style_context().add_class("band-btn")
+        btn_all_b.connect("clicked", self._on_bands_all)
+        band_bar.pack_start(btn_all_b, False, False, 0)
+
+        self.band_buttons: dict[str, Gtk.Button] = {}
+        self.band_labels: dict[str, Gtk.Label] = {}
+        for bname, _, _, _, bhex in BAND_DEFS:
+            btn = Gtk.Button()
+            btn.get_style_context().add_class("band-btn")
+            lbl = Gtk.Label()
+            lbl.set_use_markup(True)
+            lbl.set_markup(f'<span foreground="{bhex}">●</span> {bname}')
+            btn.add(lbl)
+            btn.set_tooltip_text(f"Click to toggle {bname}; Right-click to solo {bname}")
+            btn.connect("clicked", self._on_band_clicked, bname)
+            btn.connect("button-press-event", self._on_band_press, bname)
+            band_bar.pack_start(btn, False, False, 0)
+            self.band_buttons[bname] = btn
+            self.band_labels[bname] = lbl
+
+        self.lbl_legend_right = Gtk.Label(label=f"★ GOLD: {self.home_call} PATH  |  ■ WORKED / CONFIRMED GRIDS")
+        self.lbl_legend_right.get_style_context().add_class("rx-engraved")
+        band_bar.pack_end(self.lbl_legend_right, False, False, 4)
+
+        cab.pack_start(band_bar, False, False, 0)
+
+        # 5. CDE Motif Bottom Status Bar
+        self.status_lbl = Gtk.Label(
+            label=f"Ready — DE {self.home_call} [{self.home_grid}] Station QTH  |  Drag to pan, Scroll wheel to zoom, Click spot or arc to inspect"
+        )
+        self.status_lbl.set_xalign(0.0)
+        self.status_lbl.get_style_context().add_class("cde-status")
+        outer.pack_start(self.status_lbl, False, False, 0)
+
+    def _make_switch_btn(self, text: str, active: bool, cb, tip: str) -> Gtk.Button:
+        btn = Gtk.Button(label=text)
+        btn.set_tooltip_text(tip)
+        if active:
+            btn.get_style_context().add_class("sw-active")
+        btn.connect("clicked", cb)
+        return btn
+
+    def _sync_switch_style(self, btn: Gtk.Button, active: bool) -> None:
+        ctx = btn.get_style_context()
+        if active:
+            ctx.add_class("sw-active")
+        else:
+            ctx.remove_class("sw-active")
+
+    # -----------------------------------------------------------------------
+    # PSKReporter 24h Dedicated Query Engine (Engine A)
+    # -----------------------------------------------------------------------
+    def _psk_cache_path(self, call: str) -> Path:
+        safe = re.sub(r"[^A-Z0-9_-]", "_", call.upper()) or "W1AW"
+        return CACHE_DIR / f"psk_{safe}.xml"
+
+    def _start_psk24h_poll(self, force_network: bool = False) -> None:
+        call = self.home_call
+        grid4 = self.home_grid[:4].upper()
+        cpath = self._psk_cache_path(call)
+
+        def worker():
+            now = time.time()
+            xml_text = ""
+            used_cache = False
+
+            if cpath.is_file():
+                try:
+                    age = now - cpath.stat().st_mtime
+                    # Always respect PSKReporter's >=300s (5-minute) minimum query interval!
+                    if age < 300.0:
+                        xml_text = cpath.read_text(encoding="utf-8", errors="ignore")
+                        used_cache = True
+                except Exception:
+                    pass
+
+            if not used_cache:
+                url = f"https://retrieve.pskreporter.info/query?callsign={call}&flowStartSeconds=-86400"
+                try:
+                    resp = requests.get(url, headers={"User-Agent": UA}, timeout=(4.5, 9.0))
+                    if resp.status_code == 200 and (
+                        "<receptionReport" in resp.text or "<pskReporter" in resp.text or "<?xml" in resp.text
+                    ):
+                        xml_text = resp.text
+                        cpath.write_text(xml_text, encoding="utf-8")
+                        self.psk24h_last_poll = time.time()
+                except Exception:
+                    # Fallback to stale cache if offline
+                    if cpath.is_file():
+                        try:
+                            xml_text = cpath.read_text(encoding="utf-8", errors="ignore")
+                            used_cache = True
+                        except Exception:
+                            pass
+
+            spots = parse_pskreporter_xml(xml_text, call, grid4) if xml_text else []
+            GLib.idle_add(self._on_psk24h_done, call, spots, bool(xml_text), used_cache)
+
+        threading.Thread(target=worker, name="dtmaps-psk24h", daemon=True).start()
+
+    def _on_psk24h_done(self, call: str, spots: list[Spot], got_xml: bool, used_cache: bool) -> bool:
+        if call != self.home_call:
+            return False
+        with self._spots_lock:
+            self.psk24h_spots = spots
+        n = len(spots)
+        if n > 0:
+            self.psk24h_status = f"{call} (24h): {n} spots"
+        elif got_xml:
+            self.psk24h_status = f"{call}: 0 in 24h (Rig Standby)"
+        else:
+            self.psk24h_status = f"{call}: 0 in 24h (Rig Standby)"
+
+        src_note = "cached <5m" if used_cache else ("live XML" if got_xml else "offline standby")
+        self._set_status(f"PSKReporter 24h query for {call} [{src_note}]: {n} reception reports loaded.")
+        self._roster_dirty = True
+        self._queue_map_redraw()
+        self.vfd_area.queue_draw()
+        return False
+
+    def _on_periodic_psk_check(self) -> bool:
+        cpath = self._psk_cache_path(self.home_call)
+        age = (time.time() - cpath.stat().st_mtime) if cpath.is_file() else 9999.0
+        if age >= 305.0 and (time.time() - self.psk24h_last_poll) >= 305.0:
+            self.psk24h_last_poll = time.time()
+            self._start_psk24h_poll(force_network=True)
+        return True
+
+    # -----------------------------------------------------------------------
+    # Live MQTT & WSJT-X Spot Ingestion
+    # -----------------------------------------------------------------------
+    def _on_mqtt_state_threadsafe(self, st: str) -> None:
+        def apply():
+            self.mqtt_state = st
+            self.vfd_area.queue_draw()
+            return False
+        GLib.idle_add(apply)
+
+    def _on_incoming_spots_threadsafe(self, batch: list[Spot]) -> None:
+        with self._spots_lock:
+            for sp in batch:
+                if sp.key in self.live_spots:
+                    del self.live_spots[sp.key]
+                self.live_spots[sp.key] = sp
+            # Ring-buffer cap of freshest 500 live spots (preserving home callsign/grid spots longer)
+            while len(self.live_spots) > 500:
+                oldest_k = next(iter(self.live_spots))
+                self.live_spots.pop(oldest_k, None)
+        self._roster_dirty = True
+        GLib.idle_add(self._queue_map_redraw)
+
+    # -----------------------------------------------------------------------
+    # Filtered Spots Snapshot & Roster Sync
+    # -----------------------------------------------------------------------
+    def _get_filtered_spots(self) -> list[Spot]:
+        with self._spots_lock:
+            combined: dict[str, Spot] = {}
+            for sp in self.psk24h_spots:
+                combined[sp.key] = sp
+            for k, sp in self.live_spots.items():
+                combined[k] = sp
+            all_spots = list(combined.values())
+
+        mf = self.mode_filter
+        out: list[Spot] = []
+        for sp in all_spots:
+            if sp.band in BAND_COLOR_MAP and sp.band not in self.enabled_bands:
+                continue
+            if mf == "FT8 ONLY" and sp.mode != "FT8":
+                continue
+            elif mf in ("FT4", "JS8", "CW", "WSPR") and sp.mode != mf:
+                continue
+            elif mf == "HOME CALL ONLY" and not sp.is_home_call:
+                continue
+            elif mf == "HOME GRID ONLY" and not (sp.is_home_grid or sp.is_home_call):
+                continue
+            out.append(sp)
+
+        # Sort: home callsign spots first/top in roster, then newest timestamp
+        out.sort(key=lambda s: (1 if s.is_home_call else 0, s.ts), reverse=True)
+        return out
+
+    def _sync_roster_and_band_counts(self) -> None:
+        with self._spots_lock:
+            band_counts: dict[str, int] = {b: 0 for b in BAND_ORDER}
+            for sp in self.psk24h_spots:
+                if sp.band in band_counts:
+                    band_counts[sp.band] += 1
+            for sp in self.live_spots.values():
+                if sp.band in band_counts:
+                    band_counts[sp.band] += 1
+
+        for bname, _, _, _, bhex in BAND_DEFS:
+            cnt = band_counts.get(bname, 0)
+            lbl = self.band_labels[bname]
+            if cnt > 0:
+                lbl.set_markup(f'<span foreground="{bhex}">●</span> {bname}({cnt})')
+            else:
+                lbl.set_markup(f'<span foreground="{bhex}">●</span> {bname}')
+
+        spots = self._get_filtered_spots()
+        self.lbl_roster_title.set_text(f"LIVE SPOT ROSTER ({len(spots)})")
+
+        now_ts = int(time.time())
+        self.roster_store.clear()
+        for idx, sp in enumerate(spots[:220]):
+            age_s = max(0, now_ts - sp.ts)
+            if age_s < 60:
+                age_str = f"{age_s}s"
+            elif age_s < 3600:
+                age_str = f"{age_s // 60}m"
+            else:
+                age_str = f"{age_s // 3600}h"
+            snr_str = f"{sp.snr:+d}" if sp.snr is not None else "--"
+            km_str = f"{int(round(sp.dist_km))}"
+
+            if sp.is_home_call:
+                bg = "#2b240b"
+                fg = "#ffe47a"
+            elif sp.is_home_grid:
+                bg = "#102826"
+                fg = "#68fce2"
+            else:
+                # Vintage greenbar alternating rows
+                bg = "#0d171c" if (idx % 2 == 0) else "#132128"
+                fg = "#d6f5ec"
+
+            self.roster_store.append([
+                sp.key, age_str, sp.band, sp.mode,
+                sp.tx_call, sp.tx_grid[:6], sp.rx_call, sp.rx_grid[:6],
+                snr_str, km_str, bg, fg,
+            ])
+
+    # -----------------------------------------------------------------------
+    # Glowing VFD Telemetry Header Drawing
+    # -----------------------------------------------------------------------
+    def _on_draw_vfd(self, widget: Gtk.Widget, cr: cairo.Context) -> bool:
+        w = widget.get_allocated_width()
+        h = widget.get_allocated_height()
+
+        # Deep recessed VFD vacuum glass background + subtle phosphor gridlines
+        cr.set_source_rgb(0.035, 0.082, 0.086)
+        cr.rectangle(0, 0, w, h)
+        cr.fill()
+
+        cr.set_source_rgba(0.12, 0.32, 0.30, 0.18)
+        cr.set_line_width(1.0)
+        for y in range(4, h, 4):
+            cr.move_to(0, y + 0.5)
+            cr.line_to(w, y + 0.5)
+        cr.stroke()
+
+        utc_now = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%SZ")
+        cur_grid = latlon_to_maidenhead(self.cursor_lat, self.cursor_lon, chars=6)
+        dist_km, sp_deg, lp_deg = geodesic_distance_bearing(
+            self.home_lat, self.home_lon, self.cursor_lat, self.cursor_lon
+        )
+        dist_mi = dist_km * KM_TO_MI
+
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+
+        # Left Block: Home Station QTH + UTC Clock
+        cr.set_font_size(13.5)
+        cr.set_source_rgb(0.37, 0.99, 0.87)  # Glowing VFD cyan-green
+        cr.move_to(10, 20)
+        cr.show_text(f"DE {self.home_call} [{self.home_grid}]")
+
+        cr.set_font_size(11.0)
+        cr.set_source_rgb(0.28, 0.78, 0.69)
+        cr.move_to(10, 40)
+        cr.show_text(f"UTC {utc_now}   ZOOM z={self.zoom:02d}")
+
+        # Center Block: Live Cursor Geodesic Telemetry from Home QTH
+        cx = max(235, int(w * 0.23))
+        cr.set_font_size(12.5)
+        cr.set_source_rgb(0.42, 1.0, 0.90)
+        lat_hemi = "N" if self.cursor_lat >= 0 else "S"
+        lon_hemi = "E" if self.cursor_lon >= 0 else "W"
+        cr.move_to(cx, 20)
+        cr.show_text(
+            f"CURSOR {abs(self.cursor_lat):06.3f}°{lat_hemi} {abs(self.cursor_lon):07.3f}°{lon_hemi}  [{cur_grid}]"
+        )
+
+        cr.set_font_size(11.0)
+        cr.set_source_rgb(0.68, 0.96, 0.72)
+        cr.move_to(cx, 40)
+        cr.show_text(
+            f"RANGE {dist_km:7.1f} km ({dist_mi:6.1f} mi)   AZIMUTH SP {sp_deg:05.1f}° / LP {lp_deg:05.1f}°"
+        )
+
+        # Right Block: Dedicated W1AW 24h VFD Badge + Live MQTT Status Pill
+        rx = max(cx + 420, w - 295)
+        # Amber/Gold VFD pill for W1AW 24h status
+        has_home_spots = any(True for s in self.psk24h_spots) or any(
+            s.is_home_call for s in self.live_spots.values()
+        )
+        if has_home_spots:
+            cr.set_source_rgba(0.32, 0.24, 0.04, 0.9)
+            border_c = (1.0, 0.80, 0.22)
+            txt_c = (1.0, 0.88, 0.42)
+        else:
+            cr.set_source_rgba(0.10, 0.20, 0.22, 0.9)
+            border_c = (0.32, 0.78, 0.72)
+            txt_c = (0.62, 0.96, 0.90)
+
+        cr.rectangle(rx, 5, w - rx - 8, 20)
+        cr.fill_preserve()
+        cr.set_source_rgb(*border_c)
+        cr.set_line_width(1.2)
+        cr.stroke()
+
+        cr.set_font_size(11.0)
+        cr.set_source_rgb(*txt_c)
+        cr.move_to(rx + 7, 19)
+        cr.show_text(self.psk24h_status[:34])
+
+        # MQTT + Worked Grids readout on line 2
+        mqtt_live = "LIVE" in self.mqtt_state
+        cr.set_source_rgb(0.30, 0.98, 0.56) if mqtt_live else cr.set_source_rgb(0.96, 0.68, 0.26)
+        cr.arc(rx + 7, 36, 4.0, 0, 2 * math.pi)
+        cr.fill()
+
+        cr.set_font_size(10.5)
+        cr.set_source_rgb(0.55, 0.92, 0.86)
+        cr.move_to(rx + 16, 40)
+        with self._spots_lock:
+            n_live = len(self.live_spots)
+        w_cnt = len(self.worked_grids)
+        tail = f"ADIF:{w_cnt}g" if w_cnt else f"TILES:{self.tile_engine.tiles_cached_count}"
+        cr.show_text(f"{self.mqtt_state} ({n_live}) | {tail}")
+        return True
+
+    # -----------------------------------------------------------------------
+    # Slippy-Map Cartography + Tactical Overlays Renderer
+    # -----------------------------------------------------------------------
+    def _map_palette(self) -> dict[str, tuple[float, float, float]]:
+        if self.map_mode == "amber":
+            return {
+                "ocean": (0.07, 0.04, 0.01),
+                "land": (0.20, 0.12, 0.02),
+                "coast": (0.78, 0.48, 0.08),
+                "border": (0.48, 0.30, 0.06),
+                "grid": (0.65, 0.42, 0.08),
+            }
+        if self.map_mode == "red":
+            return {
+                "ocean": (0.05, 0.01, 0.01),
+                "land": (0.16, 0.03, 0.03),
+                "coast": (0.72, 0.14, 0.12),
+                "border": (0.44, 0.09, 0.08),
+                "grid": (0.62, 0.12, 0.10),
+            }
+        if self.map_mode == "day":
+            return {
+                "ocean": (0.67, 0.83, 0.94),
+                "land": (0.93, 0.92, 0.88),
+                "coast": (0.38, 0.52, 0.64),
+                "border": (0.62, 0.58, 0.64),
+                "grid": (0.20, 0.32, 0.48),
+            }
+        if self.map_mode == "topo":
+            return {
+                "ocean": (0.58, 0.78, 0.92),
+                "land": (0.86, 0.88, 0.76),
+                "coast": (0.32, 0.46, 0.36),
+                "border": (0.52, 0.46, 0.38),
+                "grid": (0.18, 0.28, 0.36),
+            }
+        # Default: GRIDTRACKER DARK (#0b1524 ocean, #1b2432 land)
+        return {
+            "ocean": (11 / 255.0, 21 / 255.0, 36 / 255.0),
+            "land": (27 / 255.0, 36 / 255.0, 50 / 255.0),
+            "coast": (0.26, 0.44, 0.62),
+            "border": (0.20, 0.31, 0.44),
+            "grid": (0.26, 0.58, 0.76),
+        }
+
+    def _latlon_to_screen(self, lat: float, lon: float, w: int, h: int, cwx: float, cwy: float) -> tuple[float, float]:
+        wx, wy = latlon_to_world_px(lat, lon, self.zoom)
+        world_w = TILE_SIZE * (1 << self.zoom)
+        dx = wx - cwx
+        # Wrap horizontally to closest copy relative to viewport center
+        dx = ((dx + world_w * 0.5) % world_w) - world_w * 0.5
+        return (w * 0.5 + dx, h * 0.5 + (wy - cwy))
+
+    def _screen_to_latlon(self, sx: float, sy: float, w: int, h: int) -> tuple[float, float]:
+        cwx, cwy = latlon_to_world_px(self.center_lat, self.center_lon, self.zoom)
+        return world_px_to_latlon(cwx + (sx - w * 0.5), cwy + (sy - h * 0.5), self.zoom)
+
+    def _on_draw_map(self, widget: Gtk.Widget, cr: cairo.Context) -> bool:
+        w = widget.get_allocated_width()
+        h = widget.get_allocated_height()
+        if w <= 4 or h <= 4:
+            return True
+
+        pal = self._map_palette()
+        cwx, cwy = latlon_to_world_px(self.center_lat, self.center_lon, self.zoom)
+        world_w = TILE_SIZE * (1 << self.zoom)
+        ntiles = 1 << self.zoom
+
+        # 1. Ocean background
+        cr.set_source_rgb(*pal["ocean"])
+        cr.rectangle(0, 0, w, h)
+        cr.fill()
+
+        # 2. Render Built-in Vector World Geography Base First (guarantees instant crisp land/ocean even offline!)
+        self._draw_vector_geography(cr, w, h, cwx, cwy, world_w, pal)
+
+        # 3. Render Cached / Downloaded Slippy Tiles on top where available
+        x0_world = cwx - w * 0.5
+        y0_world = cwy - h * 0.5
+        tx_start = int(math.floor(x0_world / TILE_SIZE))
+        tx_end = int(math.floor((x0_world + w) / TILE_SIZE))
+        ty_start = max(0, int(math.floor(y0_world / TILE_SIZE)))
+        ty_end = min(ntiles - 1, int(math.floor((y0_world + h) / TILE_SIZE)))
+
+        for ty in range(ty_start, ty_end + 1):
+            sy = round(ty * TILE_SIZE - y0_world)
+            for tx in range(tx_start, tx_end + 1):
+                sx = round(tx * TILE_SIZE - x0_world)
+                surf, dz = self.tile_engine.get_surface(self.map_mode, self.zoom, tx % ntiles, ty)
+                if surf is not None:
+                    if dz == 0:
+                        cr.set_source_surface(surf, sx, sy)
+                        cr.rectangle(sx, sy, TILE_SIZE, TILE_SIZE)
+                        cr.fill()
+                    else:
+                        # Smooth parent-tile overzoom while sharp child tile downloads
+                        scale_f = 1 << dz
+                        sub_x = (tx % scale_f) * (TILE_SIZE // scale_f)
+                        sub_y = (ty % scale_f) * (TILE_SIZE // scale_f)
+                        cr.save()
+                        cr.rectangle(sx, sy, TILE_SIZE, TILE_SIZE)
+                        cr.clip()
+                        cr.translate(sx, sy)
+                        cr.scale(scale_f, scale_f)
+                        cr.set_source_surface(surf, -sub_x, -sub_y)
+                        cr.paint()
+                        cr.restore()
+
+        # 4. Solar Greyline Day/Night Terminator Overlay
+        if self.show_greyline:
+            self._draw_solar_greyline(cr, w, h, cwx, cwy, world_w)
+
+        # 5. Adaptive Maidenhead Grid Overlay (2-char / 4-char / 6-char)
+        if self.show_grid:
+            self._draw_maidenhead_grid(cr, w, h, cwx, cwy, world_w, pal)
+
+        # 6. Worked/Confirmed ADIF Squares + Live Active PSKReporter 4-char Grid Squares
+        spots = self._get_filtered_spots()
+        if self.show_squares:
+            self._draw_active_and_worked_squares(cr, w, h, cwx, cwy, world_w, spots)
+
+        # 7. Great-Circle Geodesic Propagation Arcs + Station Beacons + W1AW SNR Pills
+        if self.show_arcs:
+            self._draw_propagation_arcs(cr, w, h, cwx, cwy, world_w, spots)
+
+        # 8. Home Station Marker (W1AW FN31pr)
+        self._draw_home_qth_marker(cr, w, h, cwx, cwy)
+
+        # 9. Interactive Range & Bearing Geodesic Ruler
+        if self.ruler_active:
+            self._draw_ruler_overlay(cr, w, h, cwx, cwy, world_w)
+
+        # 10. Subtle Corner HUD Attribution & Scale Badge
+        self._draw_map_hud(cr, w, h)
+        return True
+
+    def _draw_vector_geography(
+        self,
+        cr: cairo.Context,
+        w: int,
+        h: int,
+        cwx: float,
+        cwy: float,
+        world_w: float,
+        pal: dict[str, tuple[float, float, float]],
+    ) -> None:
+        x0 = cwx - w * 0.5
+        y0 = cwy - h * 0.5
+        k_min = int(math.floor(x0 / world_w))
+        k_max = int(math.floor((x0 + w) / world_w))
+
+        cr.set_line_width(1.0)
+        for k in range(k_min, k_max + 1):
+            x_off = k * world_w - x0
+            for is_hole, pts in WORLD_POLYGONS:
+                # Fast bounding check in longitude
+                first = True
+                for lon, lat in pts:
+                    px, py = latlon_to_world_px(lat, lon, self.zoom)
+                    sx = px - k * 0.0 + x_off
+                    sy = py - y0
+                    if first:
+                        cr.move_to(sx, sy)
+                        first = False
+                    else:
+                        cr.line_to(sx, sy)
+                cr.close_path()
+                if is_hole:
+                    cr.set_source_rgb(*pal["ocean"])
+                else:
+                    cr.set_source_rgb(*pal["land"])
+                cr.fill_preserve()
+                cr.set_source_rgb(*pal["coast"])
+                cr.stroke()
+
+            # US State & International Borders
+            cr.set_source_rgba(pal["border"][0], pal["border"][1], pal["border"][2], 0.85)
+            cr.set_line_width(1.0 if self.zoom < 5 else 1.3)
+            for bline in BORDER_POLYLINES:
+                first = True
+                for lon, lat in bline:
+                    px, py = latlon_to_world_px(lat, lon, self.zoom)
+                    sx = px + x_off
+                    sy = py - y0
+                    if first:
+                        cr.move_to(sx, sy)
+                        first = False
+                    else:
+                        cr.line_to(sx, sy)
+                cr.stroke()
+
+    def _draw_solar_greyline(
+        self, cr: cairo.Context, w: int, h: int, cwx: float, cwy: float, world_w: float
+    ) -> None:
+        sub_lat, sub_lon = compute_solar_subsolar()
+        curve = compute_terminator_curve(sub_lat, sub_lon, step_deg=3)
+        x0 = cwx - w * 0.5
+        y0 = cwy - h * 0.5
+        k_min = int(math.floor(x0 / world_w))
+        k_max = int(math.floor((x0 + w) / world_w))
+
+        # Night pole: if sub_lat >= 0 (northern summer), South Pole is in night (bottom of Mercator y=world_w)
+        night_y_edge = (world_w - y0) if sub_lat >= 0.0 else (0.0 - y0)
+
+        cr.save()
+        for k in range(k_min, k_max + 1):
+            x_off = k * world_w - x0
+            screen_pts: list[tuple[float, float]] = []
+            for lat, lon in curve:
+                px, py = latlon_to_world_px(lat, lon, self.zoom)
+                screen_pts.append((px + x_off, py - y0))
+
+            # Shade Night Hemisphere
+            cr.move_to(screen_pts[0][0], night_y_edge)
+            for sx, sy in screen_pts:
+                cr.line_to(sx, sy)
+            cr.line_to(screen_pts[-1][0], night_y_edge)
+            cr.close_path()
+            cr.set_source_rgba(0.01, 0.03, 0.08, 0.34)
+            cr.fill()
+
+            # Glowing Greyline Twilight Propagation Band (~12px halo + crisp amber-cyan line)
+            for sx_i, (sx, sy) in enumerate(screen_pts):
+                if sx_i == 0:
+                    cr.move_to(sx, sy)
+                else:
+                    cr.line_to(sx, sy)
+            cr.set_source_rgba(1.0, 0.74, 0.24, 0.18)
+            cr.set_line_width(11.0)
+            cr.stroke_preserve()
+
+            cr.set_source_rgba(1.0, 0.82, 0.36, 0.65)
+            cr.set_line_width(1.4)
+            cr.set_dash([6.0, 4.0])
+            cr.stroke()
+            cr.set_dash([])
+
+        # Subsolar Sun Marker (☉)
+        sun_x, sun_y = self._latlon_to_screen(sub_lat, sub_lon, w, h, cwx, cwy)
+        if -20 <= sun_x <= w + 20 and -20 <= sun_y <= h + 20:
+            cr.set_source_rgba(1.0, 0.86, 0.20, 0.32)
+            cr.arc(sun_x, sun_y, 11.0, 0, 2 * math.pi)
+            cr.fill()
+            cr.set_source_rgb(1.0, 0.90, 0.28)
+            cr.arc(sun_x, sun_y, 5.2, 0, 2 * math.pi)
+            cr.fill()
+            cr.set_source_rgb(0.25, 0.16, 0.0)
+            cr.set_line_width(1.0)
+            cr.arc(sun_x, sun_y, 5.2, 0, 2 * math.pi)
+            cr.stroke()
+        cr.restore()
+
+    def _draw_maidenhead_grid(
+        self,
+        cr: cairo.Context,
+        w: int,
+        h: int,
+        cwx: float,
+        cwy: float,
+        world_w: float,
+        pal: dict[str, tuple[float, float, float]],
+    ) -> None:
+        # Adaptive grid resolution:
+        # z <= 4: 2-char Fields (20° x 10°)
+        # 5 <= z <= 9: 4-char Grid Squares (2° x 1°)
+        # z >= 10: 6-char Subsquares (5' x 2.5' = 1/12° x 1/24°)
+        if self.zoom <= 4:
+            dlon, dlat, chars = 20.0, 10.0, 2
+        elif self.zoom <= 9:
+            dlon, dlat, chars = 2.0, 1.0, 4
+        else:
+            dlon, dlat, chars = 2.0 / 24.0, 1.0 / 24.0, 6
+
+        top_lat, left_lon = self._screen_to_latlon(0, 0, w, h)
+        bot_lat, _ = self._screen_to_latlon(0, h, w, h)
+        lat_min = max(-84.0, math.floor(min(top_lat, bot_lat) / dlat) * dlat)
+        lat_max = min(84.0, math.ceil(max(top_lat, bot_lat) / dlat) * dlat)
+
+        x0 = cwx - w * 0.5
+        y0 = cwy - h * 0.5
+        gc = pal["grid"]
+
+        cr.save()
+        cr.set_source_rgba(gc[0], gc[1], gc[2], 0.34)
+        cr.set_line_width(0.85)
+
+        # Horizontal parallels
+        lat = lat_min
+        while lat <= lat_max + 1e-7:
+            _, wy = latlon_to_world_px(lat, 0.0, self.zoom)
+            sy = wy - y0
+            if -2 <= sy <= h + 2:
+                cr.move_to(0, sy)
+                cr.line_to(w, sy)
+            lat += dlat
+        cr.stroke()
+
+        # Vertical meridians across visible world X range
+        px_per_lon = world_w / 360.0
+        step_px = dlon * px_per_lon
+        if step_px >= 14.0:
+            first_i = int(math.floor(x0 / step_px))
+            last_i = int(math.ceil((x0 + w) / step_px))
+            for i in range(first_i, last_i + 1):
+                sx = i * step_px - x0
+                cr.move_to(sx, 0)
+                cr.line_to(sx, h)
+            cr.stroke()
+
+            # Labels when cells are roomy enough
+            if step_px >= 46.0:
+                cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+                cr.set_font_size(9.5 if chars >= 4 else 10.5)
+                cr.set_source_rgba(gc[0], gc[1], gc[2], 0.72)
+                lat = lat_min
+                while lat < lat_max - 1e-7:
+                    _, wy_top = latlon_to_world_px(lat + dlat, 0.0, self.zoom)
+                    _, wy_bot = latlon_to_world_px(lat, 0.0, self.zoom)
+                    cell_h = wy_bot - wy_top
+                    if cell_h >= 22.0:
+                        sy_lbl = wy_top - y0 + 12.0
+                        if 8 <= sy_lbl <= h - 4:
+                            for i in range(first_i, last_i + 1):
+                                sx_lbl = i * step_px - x0 + 4.0
+                                if -30 <= sx_lbl <= w - 10:
+                                    lon_c = ((i + 0.5) * dlon - 180.0 + 180.0) % 360.0 - 180.0
+                                    gname = latlon_to_maidenhead(lat + dlat * 0.5, lon_c, chars=chars)
+                                    cr.move_to(sx_lbl, sy_lbl)
+                                    cr.show_text(gname)
+                    lat += dlat
+        cr.restore()
+
+    def _draw_active_and_worked_squares(
+        self,
+        cr: cairo.Context,
+        w: int,
+        h: int,
+        cwx: float,
+        cwy: float,
+        world_w: float,
+        spots: list[Spot],
+    ) -> None:
+        if self.zoom < 3:
+            # At z=2 still draw squares cleanly!
+            pass
+
+        def draw_g4_box(g4: str, fill_rgba: tuple[float, float, float, float], stroke_rgba: tuple[float, float, float, float], lw: float = 1.1):
+            b = grid4_bounds(g4)
+            if not b:
+                return
+            lat0, lon0, lat1, lon1 = b
+            sx0, sy1 = self._latlon_to_screen(lat0, lon0, w, h, cwx, cwy)
+            _, sy0 = self._latlon_to_screen(lat1, lon0, w, h, cwx, cwy)
+            bw_px = (2.0 / 360.0) * world_w
+            bh_px = abs(sy1 - sy0)
+            if sx0 + bw_px < -10 or sx0 > w + 10 or sy0 + bh_px < -10 or sy0 > h + 10:
+                return
+            cr.set_source_rgba(*fill_rgba)
+            cr.rectangle(sx0, sy0, max(2.0, bw_px), max(2.0, bh_px))
+            cr.fill_preserve()
+            cr.set_source_rgba(*stroke_rgba)
+            cr.set_line_width(lw)
+            cr.stroke()
+
+        cr.save()
+        # 1. Worked & Confirmed ADIF Squares
+        for g4 in self.worked_grids:
+            if g4 in self.confirmed_grids:
+                draw_g4_box(g4, (0.16, 0.85, 0.44, 0.26), (0.28, 0.96, 0.56, 0.72), 1.2)
+            else:
+                draw_g4_box(g4, (0.24, 0.66, 0.96, 0.20), (0.36, 0.78, 1.0, 0.60), 1.0)
+
+        # 2. Live Active Spot Grid Squares (colored by band or gold for W1AW!)
+        grid_color: dict[str, tuple[tuple[float, float, float], bool]] = {}
+        for sp in reversed(spots):
+            col = (1.0, 0.82, 0.22) if sp.is_home_call else BAND_COLOR_MAP.get(sp.band, (0.24, 0.92, 0.84))
+            for g in (sp.tx_grid, sp.rx_grid):
+                if len(g) >= 4:
+                    g4 = g[:4].upper()
+                    prev = grid_color.get(g4)
+                    if prev is None or sp.is_home_call:
+                        grid_color[g4] = (col, sp.is_home_call)
+
+        for g4, (col, is_hc) in grid_color.items():
+            alpha_f = 0.34 if is_hc else 0.22
+            alpha_s = 0.92 if is_hc else 0.68
+            draw_g4_box(
+                g4,
+                (col[0], col[1], col[2], alpha_f),
+                (col[0], col[1], col[2], alpha_s),
+                1.6 if is_hc else 1.0,
+            )
+        cr.restore()
+
+    def _draw_propagation_arcs(
+        self,
+        cr: cairo.Context,
+        w: int,
+        h: int,
+        cwx: float,
+        cwy: float,
+        world_w: float,
+        spots: list[Spot],
+    ) -> None:
+        x0 = cwx - w * 0.5
+        y0 = cwy - h * 0.5
+        pulse = 0.5 + 0.5 * math.sin(self.anim_phase * 2.0 * math.pi)
+        now_ts = time.time()
+
+        cr.save()
+        # Draw global background spots first, then home-grid spots, then W1AW spots & selected spot on very top!
+        ordered = sorted(
+            spots,
+            key=lambda s: (
+                2 if s.key == self.selected_spot_key else (1 if s.is_home_call else (0.5 if s.is_home_grid else 0)),
+                s.ts,
+            ),
+        )
+
+        home_Call_labels: list[tuple[float, float, str, tuple[float, float, float]]] = []
+
+        for sp in ordered:
+            is_sel = sp.key == self.selected_spot_key
+            pts = sp.get_arc()
+            if len(pts) < 2:
+                continue
+
+            # Convert unwrapped geodesic points to world pixels, shifting whole path to nearest viewport copy
+            mid_lat, mid_lon = pts[len(pts) // 2]
+            mwx, _ = latlon_to_world_px(mid_lat, mid_lon, self.zoom)
+            shift_k = round((cwx - mwx) / world_w)
+            x_shift = shift_k * world_w - x0
+
+            s_pts: list[tuple[float, float]] = []
+            vis_any = False
+            for lat, lon_u in pts:
+                # Note: latlon_to_world_px does NOT modulo lon_u, preserving continuous unwrapped X!
+                scale = world_w
+                wx = ((lon_u + 180.0) / 360.0) * scale
+                lat_c = max(-85.05112878, min(85.05112878, lat))
+                sin_l = math.sin(math.radians(lat_c))
+                wy = (0.5 - math.log((1.0 + sin_l) / (1.0 - sin_l)) / (4.0 * math.pi)) * scale
+                sx = wx + x_shift
+                sy = wy - y0
+                if -80 <= sx <= w + 80 and -80 <= sy <= h + 80:
+                    vis_any = True
+                s_pts.append((sx, sy))
+
+            if not vis_any:
+                continue
+
+            bcol = BAND_COLOR_MAP.get(sp.band, (0.35, 0.96, 0.86))
+            age = max(0.0, now_ts - sp.ts)
+            freshness = max(0.32, 1.0 - min(1.0, age / 3600.0) * 0.55)
+
+            if is_sel:
+                # Selected spot bright white-cyan spotlight
+                self._stroke_polyline(cr, s_pts, (0.35, 1.0, 0.95, 0.38), 6.5)
+                self._stroke_polyline(cr, s_pts, (1.0, 1.0, 1.0, 0.98), 2.4)
+            elif sp.is_home_call:
+                # Bold pulsing Gold/Cyan W1AW Great-Circle Arc!
+                glow_a = 0.22 + 0.20 * pulse
+                self._stroke_polyline(cr, s_pts, (1.0, 0.80, 0.18, glow_a), 5.5)
+                self._stroke_polyline(cr, s_pts, (1.0, 0.88, 0.34, 0.95), 2.1)
+
+                # Directional animated beacon traveling TX -> RX along W1AW arc!
+                b_idx = int((self.anim_phase * (len(s_pts) - 1))) % len(s_pts)
+                bx, by = s_pts[b_idx]
+                cr.set_source_rgba(0.38, 1.0, 0.92, 0.95)
+                cr.arc(bx, by, 3.3, 0, 2 * math.pi)
+                cr.fill()
+
+                # Queue remote station callsign + SNR dB pill label
+                is_tx_home = sp.tx_call.split("/")[0] == self.home_call
+                rem_pt = s_pts[-1] if is_tx_home else s_pts[0]
+                rem_call = sp.rx_call if is_tx_home else sp.tx_call
+                snr_txt = f" {sp.snr:+d}dB" if sp.snr is not None else ""
+                home_Call_labels.append((rem_pt[0], rem_pt[1], f"{rem_call}{snr_txt} [{sp.band}]", bcol))
+            else:
+                lw = 1.55 if sp.is_home_grid else 1.15
+                al = 0.85 if sp.is_home_grid else (0.58 * freshness)
+                self._stroke_polyline(cr, s_pts, (bcol[0], bcol[1], bcol[2], al), lw)
+
+            # Endpoints (TX dot + RX ring)
+            tx_x, tx_y = s_pts[0]
+            rx_x, rx_y = s_pts[-1]
+            r_dot = 3.4 if (sp.is_home_call or is_sel) else 2.2
+            cr.set_source_rgba(bcol[0], bcol[1], bcol[2], 0.92)
+            cr.arc(tx_x, tx_y, r_dot, 0, 2 * math.pi)
+            cr.fill()
+            cr.arc(rx_x, rx_y, r_dot + 0.6, 0, 2 * math.pi)
+            cr.set_line_width(1.2)
+            cr.stroke()
+
+            if is_sel and not sp.is_home_call:
+                snr_txt = f" {sp.snr:+d}dB" if sp.snr is not None else ""
+                home_Call_labels.append(
+                    (rx_x, rx_y, f"{sp.tx_call}->{sp.rx_call}{snr_txt} ({int(sp.dist_km)}km)", (1.0, 1.0, 1.0))
+                )
+
+        # Render crisp Callsign + SNR (dB) Pill Badges (de-cluttered up to 28 badges)
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(9.5)
+        placed_boxes: list[tuple[float, float, float, float]] = []
+        for lx, ly, text, col in home_Call_labels[:36]:
+            if not (4 <= lx <= w - 4 and 4 <= ly <= h - 4):
+                continue
+            ext = cr.text_extents(text)
+            pw = ext.width + 10.0
+            ph = 15.0
+            px = min(w - pw - 4, max(4.0, lx + 6.0))
+            py = min(h - ph - 4, max(4.0, ly - ph - 3.0))
+            # Simple overlap check
+            if any(abs(px - bx) < (pw * 0.75) and abs(py - by) < ph for bx, by, _, _ in placed_boxes):
+                continue
+            placed_boxes.append((px, py, pw, ph))
+
+            cr.set_source_rgba(0.05, 0.09, 0.14, 0.88)
+            cr.rectangle(px, py, pw, ph)
+            cr.fill_preserve()
+            cr.set_source_rgba(col[0], col[1], col[2], 0.92)
+            cr.set_line_width(1.1)
+            cr.stroke()
+
+            cr.set_source_rgb(0.98, 0.96, 0.86)
+            cr.move_to(px + 5.0, py + 11.2)
+            cr.show_text(text)
+
+        cr.restore()
+
+    @staticmethod
+    def _stroke_polyline(
+        cr: cairo.Context, pts: list[tuple[float, float]], rgba: tuple[float, float, float, float], lw: float
+    ) -> None:
+        cr.set_source_rgba(*rgba)
+        cr.set_line_width(lw)
+        first = True
+        for sx, sy in pts:
+            if first:
+                cr.move_to(sx, sy)
+                first = False
+            else:
+                cr.line_to(sx, sy)
+        cr.stroke()
+
+    def _draw_home_qth_marker(self, cr: cairo.Context, w: int, h: int, cwx: float, cwy: float) -> None:
+        hx, hy = self._latlon_to_screen(self.home_lat, self.home_lon, w, h, cwx, cwy)
+        if not (-30 <= hx <= w + 30 and -30 <= hy <= h + 30):
+            return
+
+        pulse_r = 9.0 + 5.5 * (0.5 + 0.5 * math.sin(self.anim_phase * 2.0 * math.pi))
+        cr.save()
+        # Pulsing radar ring around W1AW FN31pr
+        cr.set_source_rgba(1.0, 0.82, 0.22, 0.35)
+        cr.set_line_width(1.6)
+        cr.arc(hx, hy, pulse_r, 0, 2 * math.pi)
+        cr.stroke()
+
+        # Tactical crosshair + gold diamond QTH beacon
+        cr.set_source_rgb(1.0, 0.86, 0.26)
+        cr.move_to(hx, hy - 7.0)
+        cr.line_to(hx + 6.5, hy)
+        cr.line_to(hx, hy + 7.0)
+        cr.line_to(hx - 6.5, hy)
+        cr.close_path()
+        cr.fill_preserve()
+        cr.set_source_rgb(0.10, 0.12, 0.16)
+        cr.set_line_width(1.3)
+        cr.stroke()
+
+        # Label pill
+        tag = f"★ {self.home_call} [{self.home_grid}]"
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(10.0)
+        ext = cr.text_extents(tag)
+        bx = hx + 9.0
+        by = hy - 8.0
+        cr.set_source_rgba(0.14, 0.11, 0.03, 0.90)
+        cr.rectangle(bx, by, ext.width + 10.0, 16.0)
+        cr.fill_preserve()
+        cr.set_source_rgb(1.0, 0.82, 0.24)
+        cr.set_line_width(1.2)
+        cr.stroke()
+
+        cr.set_source_rgb(1.0, 0.92, 0.56)
+        cr.move_to(bx + 5.0, by + 12.0)
+        cr.show_text(tag)
+        cr.restore()
+
+    def _draw_ruler_overlay(
+        self, cr: cairo.Context, w: int, h: int, cwx: float, cwy: float, world_w: float
+    ) -> None:
+        a_lat, a_lon = self.ruler_anchor if self.ruler_anchor else (self.home_lat, self.home_lon)
+        b_lat, b_lon = self.ruler_target if self.ruler_target else (self.cursor_lat, self.cursor_lon)
+        pts = great_circle_unwrapped(a_lat, a_lon, b_lat, b_lon, steps=40)
+        x0 = cwx - w * 0.5
+        y0 = cwy - h * 0.5
+        mid_lat, mid_lon = pts[len(pts) // 2]
+        mwx, _ = latlon_to_world_px(mid_lat, mid_lon, self.zoom)
+        shift_k = round((cwx - mwx) / world_w)
+        x_shift = shift_k * world_w - x0
+
+        s_pts: list[tuple[float, float]] = []
+        for lat, lon_u in pts:
+            wx = ((lon_u + 180.0) / 360.0) * world_w
+            lat_c = max(-85.05112878, min(85.05112878, lat))
+            sin_l = math.sin(math.radians(lat_c))
+            wy = (0.5 - math.log((1.0 + sin_l) / (1.0 - sin_l)) / (4.0 * math.pi)) * world_w
+            s_pts.append((wx + x_shift, wy - y0))
+
+        cr.save()
+        cr.set_dash([7.0, 5.0])
+        self._stroke_polyline(cr, s_pts, (0.38, 1.0, 0.90, 0.95), 2.2)
+        cr.set_dash([])
+
+        dist_km, sp_deg, lp_deg = geodesic_distance_bearing(a_lat, a_lon, b_lat, b_lon)
+        g_a = latlon_to_maidenhead(a_lat, a_lon, 6)
+        g_b = latlon_to_maidenhead(b_lat, b_lon, 6)
+        ex, ey = s_pts[-1]
+        label = f"RULER {g_a} -> {g_b}: {dist_km:.1f} km ({dist_km * KM_TO_MI:.1f} mi) | SP {sp_deg:.1f}° LP {lp_deg:.1f}°"
+
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(10.0)
+        ext = cr.text_extents(label)
+        px = min(w - ext.width - 18, max(8.0, ex + 10.0))
+        py = min(h - 28.0, max(8.0, ey + 10.0))
+
+        cr.set_source_rgba(0.04, 0.16, 0.16, 0.92)
+        cr.rectangle(px, py, ext.width + 12.0, 18.0)
+        cr.fill_preserve()
+        cr.set_source_rgb(0.38, 1.0, 0.90)
+        cr.set_line_width(1.2)
+        cr.stroke()
+        cr.move_to(px + 6.0, py + 13.0)
+        cr.show_text(label)
+        cr.restore()
+
+    def _draw_map_hud(self, cr: cairo.Context, w: int, h: int) -> None:
+        cr.save()
+        mode_label = dict(MAP_MODES).get(self.map_mode, self.map_mode.upper())
+        src_mode = "SQLITE+HTTP TILES" if self.tile_engine.online_ok else "VECTOR ATLAS + TILE CACHE"
+        hud = f"{mode_label}  |  {src_mode}  |  © OpenStreetMap / OpenTopoMap / PSKReporter"
+
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(8.5)
+        ext = cr.text_extents(hud)
+        bx = w - ext.width - 14.0
+        by = h - 19.0
+        cr.set_source_rgba(0.05, 0.08, 0.12, 0.76)
+        cr.rectangle(bx, by, ext.width + 10.0, 15.0)
+        cr.fill()
+        cr.set_source_rgba(0.75, 0.84, 0.92, 0.85)
+        cr.move_to(bx + 5.0, by + 11.0)
+        cr.show_text(hud)
+        cr.restore()
+
+    # -----------------------------------------------------------------------
+    # Interactive Mouse, Scroll-Wheel & Control Callbacks
+    # -----------------------------------------------------------------------
+    def _on_map_button_press(self, widget: Gtk.Widget, event: Gdk.EventButton) -> bool:
+        widget.grab_focus()
+        w = widget.get_allocated_width()
+        h = widget.get_allocated_height()
+        lat, lon = self._screen_to_latlon(event.x, event.y, w, h)
+
+        if event.button == 1:
+            if event.type == Gdk.EventType._2BUTTON_PRESS:
+                self._zoom_at_screen_pt(self.zoom + 1, event.x, event.y)
+                return True
+            self._dragging = True
+            self._drag_moved = False
+            self._drag_last_xy = (event.x, event.y)
+            return True
+
+        if event.button == 3:
+            # Right-click sets or toggles interactive Geodesic Ruler anchor!
+            self.ruler_active = True
+            self.ruler_anchor = (lat, lon)
+            self.ruler_target = (lat, lon)
+            self._sync_switch_style(self.btn_ruler, True)
+            g6 = latlon_to_maidenhead(lat, lon, 6)
+            self._set_status(f"Ruler anchor set to {g6} ({lat:.3f}°, {lon:.3f}°). Move cursor or click to measure.")
+            self._queue_map_redraw()
+            return True
+        return False
+
+    def _on_map_button_release(self, widget: Gtk.Widget, event: Gdk.EventButton) -> bool:
+        if event.button == 1 and self._dragging:
+            self._dragging = False
+            if not self._drag_moved:
+                w = widget.get_allocated_width()
+                h = widget.get_allocated_height()
+                lat, lon = self._screen_to_latlon(event.x, event.y, w, h)
+                if self.ruler_active:
+                    if self.ruler_anchor is None:
+                        self.ruler_anchor = (lat, lon)
+                        self.ruler_target = None
+                    else:
+                        self.ruler_anchor = (lat, lon)
+                    self._queue_map_redraw()
+                else:
+                    self._select_nearest_spot(event.x, event.y, w, h)
+            else:
+                self._save_config()
+            return True
+        return False
+
+    def _on_map_motion(self, widget: Gtk.Widget, event: Gdk.EventMotion) -> bool:
+        w = widget.get_allocated_width()
+        h = widget.get_allocated_height()
+        if self._dragging:
+            dx = event.x - self._drag_last_xy[0]
+            dy = event.y - self._drag_last_xy[1]
+            if abs(dx) > 2.0 or abs(dy) > 2.0:
+                self._drag_moved = True
+            self._drag_last_xy = (event.x, event.y)
+            cwx, cwy = latlon_to_world_px(self.center_lat, self.center_lon, self.zoom)
+            world_w = TILE_SIZE * (1 << self.zoom)
+            new_wx = (cwx - dx) % world_w
+            new_wy = max(20.0, min(world_w - 20.0, cwy - dy))
+            self.center_lat, self.center_lon = world_px_to_latlon(new_wx, new_wy, self.zoom)
+            self._queue_map_redraw()
+
+        self.cursor_lat, self.cursor_lon = self._screen_to_latlon(event.x, event.y, w, h)
+        self.cursor_in_map = True
+        if self.ruler_active:
+            self.ruler_target = (self.cursor_lat, self.cursor_lon)
+            self._queue_map_redraw()
+        self.vfd_area.queue_draw()
+        return True
+
+    def _on_map_leave(self, _widget: Gtk.Widget, _event: Gdk.EventCrossing) -> bool:
+        self.cursor_in_map = False
+        return False
+
+    def _on_map_scroll(self, widget: Gtk.Widget, event: Gdk.EventScroll) -> bool:
+        step = 0
+        if event.direction == Gdk.ScrollDirection.UP:
+            step = 1
+        elif event.direction == Gdk.ScrollDirection.DOWN:
+            step = -1
+        elif event.direction == Gdk.ScrollDirection.SMOOTH:
+            _, _, dy = event.get_scroll_deltas()
+            if dy < -0.1:
+                step = 1
+            elif dy > 0.1:
+                step = -1
+        if step != 0:
+            self._zoom_at_screen_pt(self.zoom + step, event.x, event.y)
+            return True
+        return False
+
+    def _zoom_at_screen_pt(self, new_zoom: int, sx: float, sy: float) -> None:
+        nz = max(MIN_ZOOM, min(MAX_ZOOM, new_zoom))
+        if nz == self.zoom:
+            return
+        w = self.map_area.get_allocated_width()
+        h = self.map_area.get_allocated_height()
+        anchor_lat, anchor_lon = self._screen_to_latlon(sx, sy, w, h)
+        self.zoom = nz
+        awx, awy = latlon_to_world_px(anchor_lat, anchor_lon, self.zoom)
+        cwx = awx - (sx - w * 0.5)
+        cwy = awy - (sy - h * 0.5)
+        self.center_lat, self.center_lon = world_px_to_latlon(cwx, cwy, self.zoom)
+        self._save_config()
+        self._queue_map_redraw()
+        self.vfd_area.queue_draw()
+
+    def _set_zoom(self, new_zoom: int) -> None:
+        w = self.map_area.get_allocated_width()
+        h = self.map_area.get_allocated_height()
+        self._zoom_at_screen_pt(new_zoom, w * 0.5, h * 0.5)
+
+    def _jump_to(self, lat: float, lon: float, z: int) -> None:
+        self.center_lat = lat
+        self.center_lon = lon
+        self.zoom = max(MIN_ZOOM, min(MAX_ZOOM, z))
+        self._save_config()
+        self._queue_map_redraw()
+        self.vfd_area.queue_draw()
+
+    def _on_jump_home(self, *_args) -> None:
+        self._jump_to(self.home_lat, self.home_lon, 7)
+        self._set_status(
+            f"Centered on Home QTH {self.home_call} [{self.home_grid}] ({self.home_lat:.4f}°, {self.home_lon:.4f}°)"
+        )
+
+    def _select_nearest_spot(self, sx: float, sy: float, w: int, h: int) -> None:
+        cwx, cwy = latlon_to_world_px(self.center_lat, self.center_lon, self.zoom)
+        spots = self._get_filtered_spots()
+        best_sp: Spot | None = None
+        best_d = 18.0
+        for sp in spots:
+            for plat, plon in ((sp.tx_lat, sp.tx_lon), (sp.rx_lat, sp.rx_lon)):
+                px, py = self._latlon_to_screen(plat, plon, w, h, cwx, cwy)
+                d = math.hypot(px - sx, py - sy)
+                if d < best_d:
+                    best_d = d
+                    best_sp = sp
+        if best_sp is not None:
+            self.selected_spot_key = best_sp.key
+            snr_s = f"{best_sp.snr:+d} dB" if best_sp.snr is not None else "n/a"
+            self._set_status(
+                f"SPOT: {best_sp.tx_call} [{best_sp.tx_grid}] -> {best_sp.rx_call} [{best_sp.rx_grid}]  |  "
+                f"{best_sp.band} {best_sp.mode}  |  SNR {snr_s}  |  {best_sp.dist_km:.1f} km ({best_sp.dist_km * KM_TO_MI:.1f} mi)"
+            )
+        else:
+            self.selected_spot_key = None
+        self._queue_map_redraw()
+
+    # -----------------------------------------------------------------------
+    # Toolbar & Roster Actions
+    # -----------------------------------------------------------------------
+    def _on_apply_qth(self, *_args) -> None:
+        new_call = self.ent_call.get_text().strip().upper() or DEFAULT_CALLSIGN
+        new_grid = self.ent_grid.get_text().strip() or DEFAULT_GRID
+        pt = maidenhead_to_latlon(new_grid)
+        if pt is None:
+            self._set_status(f"Invalid Maidenhead locator '{new_grid}' — enter 4, 6, or 8 chars (e.g. FN31pr).")
+            return
+        if len(new_grid) == 6:
+            new_grid = new_grid[:4].upper() + new_grid[4:6].lower()
+        else:
+            new_grid = new_grid.upper()
+
+        self.home_call = new_call
+        self.home_grid = new_grid
+        self.home_lat, self.home_lon = pt
+        self.ent_call.set_text(self.home_call)
+        self.ent_grid.set_text(self.home_grid)
+        self.btn_home.set_label(f"HOME {self.home_grid}")
+        self._save_config()
+
+        # Re-tag existing live spots for new home QTH, re-query 24h XML, and resubscribe MQTT
+        hg4 = self.home_grid[:4].upper()
+        with self._spots_lock:
+            for sp in self.live_spots.values():
+                sp.is_home_call = (sp.tx_call.split("/")[0] == self.home_call or sp.rx_call.split("/")[0] == self.home_call)
+                sp.is_home_grid = (sp.tx_grid[:4].upper() == hg4 or sp.rx_grid[:4].upper() == hg4)
+        self._start_psk24h_poll(force_network=False)
+        self.mqtt_client.trigger_resubscribe()
+        self._roster_dirty = True
+        self._queue_map_redraw()
+        self.vfd_area.queue_draw()
+        self._set_status(f"Updated Home QTH -> {self.home_call} [{self.home_grid}] ({self.home_lat:.4f}°, {self.home_lon:.4f}°)")
+
+    def _on_map_mode_changed(self, combo: Gtk.ComboBoxText) -> None:
+        mkey = combo.get_active_id()
+        if mkey:
+            self.map_mode = mkey
+            self._save_config()
+            self._queue_map_redraw()
+
+    def _on_mode_filter_changed(self, combo: Gtk.ComboBoxText) -> None:
+        txt = combo.get_active_text()
+        if txt:
+            self.mode_filter = txt
+            self._roster_dirty = True
+            self._queue_map_redraw()
+
+    def _on_toggle_grid(self, *_args) -> None:
+        self.show_grid = not self.show_grid
+        self._sync_switch_style(self.btn_grid, self.show_grid)
+        self._save_config()
+        self._queue_map_redraw()
+
+    def _on_toggle_greyline(self, *_args) -> None:
+        self.show_greyline = not self.show_greyline
+        self._sync_switch_style(self.btn_grey, self.show_greyline)
+        self._save_config()
+        self._queue_map_redraw()
+
+    def _on_toggle_arcs(self, *_args) -> None:
+        self.show_arcs = not self.show_arcs
+        self._sync_switch_style(self.btn_arcs, self.show_arcs)
+        self._save_config()
+        self._queue_map_redraw()
+
+    def _on_toggle_ruler(self, *_args) -> None:
+        self.ruler_active = not self.ruler_active
+        if self.ruler_active:
+            self.ruler_anchor = (self.home_lat, self.home_lon)
+            self.ruler_target = (self.cursor_lat, self.cursor_lon)
+            self._set_status(f"Range & Bearing Ruler ON (anchored at {self.home_grid}; click or right-click map to move anchor).")
+        else:
+            self._set_status("Range & Bearing Ruler OFF.")
+        self._sync_switch_style(self.btn_ruler, self.ruler_active)
+        self._queue_map_redraw()
+
+    def _on_toggle_roster(self, *_args) -> None:
+        vis = not self.roster_box.get_visible()
+        self.roster_box.set_visible(vis)
+        self._sync_switch_style(self.btn_roster, vis)
+
+    def _on_bands_all(self, *_args) -> None:
+        self.enabled_bands = set(BAND_ORDER)
+        for bname, btn in self.band_buttons.items():
+            btn.get_style_context().remove_class("band-off")
+        self._roster_dirty = True
+        self._queue_map_redraw()
+
+    def _on_band_clicked(self, btn: Gtk.Button, bname: str) -> None:
+        if bname in self.enabled_bands:
+            if len(self.enabled_bands) > 1:
+                self.enabled_bands.remove(bname)
+                btn.get_style_context().add_class("band-off")
+        else:
+            self.enabled_bands.add(bname)
+            btn.get_style_context().remove_class("band-off")
+        self._roster_dirty = True
+        self._queue_map_redraw()
+
+    def _on_band_press(self, _btn: Gtk.Button, event: Gdk.EventButton, bname: str) -> bool:
+        if event.button == 3:
+            # Right-click solos this single band!
+            self.enabled_bands = {bname}
+            for k, b in self.band_buttons.items():
+                if k == bname:
+                    b.get_style_context().remove_class("band-off")
+                else:
+                    b.get_style_context().add_class("band-off")
+            self._roster_dirty = True
+            self._queue_map_redraw()
+            self._set_status(f"Soloed {bname} band (click ALL to restore all bands).")
+            return True
+        return False
+
+    def _on_clear_live_spots(self, *_args) -> None:
+        with self._spots_lock:
+            self.live_spots.clear()
+        self._roster_dirty = True
+        self._queue_map_redraw()
+
+    def _on_roster_row_selected(self, view: Gtk.TreeView) -> None:
+        sel = view.get_selection()
+        if not sel:
+            return
+        model, it = sel.get_selected()
+        if it is None:
+            return
+        key = model.get_value(it, 0)
+        self.selected_spot_key = key
+        self._queue_map_redraw()
+
+    def _on_roster_row_activated(self, view: Gtk.TreeView, path: Gtk.TreePath, _col) -> None:
+        it = self.roster_store.get_iter(path)
+        if it is None:
+            return
+        key = self.roster_store.get_value(it, 0)
+        self.selected_spot_key = key
+        with self._spots_lock:
+            sp = self.live_spots.get(key)
+            if sp is None:
+                for s in self.psk24h_spots:
+                    if s.key == key:
+                        sp = s
+                        break
+        if sp is not None:
+            pts = sp.get_arc()
+            mid_lat, mid_lon = pts[len(pts) // 2]
+            mid_lon_norm = ((mid_lon + 180.0) % 360.0) - 180.0
+            z_fit = 5 if sp.dist_km < 2500 else (4 if sp.dist_km < 6000 else 3)
+            self._jump_to(mid_lat, mid_lon_norm, z_fit)
+            self._set_status(
+                f"Centered on {sp.tx_call} [{sp.tx_grid}] -> {sp.rx_call} [{sp.rx_grid}] ({sp.dist_km:.0f} km, {sp.band} {sp.mode})"
+            )
+
+    def _on_click_import_adif(self, *_args) -> None:
+        dlg = Gtk.FileChooserDialog(
+            title="Import Amateur Radio ADIF Log (.adi / .adif)",
+            parent=self,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dlg.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_OPEN, Gtk.ResponseType.OK,
+        )
+        flt = Gtk.FileFilter()
+        flt.set_name("ADIF Logs (*.adi, *.adif)")
+        flt.add_pattern("*.adi")
+        flt.add_pattern("*.ADI")
+        flt.add_pattern("*.adif")
+        flt.add_pattern("*.ADIF")
+        dlg.add_filter(flt)
+        if WSJTX_DEFAULT_ADI.parent.is_dir():
+            dlg.set_current_folder(str(WSJTX_DEFAULT_ADI.parent))
+
+        if dlg.run() == Gtk.ResponseType.OK:
+            fpath = Path(dlg.get_filename())
+            self._import_adif_file(fpath, save_copy=True, quiet=False)
+        dlg.destroy()
+
+    def _import_adif_file(self, fpath: Path, save_copy: bool = True, quiet: bool = False) -> None:
+        try:
+            txt = fpath.read_text(encoding="utf-8", errors="ignore")
+            w_set, c_set, qsos = parse_adif_worked_grids(txt)
+            self.worked_grids |= w_set
+            self.confirmed_grids |= c_set
+            self.adif_qso_count += qsos
+            if save_copy:
+                self._save_worked_grids()
+            self._queue_map_redraw()
+            self.vfd_area.queue_draw()
+            if not quiet:
+                self._set_status(
+                    f"Imported {fpath.name}: {qsos} QSOs, {len(self.worked_grids)} Worked grids ({len(self.confirmed_grids)} Confirmed)."
+                )
+        except Exception as exc:
+            if not quiet:
+                self._set_status(f"ADIF import failed: {exc}")
+
+    # -----------------------------------------------------------------------
+    # Timers & Shutdown
+    # -----------------------------------------------------------------------
+    def _on_anim_tick(self) -> bool:
+        self.anim_phase = (self.anim_phase + 0.035) % 1.0
+        now = time.monotonic()
+        if self._roster_dirty and (now - self._last_roster_sync >= 0.45):
+            self._roster_dirty = False
+            self._last_roster_sync = now
+            self._sync_roster_and_band_counts()
+        # Pulse home beacon & any active W1AW arcs + UTC second clock
+        self.vfd_area.queue_draw()
+        self.map_area.queue_draw()
+        return True
+
+    def _queue_map_redraw(self) -> bool:
+        self.map_area.queue_draw()
+        return False
+
+    def _set_status(self, msg: str) -> None:
+        self.status_lbl.set_text(msg)
+
+    def _on_destroy(self, *_args) -> None:
+        self._save_config()
+        self.mqtt_client.stop()
+        self.wsjtx_listener.stop()
+        self.tile_engine.shutdown()
+        Gtk.main_quit()
+
+
+# ---------------------------------------------------------------------------
+# Comprehensive Self-Test Mode (`--self-test`)
+# ---------------------------------------------------------------------------
+def run_self_test() -> int:
+    # 1. Verify Maidenhead <-> Lat/Lon (W1AW FN31pr = Newington, CT)
+    pt = maidenhead_to_latlon("FN31pr")
+    assert pt is not None, "FN31pr conversion failed"
+    lat, lon = pt
+    assert abs(lat - 41.729167) < 0.02 and abs(lon - (-72.708333)) < 0.03, f"Unexpected FN31pr: {pt}"
+    g6 = latlon_to_maidenhead(lat, lon, chars=6)
+    assert g6 == "FN31pr", f"Round-trip Maidenhead mismatch: {g6}"
+    g8 = latlon_to_maidenhead(lat, lon, chars=8)
+    assert len(g8) == 8 and maidenhead_to_latlon(g8) is not None
+
+    # 2. Verify Geodesic Distance, Short/Long Path Azimuth & Pacific Antimeridian Slerp
+    dkm, sp, lp = geodesic_distance_bearing(lat, lon, 35.68, 139.76)  # FN31pr -> Tokyo PM95
+    assert 10500.0 < dkm < 11200.0, f"Unexpected Newington-Tokyo distance: {dkm}"
+    assert 330.0 < sp < 350.0 and abs(((sp + 180.0) % 360.0) - lp) < 0.01
+    arc = great_circle_unwrapped(lat, lon, 35.68, 139.76, steps=32)
+    assert len(arc) == 33
+    for i in range(1, len(arc)):
+        assert abs(arc[i][1] - arc[i - 1][1]) < 35.0, "Antimeridian longitude jump detected!"
+
+    # 3. Verify Solar Greyline Astronomical Terminator Math
+    ts_fixed = datetime.datetime(2026, 6, 21, 18, 0, 0, tzinfo=datetime.timezone.utc)
+    slat, slon = compute_solar_subsolar(ts_fixed)
+    assert 22.5 < slat < 24.0, f"Solstice declination out of range: {slat}"
+    term = compute_terminator_curve(slat, slon)
+    assert len(term) > 100
+
+    # 4. Verify PSKReporter XML Parser & ADIF Parser
+    sample_xml = """<?xml version="1.0"?>
+    <receptionReports>
+      <receptionReport senderCallsign="W1AW" senderLocator="FN31pr"
+        receiverCallsign="JH1ABC" receiverLocator="PM95vq"
+        frequency="14074850" mode="FT8" sNR="-08" flowStartSeconds="1732660000" />
+    </receptionReports>"""
+    spots = parse_pskreporter_xml(sample_xml, "W1AW", "FN31")
+    assert len(spots) == 1 and spots[0].is_home_call and spots[0].band == "20m" and spots[0].snr == -8
+
+    sample_adif = "Header <EOH><CALL:6>JH1ABC<GRIDSQUARE:6>PM95vq<BAND:3>20m<LOTW_QSL_RCVD:1>Y<EOR>"
+    w_g, c_g, q_n = parse_adif_worked_grids(sample_adif)
+    assert "PM95" in w_g and "PM95" in c_g and q_n == 1
+
+    # 5. Verify Pure-Stdlib MQTT v3.1.1 Packet Builder & Variable-LengthPUBLISH Decoder
+    conn_pkt = mqtt_build_connect("dtmaps_w1aw_test", 60)
+    assert conn_pkt[0] == 0x10 and b"MQTT" in conn_pkt
+    sub_pkt = mqtt_build_subscribe(1, ["pskr/filter/v2/+/+/W1AW/#", "pskr/filter/v2/+/FT8/#"])
+    assert sub_pkt[0] == 0x82
+    assert mqtt_build_pingreq() == b"\xc0\x00"
+
+    topic_b = mqtt_encode_utf8("pskr/filter/v2/20m/FT8/W1AW/K6ARK/FN31/CM87/1/1")
+    json_b = json.dumps({
+        "sc": "W1AW", "sl": "FN31pr", "rc": "K6ARK", "rl": "CM87wk",
+        "f": 14074500, "md": "FT8", "rp": 4, "t": 1732660100, "b": "20m",
+    }).encode("utf-8")
+    body = topic_b + json_b
+    pub_pkt = bytearray(b"\x30" + mqtt_encode_varlen(len(body)) + body)
+    dec = mqtt_try_decode_packet(pub_pkt)
+    assert dec is not None and dec[0] == 3
+    msp = parse_mqtt_spot_json(dec[2], "W1AW", "FN31")
+    assert msp is not None and msp.is_home_call and msp.rx_call == "K6ARK"
+
+    # 6. Verify Embedded Vector World Geography + 5 Map Mode LUTs + Cairo Surface Init
+    assert len(WORLD_POLYGONS) >= 60
+    test_tile = np.full((64, 64, 3), 180, dtype=np.uint8)
+    for mkey, _ in MAP_MODES:
+        out_rgb = apply_map_mode_to_rgb(test_tile, mkey)
+        surf = rgb_to_cairo_surface(out_rgb)
+        cr = cairo.Context(surf)
+        cr.set_source_rgb(0.2, 0.9, 0.8)
+        cr.arc(32, 32, 8, 0, 2 * math.pi)
+        cr.stroke()
+
+    # Check Gtk bindings import & init_check cleanly (works headless or with DISPLAY)
+    Gtk.init_check(sys.argv)
+
+    print("DTMAPS_SELF_TEST_OK")
+    return 0
+
+
+def main() -> int:
+    if "--self-test" in sys.argv:
+        return run_self_test()
+
+    ok, _ = Gtk.init_check(sys.argv)
+    if not ok:
+        sys.stderr.write("dtMaps: Cannot open X11/GTK display.\n")
+        return 1
+
+    win = DtMapsWindow()
+    win.show_all()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

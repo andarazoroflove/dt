@@ -1,0 +1,70 @@
+#!/bin/sh
+# Wrapper for CDE dtwm:
+# 1. Restores full CDE session environment (XMICONSEARCHPATH, DTDATABASESEARCHPATH,
+#    DTAPPSEARCHPATH, DTUSERSESSION, TT_SESSION) even if launched outside dtsession.
+# 2. Preloads libdtwm_subpanel_cols.so for automatic multi-column subpanels that
+#    never cover the main Front Panel.
+# 3. Ensures cde-panel-tray is active and snaps Front Panel to bottom-center.
+
+UID_NOW="$(/usr/bin/id -u)"
+
+# Import live CDE session vars from dtsession if missing
+if [ -z "${XMICONSEARCHPATH:-}" ] || [ -z "${DTDATABASESEARCHPATH:-}" ] || [ -z "${TT_SESSION:-}" ]; then
+    DTS_PID="$(/usr/bin/pgrep -u "$UID_NOW" -x dtsession 2>/dev/null | /usr/bin/head -n 1 || true)"
+    if [ -n "$DTS_PID" ] && [ -r "/proc/$DTS_PID/environ" ]; then
+        eval "$(/usr/bin/python3 - "$DTS_PID" <<'PY'
+import shlex, sys
+pid = sys.argv[1]
+want = {
+    "LANG", "DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+    "DTUSERSESSION", "TT_SESSION", "DTMOUNTPOINT", "DTAPPSEARCHPATH",
+    "DTDATABASESEARCHPATH", "XMICONSEARCHPATH", "XMICONBMSEARCHPATH",
+    "DTHELPSEARCHPATH", "DTINFOLIBSEARCHPATH", "DTINFOLIBDEFAULT", "SESSION_SVR"
+}
+raw = open(f"/proc/{pid}/environ", "rb").read().split(b"\x00")
+for item in raw:
+    if b"=" not in item:
+        continue
+    k, v = item.decode("utf-8", "surrogateescape").split("=", 1)
+    if k in want and v:
+        print(f"export {k}={shlex.quote(v)}")
+PY
+)"
+    fi
+fi
+
+# Fallback to standard CDE dtsearchpath if still unset
+if [ -z "${XMICONSEARCHPATH:-}" ] || [ -z "${DTDATABASESEARCHPATH:-}" ]; then
+    if [ -x /usr/dt/bin/dtsearchpath ]; then
+        eval "$(/usr/dt/bin/dtsearchpath -ksh 2>/dev/null)" || true
+    fi
+fi
+
+# Strip any stale saved FrontPanel geometry from XA_RESOURCE_MANAGER before dtwm starts
+if [ -x /usr/bin/xrdb ]; then
+    /usr/bin/xrdb -query 2>/dev/null | /bin/grep -v -iE 'FrontPanel.*geometry' | /usr/bin/xrdb -load 2>/dev/null || true
+fi
+
+SUBPANEL_SO="$HOME/.local/bin/libdtwm_subpanel_cols.so"
+if [ ! -f "$SUBPANEL_SO" ] && [ -f "$HOME/.local/lib/libdtwm_subpanel_cols.so" ]; then
+    SUBPANEL_SO="$HOME/.local/lib/libdtwm_subpanel_cols.so"
+fi
+if [ -f "$SUBPANEL_SO" ]; then
+    case ":${LD_PRELOAD:-}:" in
+        *":$SUBPANEL_SO:"*) ;;
+        *) export LD_PRELOAD="${SUBPANEL_SO}${LD_PRELOAD:+:$LD_PRELOAD}" ;;
+    esac
+fi
+
+# Ensure cde-panel-tray is running and re-centers the Front Panel after dtwm starts/restarts
+if [ -x "$HOME/.local/bin/cde-panel-tray" ]; then
+    (
+        sleep 1.0
+        "$HOME/.local/bin/cde-panel-tray" --center-only >/dev/null 2>&1 || true
+        "$HOME/.local/bin/cde-panel-tray" --daemon >/dev/null 2>&1 || true
+        sleep 1.2
+        "$HOME/.local/bin/cde-panel-tray" --center-only >/dev/null 2>&1 || true
+    ) >/dev/null 2>&1 &
+fi
+
+exec /usr/dt/bin/dtwm "$@"

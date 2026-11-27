@@ -1,0 +1,3570 @@
+#!/usr/bin/env python3
+"""
+dtNet — Vintage SunNet Manager / SGI NetVisualizer Analog Network Telemetry &
+        Visual World Traceroute Console for CDE (`Utilities` Subpanel)
+
+Features:
+  - Authentic 1980s/1990s UNIX Workstation Network Operations Rack styled for CDE (OSF/Motif bevels):
+      * Top Analog Telemetry Rack (18 fps damped spring needle ballistics):
+          1. RX THROUGHPUT — Auto-scaling Kbps / Mbps ballistic needle + peak-hold tick + VFD (/proc/net/dev)
+          2. TX THROUGHPUT — Auto-scaling Kbps / Mbps ballistic needle + peak-hold tick + VFD (/proc/net/dev)
+          3. RTT LATENCY / RF LINK — Switchable live Ping RTT (0..250 ms + jitter VFD) OR
+             Wi-Fi RF Signal (-100..-30 dBm + Link Quality % from /proc/net/wireless)
+      * Toggleable [WARM AMBER] incandescent cream/brass vs [DARK PHOSPHOR] radium night dial faces
+      * Phosphor Dual-Trace RX/TX Rolling Strip-Chart + Interface Selector (ALL or per-NIC from
+        /sys/class/net/ showing UP/DOWN jewel LED, IPv4/IPv6, MAC, Speed, MTU, Total GiB, Err/Drop)
+  - 3-Tab Sunken Workstation Deck:
+      1. WORLD TRACEROUTE RADAR — Target entry + 7 presets, [TRACE ROUTE] (traceroute -n / tracepath -n
+         with automatic rootless Python `ping -t <ttl>` 1..24 fallback), [CONTINUOUS PING], cached IP
+         geolocation (~/.cache/dtnet/ipgeo.json + offline fallback) from Home QTH (41.7292° N, -72.7083° W,
+         Newington, CT), glowing neon great-circle hop arcs & numbered hop beacons over a vector world map
+         alongside a tractor-feed greenbar hop RTT table.
+      2. ACTIVE SOCKETS & PORTS (/proc/net) — Pure-Python /proc/net/{tcp,tcp6,udp,udp6} hex decoder +
+         /proc/[pid]/fd socket-inode-to-process mapper with [LISTEN ONLY], [ESTABLISHED], and live search.
+      3. LAN SWEEP & BENCH TOOLS — Auto-detected /24 subnet + /proc/net/arp threaded ping/TCP port sweep
+         (22, 53, 80, 443, 445, 631, 5900, 8073, 8080) + integrated DNS / TCP Banner / TLS Cert / HTTP Header
+         bench inspector.
+"""
+
+from __future__ import annotations
+
+import base64
+import collections
+import concurrent.futures
+import datetime
+import fcntl
+import json
+import math
+import os
+import random
+import re
+import shutil
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zlib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import cairo
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("Pango", "1.0")
+from gi.repository import Gdk, GLib, Gtk, Pango
+
+HOME = Path.home()
+CONFIG_DIR = HOME / ".config" / "dtnet"
+CACHE_DIR = HOME / ".cache" / "dtnet"
+STATE_FILE = CONFIG_DIR / "state.json"
+IPGEO_CACHE_FILE = CACHE_DIR / "ipgeo.json"
+
+HOME_QTH_LAT = 41.7292
+HOME_QTH_LON = -72.7083
+HOME_QTH_NAME = "Newington, CT (FN31pr)"
+
+HISTORY_LEN = 120
+SWEEP_PORTS = (22, 53, 80, 443, 445, 631, 5900, 8073, 8080)
+TRACE_PRESETS = [
+    ("1.1.1.1", "1.1.1.1 — Cloudflare DNS"),
+    ("8.8.8.8", "8.8.8.8 — Google Public DNS"),
+    ("github.com", "github.com — GitHub Core"),
+    ("pskreporter.info", "pskreporter.info — Ham Spots"),
+    ("kiwisdr.com", "kiwisdr.com — Global HF SDR"),
+    ("arrl.org", "arrl.org — ARRL HQ (CT)"),
+    ("noaa.gov", "noaa.gov — NOAA Space/WX"),
+]
+
+UA = "dtNet/1.0 (CDE Workstation Network Telemetry Console)"
+
+
+# ---------------------------------------------------------------------------
+# Embedded Compact Vector World Geography + Geopolitical & US State Borders
+# ---------------------------------------------------------------------------
+WORLD_VEC_B64 = (
+    "eNpVWm+IHNlxr5ZWu6vVSiumiXW68518JN3YwQmJHIeeD3EgkQ6yvQ45wVkiMAMBffH6Q2YgXIKjyZfZOOQIzIDx5N+Fg54LSPmQ"
+    "c2B7Q7IbB+4+TMcEyQQTQndiW8acHNs9d0G6P7ZP81L1q3q9Yy2op1/3e69evapf/apef5roL0/8849eOH+fahdR5eaucEMK+W7f"
+    "xST/Cle6yqXcIr9r/itcSDGVfJ87+ZNfxH0rvkbcVnFLbm3y9OWFtBRul8e8wjMQ9526jK9Tbi/dACO3MfrMJTxCSGPX4/4x/075"
+    "2qGEf8uvkP+X5zWPLCOI1G1+OuP+B9xecn+Rp+LrgO+lRwFZavf1Rch95bn0Tpv2Eb834NEK9K+xrsLkv0Mtvs65l4xUQiq5vwN9"
+    "1Kwjkah2Il+EZ6W9G1OC+xbt8PvbLCGRziqzFdCcaLPi9bf4/TlWP3IyeuUu87pGrkuX8U5M8k7JumtDwop1GfKIMx4ntnUkJlHl"
+    "xriWfJV9OOC7fciUsIb6pGuW+wnLI+toUcbjVk40lbC8tZtQlyWKsKI2P02xupotI+a/ro0xxNpL7ldhl0TixPQj1y7/xZhnl+dQ"
+    "e5J3O9jZAveyczVWM8fcCdoz2Nwu9q9F17G+HZZEJErZNgrTU+lm2OuYRraXfWhh7LyMPZ5RrKWGxkvYTIHfqoXKdJabziqMk7nr"
+    "+FW5AtYtPURPY1yldZ+vY5Yiphu8U/pOtSSPaENsmmgbGiogQUy3bLSBi8z2dL9LeIXMOYKHyLV26n8RScuMe9dm2WqXCfVZt2L/"
+    "BfyodlexD94uu9yuVnOVdS57HJPqXm00pR58KmXdxtD0jPUXQnJvJynfdTF/zTYsuhzZ3o4hT4dCvLdjK23DGsWOxM4zd99+3+V3"
+    "unzfh9bHTlYuXlbYldjSdQ1T1oJiTcZPpvxrl68zp14vWs9Ny5f4T2xdZFL95bxS0fOY+4aUkEcn3ZuMNaG7UuPt62xhBNvNWDZF"
+    "jct4MyLpP2XrKVli8YwWay4GAnRh1wX2L+G/LvxFcWACPArpDj/rseak9aWg4Bl2edUZrDKBRkQzei8+0oJ2aqf41oWHiaW3zUs7"
+    "2EW1HMW8KfxfMay2FVwFZvRJdHCZZc+xyjZsXHB1znKOuL2AX0XsVxN+pisn/MrMvkr4oNhZjd3xmKoeO+L5RM7KdlrmLzFmwutM"
+    "WTZdZ4aocWTrUksp3T32mG1ecZvfHcIaBdsUERLKbT0F0DKhNxeyDwnNzBuPMZuATeoZM5NTPD83HXmfjqDhEPIQEEhxV6yQbA8i"
+    "+IBGHJVF3rhk60t4niHaJS6FQMyQ26TnkHtuQrYIMuoeiW22+MkA1iOr3jcEGhvK7jb+fp//ZubjJTQcw0O9TiN43Vogs3ZpBy2l"
+    "WwsI9tVvcI6AxSlWWmFV8uu+aX9CZNGzBprfDDQ2JdZ6F7iewPcnQNsS+B4Z5qSGG5HtvOgjhGdo7OkhVsyBeLJStcja+TgtrbIG"
+    "QYoh7D0B6ojdR5g1RMzMXAv9M+xlSheDyHiAzjPhOVLoqXA9i7xz03sGDUa2Rwn0eGj4JLKEhn+ybhlHvDoGlqqO7kLT2zzqHFiU"
+    "GpKm5ONzYTEswjhyHVoEkbGHxhX6poMBnswQ50uOw2PYXQmvCI3PeLnlzdeDGh4ge7fHqxgCp6dOuZh6m/ITWb/IkzW66GC1Nawr"
+    "aqymhz0loJRyoSEQJQU7OYTNaDxvYQ9irCm1OJ2Q2rX46sB85skgAqORWWLGOcWOiK7w0wMgaw2kFsu6Q97f+PK5E5/94IXz3lx/"
+    "FIRw+G/Z/ZOBN89jeiL3b6zo1sxP6H18UlV8hHCTu2vWr2db2Lft/fOTIlTllt1Dnn880NDo51BCqKB8LSgRHm4GSjteD+ZODO/I"
+    "aIrSuzZUkgBSavd8oGAhWyOhXVykf1LD5WQpFMu7dxEUZLMPjJ78cCFQJVvuafBVDnjXnRK5wuDqklNiEjJoFE1orPn9Xai6dBNb"
+    "fYgg3ec/De/y5ymwAGIC+iF0Y98pQOZmej6sfGoxt6BcguZ4ipqC+moAjI3mRg3NLeEabWx0wQYvso7cFJRpLagg4z7o/tTlBoe5"
+    "kZ2xG4AQ7yJQy360jU614Bwjk3HO1xaALIcEKWXmEKVBRw0QrSB7gnHE3TVwVUbvZNYhjFWMvUTLFKtUMlJamBkthRo1/YG5b4Kg"
+    "T4AqH5BzNwGgzwwOB0h3xkYUS6cEqWjopoQiWcM+3pBEZQICOwaVrFgihd3cglNhwaKGDvtYqcLzhO/nrPErTnfmhu2jD/EakhQ8"
+    "dmGRiYF2ZNKmoAFKO2rMG7N99vjpAYfqDKH6EXmLHhg9IuojKOTokYJg7TqvYWINX3Ua+ErMXNveyntifftINL3n9U2mDtK4yq0G"
+    "OYAuxl6HoCpDnmfe2KmM8mAhSYUA2NQdU1rdSyUBQvkypkIHfL/P+6GwnlmCJzqSdHXHMKODVUbAkMSCsKaoM+57if17AEsZg3Tq"
+    "SpXwF9hH3adboLuylzJai+8lqdZwULJdjZwGs8/x/Qzvbbo3FzJW1tib4lNmNKYwyiDooSmF2E8HJECTtgnonQQ7CSoRfL5r0L1j"
+    "4VG8VGlmYemJpz6KT0fw6F2WNePdlxVe51+7eLdGOlQspdYZVjGBHAWStzsUwS+GsFyhmh3qw64S0hAufrNHEYLuHIlFyiGiD/uZ"
+    "Oo8oCWiPJs8T7MKngNl9nmebRtCN0rGwSUVbjKRkGJCSD2KFJdxKsSPaprBJfTSc7yOMtiwlEEK9bSWQLghrDyP2gPkJxuxCVxJ2"
+    "lSbOMILu+MzSyhz2KX6xx/SrRz1SfxNar/RM8WPHwu4RtBRxbAot5VLE/nigXvfQcFWCqqZiHYosVoaGvSqX0BHFex8XhyCrPhTP"
+    "OQaVRmK2Efrb/P82/EYs6YpT4luBQGlyL9psmV5j8mUQjYVKYVQzc6de06KHoI87JLH9CKWbwuJdCIrtKYb82rMdH5p8E9ISUmEl"
+    "JPHzyBAoNHrVs7h6XIYgi3jzpq2F9LdGCposcQpZw32jylLkyA0LM/hRSr+10D04azFnZNoQKTedpgADaEepqiaPxzFUnv/9QpAq"
+    "BP+oEYtiWHlo5bCRYfLAqe1msLjI7iOkG8ljiQ5lM+aLC8GdLnUe+1KWytey+z9d6Hu/8mNF2tcWmj7VIIm6phuGJxH0WCGezBA7"
+    "SysZtUEXMed92g9feajMUPM+qSTs8O/bVmfqNuzR53cqgt+CflN5yZ3PMroAIV8Zk6ymZdU0zWruGTUb2hgdu14L5gCfLly4akwg"
+    "xXwz9BfXvWfthwhWOSiOhPJLzrvJ3C3TS0/R9mze20uUjXgj//0Nou+8I23XAl/xS08q3fBU8xBZT0IvBkqI+ja2rimirgVddc0W"
+    "fbupG2j75RMKmOoSEaBAXUEraxNsVodl3QFjl/U+H6icvx8UTSYhBneIumibNIwlkHO7kUfm0Uqeum276Texat8RYFFcb46QeVx9"
+    "Ko0cHVgurgG0bzq52xAEXct9a79oMHQzEAIUMzS0EBA0m2xD/x3+ewRJYwPGqLGlXw2OYUN0t2cw8RLbTYs0wB6ZHfoM+KVA230Y"
+    "H5rbJw1shJYSHGd9Mqe/X4aqNjJbvb9na0rMJ7ydf+SEuvZDA0uCnSdNxj2Enbab1OZ4foVSD4WJ/R+bffRkfb9Brz/18HFCtbGG"
+    "HGUdxYsK6NYFGgtTVLzsA4+0pDJ3u5ZLZK74ieKabG6B0nCJBDVG0ShDHOyAdQluHYCV9CizQvqDRQ0GVRhLvmKGMGoMJWnYx4iN"
+    "IGQYGfLvR6TlcS1giEqGVnjUIwONiDsUmUr8diUoX3n11IjUlVNI6ZOW68HafpYGFwkWrnXH3CVNziua1rr5BMgyNtoZUdwInJj2"
+    "9TzCJwsDA9/Skq4JKYUcgdLuWdDPGDxbEHQMMO1gAQNQ9NiqBiFsQOpmdIkOLxydTJHzDbB7MZyqRjakBbApnK8yTK6sDF5i8tYS"
+    "O9W45Pmd5nrCScQ1fKmwB9Fi0zc9TS899ex6YtWE0FI5rW8PQFEJGKKtFcLczE5G8uaZJMYtq+63zGYVf0Joc0hxQy3FdOlJmn3o"
+    "ZqB7WTHLqp1nLr4AL2VFEWPucnd8CCNZdQR2mFvxsbDA04Ordq1AFVFsjIQu0L2T/7GVwHtLd7hUw5KzlNQq8WMQtDbSBVHrLRB0"
+    "qYBquhuZfQyBWGqm8NQL9Benv/RYzUUPKNQfMmQ2MskMOWtlsbtlkmuYlDCVgC3doaQxu9gsn+8+RO9tfmxraCcWr+HkrETqWaAq"
+    "Vpmt6fMSqTOhQqoUWwbZtvR/h9oWg1DSCOnJp/5q63YTnpdDrFZUhAE/YObwi2b4U8vbbtl9BmUlgGuJKP+7stVHHY6WaG2JMwGh"
+    "U9L9lpGjsV3zhjx5YhUpQQ7p3bf+ZqULDWmWEyJoli5sFqvd/dGdGOe+6XiAHCuCJgHMW/S1H3zxXGI7H1mJZtrAYWyVqxgWQDhF"
+    "UVve0+6dC7W7Z91nBgBtHFz4Q54UfG4fTp8iQ1N3YjM5R7MPNs76RF265nYup/AZUtYkslo9lCEuyi6dZa73vY2+lfLUZnK44AHm"
+    "VjghSpuDSQl+3O0/n/2FH3YhlpwB6GmintceNKA9t6qyREWkf5v05afeXo+sHrAHxlqY+2vNKTeByXJLOkPnHz19/tBUs+sUQeT3"
+    "1Aiyuq8lZ2foH55deb8L/i6eMXZ6HDECyciAVYmV33n0DfrkmY3zEah8ixI7u5CkTOz8Gau8S8pEp+lrp9/fav9EkVkihK8UtQm2"
+    "fpq++n+PTu41SY4/EVJ7vIXkFaO9/MSLi8Ryr11smNZ7tJRqAfw0Pffhlfe3zWn6SEPltHJukUHTCFqnX3v36fOxUYUDCyillWdB"
+    "Q9dpcuHmQkea2e4UZk4GZ+v0xx9pPU4MpPWww9tEjdFojRbvvnD+QUCkhZcWrmf5EQpPa/Sb7zx9vguErdzM/LjyzrdGf/C939vy"
+    "DG8AA6PjxHqN/nXru0FKWrvTWps/DOjK4+ef6BpbzXBa4lP3u9r7p376Bx+oT0xRk1Hw0gyeH3/+7OffTZryVGWD11pgWqV/+/6f"
+    "bB2aH1SoR9iBwypNv/uxrYktZeZ8iS6WR5/55isbXmN5s+aWPHot+O119fIacKHVeZJHty/8eEXBIuPdOuBmPe7jRw+e6BlPnoIZ"
+    "+y8g+NFzl55fpHaYWJndIQat0luXPvNB1xJ3fUHPkvjRJx+9906/EUPZk6ySTlHrzVc22s2XFlYEPcWCn1tPkbEVdoQQS/Nf3390"
+    "MrIzhLnNwc2/HhZ2DFPaITkG4QC8OJ62VGReoS9svr+VLBkhN736/ZWtxCjHgTatP/ONc4d22HZVZF2h//rv8+e6yycYK/SVt35n"
+    "MzGYt7H+8JtvnxH7kiJlqR1/+X9+fiMl/3kI3vqzjfGJ2DDL3vqleYiqe2m1NW56/YkBkNzTBm76uWceLFKD8X1t+vIzL2NTBOUP"
+    "WFHBDv3RiVfXtbY0db5qkpia5+Y06u/KL8dOP3z4EjC2TZc4xEnN3vuBfoyROc3cNfofE8eqYd1HdkC4tnRKoR+yjLCqllUF+ngv"
+    "c2kDUp3mwEZranmT8t5pUlchMxN4Yr70gYsPKgW/mVmdMjZUG2F9ERx85PQY7xbeT8xA23DA4KP08oMvntMjGqGlM5cZwo+aIiVZ"
+    "YVA59nQJlC47jQ0TiF/aQcjcaYFZmeLRUpZMOHXTbekbZ78ZCKZ0rHQ8dzes0ByR4jUn2899+J/Otej4PEcOV5Nmd2M7zp01mrsW"
+    "6MdDrwVqe3EjToIE+I5ViaQ+9nWrp4yMHOSGnDdsmb/7OLTjYF9t2kHOFfwMvbHylU39ToIsXdHjmtz583gpOc7c1BWNn4cWbjML"
+    "FAfQqhBlBbI9Y9pd02SHtMClWY6yUz0GkVPtNmi/z4CCi/Tt1bfXQ2CU0oB93grN/Y5T+xLOMkPpxR8sJ6iszdxtKF3PZeQTin2r"
+    "SMeWrN7i3sEF+pfVT5wKDRESfL00hfXoN09jczl1veWzY6nfFDjh3Cb9jmNCB5iu13ytwQn/6Y0Tp7X6qjILFMudVKsrq7wqoTz+"
+    "VGvOqtOcqdt8fhFs0RdOv3qqh1L9cTjsW96tIdsX7/0XaJFJyM5xhv5u9b3NuOH2tdXRNWGQLbhun+uIrgMO4qv50lrV+HTXtRQb"
+    "rNGr80+f9seusdWFK8v5g1X66FtfXW/ZMV5tvoieq7T+9j+uh/bBgh6i57DqYIU+cepvz3SJmvPz/wf5JELD"
+)
+
+BORDER_POLYLINES: list[list[tuple[float, float]]] = [
+    [(-123.2, 49.0), (-95.15, 49.0), (-89.5, 48.0), (-84.5, 46.5), (-82.4, 43.0),
+     (-79.0, 43.2), (-76.3, 44.2), (-74.7, 45.0), (-71.5, 45.0), (-69.2, 47.4), (-67.8, 47.1), (-67.0, 45.2)],
+    [(-141.0, 69.6), (-141.0, 60.3), (-139.0, 60.0), (-135.0, 59.5), (-130.0, 56.0)],
+    [(-117.1, 32.55), (-114.8, 32.7), (-111.1, 31.33), (-108.2, 31.33), (-106.5, 31.78),
+     (-104.0, 29.5), (-103.0, 29.0), (-101.4, 29.8), (-99.5, 27.5), (-97.15, 25.95)],
+    # Regional state border polyline
+    [(-117.0, 49.0), (-116.05, 49.0), (-116.05, 47.98), (-115.7, 47.45), (-114.9, 46.8),
+     (-114.3, 46.6), (-114.5, 45.8), (-113.8, 45.6), (-113.0, 44.45), (-111.4, 44.5),
+     (-111.05, 44.65), (-111.05, 42.0), (-117.02, 42.0), (-117.02, 43.8), (-117.2, 44.3),
+     (-116.45, 45.6), (-116.92, 46.0), (-117.0, 46.4), (-117.0, 49.0)],
+    [(-124.2, 42.0), (-111.05, 42.0)],
+    [(-124.0, 46.2), (-119.0, 46.0), (-117.0, 46.0)],
+    [(-120.0, 42.0), (-120.0, 39.0), (-114.6, 35.0)],
+    [(-114.05, 42.0), (-114.05, 36.0)],
+    [(-111.05, 45.0), (-104.05, 45.0)],
+    [(-111.05, 41.0), (-102.05, 41.0)],
+    [(-109.05, 41.0), (-109.05, 31.33)],
+    [(-114.8, 37.0), (-94.6, 37.0)],
+    [(-104.05, 49.0), (-104.05, 41.0)],
+    [(-96.6, 49.0), (-96.4, 43.5), (-95.8, 40.0), (-94.6, 37.0), (-94.0, 29.7)],
+    [(-5.5, 43.4), (3.1, 42.4)],
+    [(7.6, 47.6), (6.1, 46.2), (7.0, 45.8), (6.7, 45.0), (7.5, 43.8)],
+    [(14.8, 53.9), (14.6, 51.0), (12.2, 50.3), (13.8, 48.8)],
+    [(24.0, 54.0), (23.5, 49.0), (28.2, 45.5)],
+    [(25.0, 22.0), (35.0, 22.0)],
+    [(-70.0, -18.0), (-68.5, -24.0), (-70.3, -33.0), (-71.8, -42.0), (-72.5, -51.5)],
+]
+
+
+def decode_embedded_world_polygons() -> list[tuple[bool, list[tuple[float, float]]]]:
+    raw = zlib.decompress(base64.b64decode(WORLD_VEC_B64))
+    off = 0
+    (npolys,) = struct.unpack_from("<H", raw, off)
+    off += 2
+    out: list[tuple[bool, list[tuple[float, float]]]] = []
+    for _ in range(npolys):
+        is_hole, npts = struct.unpack_from("<BH", raw, off)
+        off += 3
+        px, py = 0, 0
+        pts: list[tuple[float, float]] = []
+        for _ in range(npts):
+            dx, dy = struct.unpack_from("<hh", raw, off)
+            off += 4
+            px += dx
+            py += dy
+            pts.append((px / 50.0, py / 50.0))
+        out.append((bool(is_hole), pts))
+    return out
+
+
+WORLD_POLYGONS = decode_embedded_world_polygons()
+
+
+# ---------------------------------------------------------------------------
+# CDE Palette Loader & Vintage OSF/Motif 3D Bevel CSS
+# ---------------------------------------------------------------------------
+def load_cde_palette() -> tuple[str, str, str]:
+    chrome, sel, well = "#aeb2c3", "#2c567e", "#fff7e9"
+    try:
+        out = subprocess.check_output(["xrdb", "-query"], text=True, stderr=subprocess.DEVNULL)
+        pal_name = "Crimson.dp"
+        for ln in out.splitlines():
+            if "ColorPalette:" in ln:
+                pal_name = ln.split(":", 1)[1].strip()
+                break
+        for pdir in (HOME / ".dt/palettes", Path("/usr/dt/palettes")):
+            pf = pdir / pal_name
+            if pf.is_file():
+                hexes = [l.strip() for l in pf.read_text().splitlines() if l.strip().startswith("#")]
+                if len(hexes) >= 4:
+                    def norm16(h: str) -> str:
+                        h = h.lstrip("#")
+                        return f"#{h[0:2]}{h[4:6]}{h[8:10]}" if len(h) == 12 else "#" + h[:6]
+                    chrome, sel, well = norm16(hexes[1]), norm16(hexes[2]), norm16(hexes[3])
+                break
+    except Exception:
+        pass
+    return chrome, sel, well
+
+
+def build_net_css(chrome: str, sel: str, _well: str) -> bytes:
+    css = f"""
+    window, dialog, .background {{
+        background-color: {chrome};
+        color: #101216;
+        font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+        font-size: 8.5pt;
+    }}
+    .net-cabinet {{
+        background-color: #2b303a;
+        border-top: 2px solid #5d677a;
+        border-left: 2px solid #5d677a;
+        border-right: 2px solid #15181e;
+        border-bottom: 2px solid #15181e;
+        padding: 4px 5px;
+    }}
+    .net-strip {{
+        background-color: #363c49;
+        border-top: 2px solid #5a6375;
+        border-left: 2px solid #5a6375;
+        border-right: 2px solid #191d24;
+        border-bottom: 2px solid #191d24;
+        padding: 3px 5px;
+    }}
+    .net-bevel-in {{
+        background-color: #161b22;
+        border-top: 2px solid #0d1015;
+        border-left: 2px solid #0d1015;
+        border-right: 2px solid #586175;
+        border-bottom: 2px solid #586175;
+    }}
+    .net-engraved {{
+        color: #dde4f2;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8pt;
+    }}
+    .net-vfd-box {{
+        background-color: #091516;
+        color: #52f7d4;
+        border-top: 2px solid #040a0b;
+        border-left: 2px solid #040a0b;
+        border-right: 2px solid #4d5769;
+        border-bottom: 2px solid #4d5769;
+        padding: 3px 6px;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 7.8pt;
+    }}
+    notebook {{
+        background-color: #2e3440;
+        border-top: 2px solid #161920;
+        border-left: 2px solid #161920;
+        border-right: 2px solid #636c80;
+        border-bottom: 2px solid #636c80;
+    }}
+    notebook > header {{
+        background-color: #353b48;
+        border-bottom: 2px solid #191c22;
+        padding: 1px 2px 0px 2px;
+    }}
+    notebook > header > tabs > tab {{
+        background-color: #424958;
+        color: #d6deeb;
+        border-top: 2px solid #6d778c;
+        border-left: 2px solid #6d778c;
+        border-right: 2px solid #1b1f27;
+        border-bottom: none;
+        padding: 3px 10px;
+        margin-right: 2px;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8pt;
+    }}
+    notebook > header > tabs > tab:checked {{
+        background-color: #22473c;
+        color: #6dfce0;
+        border-top: 2px solid #58d1b4;
+        border-left: 2px solid #58d1b4;
+    }}
+    notebook > header > tabs > tab label {{
+        color: inherit;
+    }}
+    entry {{
+        background-color: #10181b;
+        color: #6efce0;
+        caret-color: #6efce0;
+        border-top: 2px solid #070b0d;
+        border-left: 2px solid #070b0d;
+        border-right: 2px solid #566074;
+        border-bottom: 2px solid #566074;
+        border-radius: 0px;
+        padding: 2px 5px;
+        min-height: 20px;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8.2pt;
+    }}
+    button {{
+        background-image: none;
+        background-color: #464d5c;
+        color: #edf2f7;
+        border-top: 2px solid #757f94;
+        border-left: 2px solid #757f94;
+        border-right: 2px solid #1d2129;
+        border-bottom: 2px solid #1d2129;
+        border-radius: 0px;
+        padding: 2px 6px;
+        min-height: 20px;
+        box-shadow: none;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 7.9pt;
+    }}
+    button label {{
+        color: #edf2f7;
+    }}
+    button:hover {{
+        background-color: #535c6e;
+    }}
+    button:active, button:checked {{
+        background-color: #262b35;
+        border-top: 2px solid #161920;
+        border-left: 2px solid #161920;
+        border-right: 2px solid #6d768a;
+        border-bottom: 2px solid #6d768a;
+    }}
+    button.sw-active {{
+        background-color: #1e4d3e;
+        color: #68f7c4;
+        border-top: 2px solid #112b22;
+        border-left: 2px solid #112b22;
+        border-right: 2px solid #4fb393;
+        border-bottom: 2px solid #4fb393;
+    }}
+    button.sw-active label {{
+        color: #68f7c4;
+    }}
+    button.btn-amber {{
+        background-color: #694b1c;
+        color: #ffe2ad;
+        border-top: 2px solid #b0843c;
+        border-left: 2px solid #b0843c;
+        border-right: 2px solid #2e1f08;
+        border-bottom: 2px solid #2e1f08;
+    }}
+    button.btn-amber label {{
+        color: #ffe2ad;
+    }}
+    button.btn-trace {{
+        background-color: #1c5346;
+        color: #82ffe2;
+        border-top: 2px solid #56cca9;
+        border-left: 2px solid #56cca9;
+        border-right: 2px solid #0b261f;
+        border-bottom: 2px solid #0b261f;
+    }}
+    button.btn-trace label {{
+        color: #82ffe2;
+    }}
+    button.btn-stop {{
+        background-color: #872323;
+        color: #ffe0e0;
+        border-top: 2px solid #cf6363;
+        border-left: 2px solid #cf6363;
+        border-right: 2px solid #380b0b;
+        border-bottom: 2px solid #380b0b;
+    }}
+    button.btn-stop label {{
+        color: #ffffff;
+    }}
+    combobox button.combo {{
+        background-color: #1f252e;
+        color: #d8f8ee;
+        border-top: 2px solid #12151b;
+        border-left: 2px solid #12151b;
+        border-right: 2px solid #626b7f;
+        border-bottom: 2px solid #626b7f;
+        padding: 2px 5px;
+    }}
+    combobox button.combo label, combobox cellview {{
+        color: #d8f8ee;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8pt;
+    }}
+    menu {{
+        background-color: #2b303b;
+        color: #edf2f7;
+        border: 1px solid #6c758a;
+    }}
+    menuitem {{
+        color: #edf2f7;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8pt;
+        padding: 3px 8px;
+    }}
+    menuitem:hover {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    treeview.greenbar {{
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 7.9pt;
+        color: #122116;
+        background-color: #f4faf2;
+    }}
+    treeview.greenbar:selected {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    treeview.greenbar header button {{
+        background-color: #34443a;
+        color: #daf5de;
+        border-top: 1px solid #647d6c;
+        border-left: 1px solid #647d6c;
+        border-right: 1px solid #1b241e;
+        border-bottom: 1px solid #1b241e;
+        padding: 2px 5px;
+        font-size: 7.6pt;
+    }}
+    treeview.greenbar header button label {{
+        color: #daf5de;
+    }}
+    textview.bench-console, textview.bench-console text {{
+        background-color: #0b1416;
+        color: #6af7d6;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8.2pt;
+    }}
+    .cde-status {{
+        background-color: {chrome};
+        color: #101216;
+        padding: 2px 8px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 7.9pt;
+    }}
+    """
+    return css.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Formatting, Spherical Great-Circle Arc Math & IP Geolocation Engine
+# ---------------------------------------------------------------------------
+def fmt_bits_rate(bps_bits: float) -> str:
+    if bps_bits >= 1_000_000_000.0:
+        return f"{bps_bits / 1_000_000_000.0:5.2f} Gbps"
+    if bps_bits >= 1_000_000.0:
+        return f"{bps_bits / 1_000_000.0:5.2f} Mbps"
+    if bps_bits >= 1_000.0:
+        return f"{bps_bits / 1_000.0:5.1f} Kbps"
+    return f"{bps_bits:5.0f} bps"
+
+
+def fmt_bits_short(bps_bits: float) -> str:
+    if bps_bits >= 1_000_000.0:
+        return f"{bps_bits / 1_000_000.0:.2f}M"
+    if bps_bits >= 1_000.0:
+        return f"{bps_bits / 1_000.0:.1f}K"
+    return f"{int(bps_bits)}b"
+
+
+def fmt_bytes_gib(nbytes: float) -> str:
+    if nbytes >= 1024.0 ** 3:
+        return f"{nbytes / (1024.0 ** 3):.2f} GiB"
+    if nbytes >= 1024.0 ** 2:
+        return f"{nbytes / (1024.0 ** 2):.1f} MiB"
+    if nbytes >= 1024.0:
+        return f"{nbytes / 1024.0:.0f} KiB"
+    return f"{int(nbytes)} B"
+
+
+def choose_throughput_scale(max_bits_per_sec: float) -> tuple[float, str, list[tuple[float, str, bool]]]:
+    """Return (ceiling_bps, unit_label, dial_marks) for auto-ranging Kbps / Mbps dials."""
+    tiers = [
+        (100_000.0, "Kbps (0-100K)", [(0.0, "0", False), (0.2, "20", False), (0.4, "40", False), (0.6, "60", False), (0.8, "80", True), (1.0, "100", True)]),
+        (1_000_000.0, "Kbps (0-1000K)", [(0.0, "0", False), (0.2, "200", False), (0.4, "400", False), (0.6, "600", False), (0.8, "800", True), (1.0, "1M", True)]),
+        (10_000_000.0, "Mbps (0-10M)", [(0.0, "0", False), (0.2, "2", False), (0.4, "4", False), (0.6, "6", False), (0.8, "8", True), (1.0, "10", True)]),
+        (100_000_000.0, "Mbps (0-100M)", [(0.0, "0", False), (0.2, "20", False), (0.4, "40", False), (0.6, "60", False), (0.8, "80", True), (1.0, "100", True)]),
+        (1_000_000_000.0, "Mbps (0-1G)", [(0.0, "0", False), (0.2, "200", False), (0.4, "400", False), (0.6, "600", False), (0.8, "800", True), (1.0, "1G", True)]),
+    ]
+    for ceil_bps, ulbl, marks in tiers:
+        if max_bits_per_sec <= ceil_bps * 0.92:
+            return ceil_bps, ulbl, marks
+    return tiers[-1]
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r_earth = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp * 0.5) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl * 0.5) ** 2
+    return 2.0 * r_earth * math.asin(min(1.0, math.sqrt(max(0.0, a))))
+
+
+def great_circle_segments(
+    lat1: float, lon1: float, lat2: float, lon2: float, steps: int = 48
+) -> list[list[tuple[float, float]]]:
+    """
+    Compute spherical great-circle path from (lat1, lon1) to (lat2, lon2) as a list
+    of (lon, lat) polyline segments split cleanly across the ±180° antimeridian.
+    """
+    phi1, lam1 = math.radians(lat1), math.radians(lon1)
+    phi2, lam2 = math.radians(lat2), math.radians(lon2)
+
+    def to_xyz(p: float, l: float) -> tuple[float, float, float]:
+        cp = math.cos(p)
+        return cp * math.cos(l), cp * math.sin(l), math.sin(p)
+
+    v1 = to_xyz(phi1, lam1)
+    v2 = to_xyz(phi2, lam2)
+    dot = max(-1.0, min(1.0, v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2]))
+    omega = math.acos(dot)
+
+    raw_pts: list[tuple[float, float]] = []
+    if omega < 1e-5:
+        return [[(lon1, lat1), (lon2, lat2)]]
+
+    sin_om = math.sin(omega)
+    for i in range(steps + 1):
+        f = i / float(steps)
+        if abs(sin_om) < 1e-6:
+            x = (1.0 - f) * v1[0] + f * v2[0]
+            y = (1.0 - f) * v1[1] + f * v2[1]
+            z = (1.0 - f) * v1[2] + f * v2[2]
+            norm = math.hypot(math.hypot(x, y), z) or 1.0
+            x, y, z = x / norm, y / norm, z / norm
+        else:
+            a = math.sin((1.0 - f) * omega) / sin_om
+            b = math.sin(f * omega) / sin_om
+            x = a * v1[0] + b * v2[0]
+            y = a * v1[1] + b * v2[1]
+            z = a * v1[2] + b * v2[2]
+        lat = math.degrees(math.atan2(z, math.hypot(x, y)))
+        lon = math.degrees(math.atan2(y, x))
+        raw_pts.append((lon, lat))
+
+    # Split polyline cleanly whenever longitude jumps across ±180° dateline
+    segments: list[list[tuple[float, float]]] = []
+    cur: list[tuple[float, float]] = [raw_pts[0]]
+    for prev, nxt in zip(raw_pts, raw_pts[1:]):
+        dlon = nxt[0] - prev[0]
+        if abs(dlon) > 180.0:
+            if prev[0] > 0 and nxt[0] < 0:
+                rem = 180.0 - prev[0]
+                span = rem + (nxt[0] + 180.0)
+                t = rem / span if span > 1e-6 else 0.5
+                mid_lat = prev[1] + t * (nxt[1] - prev[1])
+                cur.append((180.0, mid_lat))
+                segments.append(cur)
+                cur = [(-180.0, mid_lat), nxt]
+            else:
+                rem = prev[0] + 180.0
+                span = rem + (180.0 - nxt[0])
+                t = rem / span if span > 1e-6 else 0.5
+                mid_lat = prev[1] + t * (nxt[1] - prev[1])
+                cur.append((-180.0, mid_lat))
+                segments.append(cur)
+                cur = [(180.0, mid_lat), nxt]
+        else:
+            cur.append(nxt)
+    if len(cur) >= 2:
+        segments.append(cur)
+    return segments
+
+
+def is_private_or_local_ip(ip: str) -> bool:
+    try:
+        packed = socket.inet_aton(ip)
+        b0, b1, _, _ = packed
+        if b0 in (0, 10, 127):
+            return True
+        if b0 == 169 and b1 == 254:
+            return True
+        if b0 == 172 and 16 <= b1 <= 31:
+            return True
+        if b0 == 192 and b1 == 168:
+            return True
+        if b0 == 100 and 64 <= b1 <= 127:
+            return True
+    except OSError:
+        if ip.startswith(("fe80:", "fc", "fd", "::1")):
+            return True
+    return False
+
+
+# Curated well-known Anycast / Science / Ham / Backbone Geo Seeds (works 100% offline too)
+SEED_GEO_DB: dict[str, dict] = {
+    "1.1.1.1": {"lat": 37.7749, "lon": -122.4194, "city": "San Francisco", "cc": "US", "isp": "Cloudflare", "asn": "AS13335 Cloudflare"},
+    "1.0.0.1": {"lat": 37.7749, "lon": -122.4194, "city": "San Francisco", "cc": "US", "isp": "Cloudflare", "asn": "AS13335 Cloudflare"},
+    "8.8.8.8": {"lat": 37.3861, "lon": -122.0839, "city": "Mountain View", "cc": "US", "isp": "Google", "asn": "AS15169 Google"},
+    "8.8.4.4": {"lat": 37.3861, "lon": -122.0839, "city": "Mountain View", "cc": "US", "isp": "Google", "asn": "AS15169 Google"},
+    "9.9.9.9": {"lat": 37.8715, "lon": -122.2730, "city": "Berkeley", "cc": "US", "isp": "Quad9", "asn": "AS19281 Quad9"},
+    "208.67.222.222": {"lat": 37.7749, "lon": -122.4194, "city": "San Francisco", "cc": "US", "isp": "Cisco OpenDNS", "asn": "AS36692 OpenDNS"},
+    "140.82.112.3": {"lat": 39.0438, "lon": -77.4874, "city": "Ashburn", "cc": "US", "isp": "GitHub", "asn": "AS36459 GitHub"},
+    "140.82.113.4": {"lat": 39.0438, "lon": -77.4874, "city": "Ashburn", "cc": "US", "isp": "GitHub", "asn": "AS36459 GitHub"},
+    "50.116.41.179": {"lat": 42.3601, "lon": -71.0589, "city": "Boston", "cc": "US", "isp": "Linode / PSKReporter", "asn": "AS63949 Akamai/Linode"},
+    "198.58.101.67": {"lat": 37.5485, "lon": -121.9886, "city": "Fremont", "cc": "US", "isp": "KiwiSDR Directory", "asn": "AS63949 Linode"},
+    "52.200.84.139": {"lat": 41.6979, "lon": -72.7237, "city": "Newington, CT", "cc": "US", "isp": "ARRL HQ", "asn": "AS14618 AWS/ARRL"},
+    "140.90.33.21": {"lat": 38.9907, "lon": -77.0261, "city": "Silver Spring, MD", "cc": "US", "isp": "NOAA", "asn": "AS13867 NOAA"},
+}
+
+OFFLINE_IXP_ANCHORS = [
+    (40.7608, -111.8910, "Salt Lake IX", "US", "Regional Backbone"),
+    (39.7392, -104.9903, "Denver IX", "US", "Core Transit"),
+    (47.6062, -122.3321, "Seattle SIX", "US", "Pacific NW IX"),
+    (37.3382, -121.8863, "San Jose Equinix", "US", "Tier-1 IX"),
+    (41.8781, -87.6298, "Chicago IX", "US", "Midwest Core"),
+    (39.0438, -77.4874, "Ashburn MAE-East", "US", "East Coast IX"),
+    (51.5074, -0.1278, "London LINX", "GB", "Transatlantic IX"),
+    (50.1109, 8.6821, "Frankfurt DE-CIX", "DE", "European Core"),
+    (35.6762, 139.6503, "Tokyo JPIX", "JP", "Transpacific IX"),
+]
+
+
+class IpGeoResolver:
+    """Thread-safe IP geolocation resolver backed by ~/.cache/dtnet/ipgeo.json + ip-api.com/batch."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cache: dict[str, dict] = dict(SEED_GEO_DB)
+        self._load_disk_cache()
+
+    def _load_disk_cache(self):
+        try:
+            if IPGEO_CACHE_FILE.is_file():
+                data = json.loads(IPGEO_CACHE_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    self._cache.update(data)
+        except Exception:
+            pass
+
+    def _save_disk_cache(self):
+        try:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            IPGEO_CACHE_FILE.write_text(json.dumps(self._cache, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def resolve_many(self, ips: list[str]) -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        to_query: list[str] = []
+
+        with self._lock:
+            for ip in ips:
+                if not ip or ip == "*":
+                    continue
+                if is_private_or_local_ip(ip):
+                    out[ip] = {
+                        "lat": HOME_QTH_LAT + 0.04,
+                        "lon": HOME_QTH_LON + 0.05,
+                        "city": "Local LAN / Gateway",
+                        "cc": "LAN",
+                        "isp": "RFC1918 Local Hop",
+                        "asn": "LOCAL",
+                    }
+                elif ip in self._cache:
+                    out[ip] = self._cache[ip]
+                else:
+                    to_query.append(ip)
+
+        if to_query:
+            unique_q = list(dict.fromkeys(to_query))[:90]
+            payload = json.dumps(
+                [{"query": q, "fields": "status,query,lat,lon,city,region,countryCode,isp,as"} for q in unique_q]
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                "http://ip-api.com/batch",
+                data=payload,
+                headers={"Content-Type": "application/json", "User-Agent": UA},
+                method="POST",
+            )
+            fetched: dict[str, dict] = {}
+            try:
+                with urllib.request.urlopen(req, timeout=3.2) as resp:
+                    arr = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    if isinstance(arr, list):
+                        for item in arr:
+                            if isinstance(item, dict) and item.get("status") == "success":
+                                qip = str(item.get("query", ""))
+                                city = item.get("city") or item.get("region") or "Transit"
+                                cc = item.get("countryCode") or ""
+                                asn = item.get("as") or item.get("isp") or "ISP"
+                                fetched[qip] = {
+                                    "lat": float(item.get("lat", HOME_QTH_LAT)),
+                                    "lon": float(item.get("lon", HOME_QTH_LON)),
+                                    "city": str(city),
+                                    "cc": str(cc),
+                                    "isp": str(item.get("isp", "")),
+                                    "asn": str(asn)[:34],
+                                }
+            except Exception:
+                pass
+
+            if fetched:
+                with self._lock:
+                    self._cache.update(fetched)
+                    self._save_disk_cache()
+                out.update(fetched)
+
+            # Heuristic fallback if offline / rate-limited so hops still plot cleanly
+            for qip in unique_q:
+                if qip not in out:
+                    try:
+                        b0 = int(qip.split(".")[0])
+                    except Exception:
+                        b0 = sum(ord(c) for c in qip)
+                    anchor = OFFLINE_IXP_ANCHORS[b0 % len(OFFLINE_IXP_ANCHORS)]
+                    out[qip] = {
+                        "lat": anchor[0],
+                        "lon": anchor[1],
+                        "city": f"{anchor[2]} (est.)",
+                        "cc": anchor[3],
+                        "isp": anchor[4],
+                        "asn": "Offline Geo Est.",
+                    }
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Pure-Python /proc/net/* & /sys/class/net/* Linux Network Telemetry Engine
+# ---------------------------------------------------------------------------
+TCP_STATES = {
+    "01": "ESTABLISHED",
+    "02": "SYN_SENT",
+    "03": "SYN_RECV",
+    "04": "FIN_WAIT1",
+    "05": "FIN_WAIT2",
+    "06": "TIME_WAIT",
+    "07": "CLOSE",
+    "08": "CLOSE_WAIT",
+    "09": "LAST_ACK",
+    "0A": "LISTEN",
+    "0B": "CLOSING",
+}
+
+WELL_KNOWN_PORTS = {
+    20: "ftp-data", 21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp",
+    53: "domain", 67: "dhcp-s", 68: "dhcp-c", 69: "tftp", 80: "http",
+    110: "pop3", 111: "rpcbind", 123: "ntp", 137: "netbios", 139: "smb",
+    143: "imap", 161: "snmp", 389: "ldap", 443: "https", 445: "microsoft-ds",
+    465: "smtps", 514: "syslog", 587: "submission", 631: "ipp-cups",
+    853: "dns-tls", 993: "imaps", 995: "pop3s", 1080: "socks", 1883: "mqtt",
+    2049: "nfs", 3000: "dev-http", 3306: "mysql", 3389: "rdp", 4532: "rigctld",
+    5000: "upnp/app", 5353: "mdns", 5432: "postgres", 5900: "vnc",
+    6379: "redis", 6667: "irc", 6697: "ircs", 7373: "hamlib", 8000: "http-alt",
+    8073: "kiwisdr", 8080: "http-proxy", 8443: "https-alt", 9090: "prom/ws",
+}
+
+OUI_HINTS = {
+    "00:50:56": "VMware", "00:0C:29": "VMware", "52:54:00": "QEMU/KVM",
+    "08:00:27": "VirtualBox", "B8:27:EB": "RaspberryPi", "DC:A6:32": "RaspberryPi",
+    "E4:5F:01": "RaspberryPi", "D8:3A:DD": "RaspberryPi", "00:1B:21": "Intel",
+    "A4:C3:F0": "Intel", "3C:97:0E": "ThinkPad/Wistron", "00:13:E8": "Intel",
+    "F0:9F:C2": "Ubiquiti", "78:8A:20": "Ubiquiti", "44:D9:E7": "Ubiquiti",
+    "C4:AD:34": "MikroTik", "DC:2C:6E": "MikroTik", "00:1A:2B": "Ayecom",
+}
+
+
+def parse_proc_net_dev_text(text: str) -> dict[str, dict[str, int]]:
+    """Parse /proc/net/dev contents into per-interface counter dicts."""
+    out: dict[str, dict[str, int]] = {}
+    for ln in text.splitlines()[2:]:
+        if ":" not in ln:
+            continue
+        iface_part, stats_part = ln.split(":", 1)
+        iface = iface_part.strip()
+        cols = stats_part.split()
+        if len(cols) < 16:
+            continue
+        out[iface] = {
+            "rx_bytes": int(cols[0]),
+            "rx_packets": int(cols[1]),
+            "rx_errs": int(cols[2]),
+            "rx_drop": int(cols[3]),
+            "tx_bytes": int(cols[8]),
+            "tx_packets": int(cols[9]),
+            "tx_errs": int(cols[10]),
+            "tx_drop": int(cols[11]),
+            "tx_colls": int(cols[13]),
+        }
+    return out
+
+
+def parse_proc_net_wireless_text(text: str) -> dict[str, dict[str, float]]:
+    """Parse /proc/net/wireless for link quality (0..70 -> %) and signal level (dBm)."""
+    out: dict[str, dict[str, float]] = {}
+    for ln in text.splitlines()[2:]:
+        if ":" not in ln:
+            continue
+        iface_part, rest = ln.split(":", 1)
+        iface = iface_part.strip()
+        cols = rest.split()
+        if len(cols) < 4:
+            continue
+        try:
+            link_raw = float(cols[1].rstrip("."))
+            level_dbm = float(cols[2].rstrip("."))
+            noise_dbm = float(cols[3].rstrip("."))
+            if level_dbm > 0:
+                level_dbm -= 256.0
+            if noise_dbm > 0:
+                noise_dbm -= 256.0
+            qual_pct = max(0.0, min(100.0, (link_raw / 70.0) * 100.0 if link_raw <= 70.0 else link_raw))
+            out[iface] = {
+                "link_raw": link_raw,
+                "qual_pct": qual_pct,
+                "level_dbm": level_dbm,
+                "noise_dbm": noise_dbm,
+            }
+        except ValueError:
+            continue
+    return out
+
+
+def decode_hex_addr_port(hex_pair: str, is_ipv6: bool = False) -> tuple[str, int]:
+    """Decode /proc/net/tcp or tcp6 'HEXADDR:HEXPORT' into human-readable (ip_str, port)."""
+    addr_hex, port_hex = hex_pair.strip().split(":")
+    port = int(port_hex, 16)
+    if not is_ipv6:
+        val = int(addr_hex, 16)
+        raw4 = struct.pack("<I", val)
+        return socket.inet_ntoa(raw4), port
+    # Linux /proc/net/tcp6 stores 4 x 32-bit words in host (little-endian) byte order
+    words = [int(addr_hex[i : i + 8], 16) for i in range(0, 32, 8)]
+    raw16 = struct.pack("<4I", *words)
+    ip6 = socket.inet_ntop(socket.AF_INET6, raw16)
+    return ip6, port
+
+
+def format_endpoint(ip: str, port: int, is_ipv6: bool) -> str:
+    p_str = "*" if port == 0 else str(port)
+    if is_ipv6:
+        return f"[{ip}]:{p_str}"
+    return f"{ip}:{p_str}"
+
+
+def port_service_name(port: int, proto: str = "tcp") -> str:
+    if port == 0:
+        return "-"
+    if port in WELL_KNOWN_PORTS:
+        return WELL_KNOWN_PORTS[port]
+    try:
+        return socket.getservbyport(port, "udp" if "udp" in proto.lower() else "tcp")
+    except OSError:
+        return "-"
+
+
+def parse_proc_net_sockets_text(text: str, proto_label: str, is_ipv6: bool = False) -> list[dict]:
+    """Parse /proc/net/{tcp,tcp6,udp,udp6} text into structured socket rows."""
+    rows: list[dict] = []
+    is_udp = proto_label.upper().startswith("UDP")
+    for ln in text.splitlines()[1:]:
+        cols = ln.split()
+        if len(cols) < 10 or ":" not in cols[1] or ":" not in cols[2]:
+            continue
+        try:
+            lip, lport = decode_hex_addr_port(cols[1], is_ipv6=is_ipv6)
+            rip, rport = decode_hex_addr_port(cols[2], is_ipv6=is_ipv6)
+            st_hex = cols[3].upper()
+            if is_udp:
+                if st_hex == "01":
+                    state = "ESTABLISHED"
+                elif st_hex == "07":
+                    state = "LISTEN" if lport > 0 else "UNCONN"
+                else:
+                    state = TCP_STATES.get(st_hex, f"0x{st_hex}")
+            else:
+                state = TCP_STATES.get(st_hex, f"0x{st_hex}")
+
+            q_parts = cols[4].split(":")
+            tx_q = int(q_parts[0], 16) if len(q_parts) == 2 else 0
+            rx_q = int(q_parts[1], 16) if len(q_parts) == 2 else 0
+            uid = int(cols[7])
+            inode = cols[9]
+            svc = port_service_name(lport if state == "LISTEN" or rport == 0 else rport, proto_label)
+            if svc == "-" and lport > 0:
+                svc = port_service_name(lport, proto_label)
+
+            rows.append({
+                "proto": proto_label,
+                "state": state,
+                "lip": lip,
+                "lport": lport,
+                "rip": rip,
+                "rport": rport,
+                "local": format_endpoint(lip, lport, is_ipv6),
+                "remote": format_endpoint(rip, rport, is_ipv6),
+                "service": svc,
+                "queue": f"{tx_q}:{rx_q}",
+                "uid": uid,
+                "inode": inode,
+                "proc": "-",
+            })
+        except Exception:
+            continue
+    return rows
+
+
+def scan_inode_to_process_map() -> dict[str, str]:
+    """Pure-Python /proc/[pid]/fd symlink scanner mapping socket inodes -> 'PID/comm'."""
+    inode_map: dict[str, str] = {}
+    try:
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit():
+                continue
+            pid = entry.name
+            fd_dir = f"/proc/{pid}/fd"
+            try:
+                fd_entries = os.scandir(fd_dir)
+            except OSError:
+                continue
+            comm = ""
+            with fd_entries:
+                for fde in fd_entries:
+                    try:
+                        target = os.readlink(fde.path)
+                    except OSError:
+                        continue
+                    if target.startswith("socket:[") and target.endswith("]"):
+                        ino = target[8:-1]
+                        if not comm:
+                            try:
+                                comm = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8", errors="replace").strip()
+                            except OSError:
+                                comm = "proc"
+                        inode_map[ino] = f"{pid}/{comm}"
+    except OSError:
+        pass
+    return inode_map
+
+
+def parse_proc_net_arp_text(text: str) -> list[dict[str, str]]:
+    """Parse /proc/net/arp into neighbor dicts."""
+    out: list[dict[str, str]] = []
+    for ln in text.splitlines()[1:]:
+        cols = ln.split()
+        if len(cols) < 6:
+            continue
+        ip_addr, _hw_type, flags, mac, _mask, dev = cols[:6]
+        mac_up = mac.upper()
+        if mac_up == "00:00:00:00:00:00" and flags == "0x0":
+            continue
+        oui = mac_up[:8]
+        vendor = OUI_HINTS.get(oui, "")
+        out.append({
+            "ip": ip_addr,
+            "flags": flags,
+            "mac": mac_up,
+            "dev": dev,
+            "vendor": vendor,
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Traceroute / Tracepath / Rootless `ping -t <ttl>` Parser Helpers
+# ---------------------------------------------------------------------------
+IP4_RE = re.compile(r"\b((?:\d{1,3}\.){3}\d{1,3})\b")
+RTT_MS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*ms", re.IGNORECASE)
+PING_TTL_FROM_RE = re.compile(r"[Ff]rom\s+((?:\d{1,3}\.){3}\d{1,3}).*?(?:exceeded|ttl)", re.IGNORECASE)
+PING_REPLY_RE = re.compile(r"bytes\s+from\s+((?:\d{1,3}\.){3}\d{1,3}).*?time[=<](\d+(?:\.\d+)?)\s*ms", re.IGNORECASE)
+
+
+def parse_traceroute_line(line: str) -> tuple[int, str, float | None] | None:
+    """
+    Parse a single output line from `traceroute -n` or `tracepath -n`.
+    Returns (hop_num, ip_or_star, avg_rtt_ms_or_None) or None if header/noise.
+    """
+    s = line.strip()
+    if not s or s.lower().startswith(("traceroute to", "resume:", "too many hops")):
+        return None
+    m_hop = re.match(r"^(\d+)\s*:?\s+(.*)$", s)
+    if not m_hop:
+        return None
+    hop_num = int(m_hop.group(1))
+    rest = m_hop.group(2).strip()
+    if rest.startswith("no reply") or re.fullmatch(r"[\*\s!NHXP]+", rest):
+        return hop_num, "*", None
+    m_ip = IP4_RE.search(rest)
+    if not m_ip:
+        return None
+    ip_addr = m_ip.group(1)
+    rtts = [float(x) for x in RTT_MS_RE.findall(rest)]
+    avg_rtt = sum(rtts) / len(rtts) if rtts else None
+    return hop_num, ip_addr, avg_rtt
+
+
+def parse_ping_ttl_output(output: str, elapsed_ms: float) -> tuple[str, float | None, bool]:
+    """
+    Parse output from `ping -n -t <ttl> -c 1 -W 1 <target>`.
+    Returns (hop_ip_or_star, rtt_ms, reached_destination).
+    """
+    m_rep = PING_REPLY_RE.search(output)
+    if m_rep:
+        return m_rep.group(1), float(m_rep.group(2)), True
+    m_ttl = PING_TTL_FROM_RE.search(output)
+    if m_ttl:
+        m_ms = RTT_MS_RE.search(output)
+        rtt = float(m_ms.group(1)) if m_ms else max(0.2, elapsed_ms)
+        return m_ttl.group(1), rtt, False
+    return "*", None, False
+
+
+# ---------------------------------------------------------------------------
+# Live Workstation Network Telemetry Sampler
+# ---------------------------------------------------------------------------
+class NetTelemetrySampler:
+    def __init__(self):
+        self.selected_iface = "ALL"
+        self._prev_dev: dict[str, dict[str, int]] = {}
+        self._prev_ts = 0.0
+        self._addr_cache_ts = 0.0
+        self._iface_addrs: dict[str, tuple[str, str]] = {}
+
+        # Instantaneous rates (bits/sec & packets/sec)
+        self.rx_bps = 0.0
+        self.tx_bps = 0.0
+        self.rx_pps = 0.0
+        self.tx_pps = 0.0
+        self.rx_peak_bps = 0.0
+        self.tx_peak_bps = 0.0
+        self.err_delta = 0
+
+        # History deques (bits/sec)
+        self.rx_hist: collections.deque[float] = collections.deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN)
+        self.tx_hist: collections.deque[float] = collections.deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN)
+
+        # Active interface metadata
+        self.nic_names: list[str] = ["lo"]
+        self.link_up = True
+        self.mac_addr = "00:00:00:00:00:00"
+        self.ipv4_addr = "127.0.0.1"
+        self.ipv6_addr = "::1"
+        self.speed_str = "LOOPBACK"
+        self.mtu = 65536
+        self.tot_rx_bytes = 0
+        self.tot_tx_bytes = 0
+        self.tot_errs = 0
+        self.tot_drops = 0
+
+        # Wi-Fi RF telemetry (/proc/net/wireless)
+        self.wifi_present = False
+        self.wifi_iface = ""
+        self.wifi_dbm = -100.0
+        self.wifi_qual_pct = 0.0
+        self.wifi_noise_dbm = -95.0
+
+        # Live RTT telemetry (updated by background ping probe)
+        self.rtt_ms: float | None = None
+        self.rtt_peak_ms = 0.0
+        self.rtt_jitter_ms = 0.0
+        self.rtt_loss_pct = 0.0
+        self.rtt_target = "1.1.1.1"
+
+    def reset_peaks(self):
+        self.rx_peak_bps = self.rx_bps
+        self.tx_peak_bps = self.tx_bps
+        self.rtt_peak_ms = self.rtt_ms or 0.0
+
+    def _refresh_ip_addrs(self):
+        now = time.monotonic()
+        if now - self._addr_cache_ts < 4.0:
+            return
+        self._addr_cache_ts = now
+        addrs: dict[str, tuple[str, str]] = {}
+
+        # Pure-Python IPv4 ioctl SIOCGIFADDR fallback + /proc/net/if_inet6
+        v4_map: dict[str, str] = {}
+        v6_map: dict[str, str] = {}
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            for nic in self.nic_names:
+                try:
+                    ifreq = struct.pack("256s", nic[:15].encode("utf-8"))
+                    res = fcntl.ioctl(s.fileno(), 0x8915, ifreq)  # SIOCGIFADDR
+                    v4_map[nic] = socket.inet_ntoa(res[20:24])
+                except OSError:
+                    continue
+            s.close()
+        except OSError:
+            pass
+
+        try:
+            if6 = Path("/proc/net/if_inet6")
+            if if6.is_file():
+                for ln in if6.read_text(encoding="utf-8", errors="replace").splitlines():
+                    parts = ln.split()
+                    if len(parts) >= 6:
+                        raw_hex, nic = parts[0], parts[5]
+                        if len(raw_hex) == 32 and nic not in v6_map:
+                            b16 = bytes.fromhex(raw_hex)
+                            v6_map[nic] = socket.inet_ntop(socket.AF_INET6, b16)
+        except Exception:
+            pass
+
+        # Enrich with `ip -o addr` if present (adds CIDR prefix)
+        if shutil.which("ip"):
+            try:
+                out = subprocess.check_output(["ip", "-o", "addr", "show"], text=True, stderr=subprocess.DEVNULL, timeout=0.8)
+                for ln in out.splitlines():
+                    parts = ln.split()
+                    if len(parts) >= 4:
+                        nic = parts[1]
+                        fam = parts[2]
+                        cidr = parts[3]
+                        if fam == "inet" and nic not in v4_map:
+                            v4_map[nic] = cidr.split("/")[0]
+                        elif fam == "inet":
+                            v4_map[nic] = cidr
+                        elif fam == "inet6" and nic not in v6_map:
+                            v6_map[nic] = cidr.split("/")[0]
+            except Exception:
+                pass
+
+        for nic in self.nic_names:
+            addrs[nic] = (v4_map.get(nic, "-"), v6_map.get(nic, "-"))
+        self._iface_addrs = addrs
+
+    def sample(self):
+        now = time.monotonic()
+        try:
+            dev_txt = Path("/proc/net/dev").read_text(encoding="utf-8", errors="replace")
+            cur_dev = parse_proc_net_dev_text(dev_txt)
+        except OSError:
+            cur_dev = {}
+
+        try:
+            sys_nics = sorted(p.name for p in Path("/sys/class/net").iterdir())
+        except OSError:
+            sys_nics = sorted(cur_dev.keys()) or ["lo"]
+        if sys_nics:
+            self.nic_names = sys_nics
+
+        self._refresh_ip_addrs()
+
+        # Choose target NICs for throughput aggregation
+        if self.selected_iface == "ALL":
+            non_lo = [n for n in cur_dev if n != "lo"]
+            active_set = non_lo if non_lo else list(cur_dev.keys())
+        elif self.selected_iface in cur_dev:
+            active_set = [self.selected_iface]
+        else:
+            active_set = list(cur_dev.keys())
+
+        dt = now - self._prev_ts if self._prev_ts > 0 else 0.0
+        if dt > 0.05 and self._prev_dev:
+            d_rxb = sum(max(0, cur_dev[n]["rx_bytes"] - self._prev_dev.get(n, cur_dev[n])["rx_bytes"]) for n in active_set)
+            d_txb = sum(max(0, cur_dev[n]["tx_bytes"] - self._prev_dev.get(n, cur_dev[n])["tx_bytes"]) for n in active_set)
+            d_rxp = sum(max(0, cur_dev[n]["rx_packets"] - self._prev_dev.get(n, cur_dev[n])["rx_packets"]) for n in active_set)
+            d_txp = sum(max(0, cur_dev[n]["tx_packets"] - self._prev_dev.get(n, cur_dev[n])["tx_packets"]) for n in active_set)
+            d_err = sum(
+                max(0, (cur_dev[n]["rx_errs"] + cur_dev[n]["tx_errs"] + cur_dev[n]["rx_drop"] + cur_dev[n]["tx_drop"])
+                    - (self._prev_dev.get(n, cur_dev[n])["rx_errs"] + self._prev_dev.get(n, cur_dev[n])["tx_errs"]
+                       + self._prev_dev.get(n, cur_dev[n])["rx_drop"] + self._prev_dev.get(n, cur_dev[n])["tx_drop"]))
+                for n in active_set
+            )
+            self.rx_bps = (d_rxb * 8.0) / dt
+            self.tx_bps = (d_txb * 8.0) / dt
+            self.rx_pps = d_rxp / dt
+            self.tx_pps = d_txp / dt
+            self.err_delta = d_err
+            self.rx_peak_bps = max(self.rx_peak_bps * 0.996, self.rx_bps)
+            self.tx_peak_bps = max(self.tx_peak_bps * 0.996, self.tx_bps)
+            self.rx_hist.append(self.rx_bps)
+            self.tx_hist.append(self.tx_bps)
+
+        self._prev_dev = cur_dev
+        self._prev_ts = now
+
+        # Totals & NIC hardware properties
+        self.tot_rx_bytes = sum(cur_dev[n]["rx_bytes"] for n in active_set)
+        self.tot_tx_bytes = sum(cur_dev[n]["tx_bytes"] for n in active_set)
+        self.tot_errs = sum(cur_dev[n]["rx_errs"] + cur_dev[n]["tx_errs"] for n in active_set)
+        self.tot_drops = sum(cur_dev[n]["rx_drop"] + cur_dev[n]["tx_drop"] for n in active_set)
+
+        primary_nic = self.selected_iface if self.selected_iface != "ALL" else self._pick_primary_nic()
+        self._read_nic_sysfs(primary_nic)
+
+        # Read /proc/net/wireless
+        self.wifi_present = False
+        try:
+            w_txt = Path("/proc/net/wireless").read_text(encoding="utf-8", errors="replace")
+            w_map = parse_proc_net_wireless_text(w_txt)
+            if w_map:
+                wnic = primary_nic if primary_nic in w_map else next(iter(w_map))
+                winfo = w_map[wnic]
+                self.wifi_present = True
+                self.wifi_iface = wnic
+                self.wifi_dbm = winfo["level_dbm"]
+                self.wifi_qual_pct = winfo["qual_pct"]
+                self.wifi_noise_dbm = winfo["noise_dbm"]
+        except OSError:
+            pass
+
+    def _pick_primary_nic(self) -> str:
+        for n in self.nic_names:
+            if n == "lo":
+                continue
+            try:
+                st = Path(f"/sys/class/net/{n}/operstate").read_text().strip().lower()
+                if st == "up":
+                    return n
+            except OSError:
+                continue
+        for n in self.nic_names:
+            if n != "lo":
+                return n
+        return self.nic_names[0] if self.nic_names else "lo"
+
+    def _read_nic_sysfs(self, nic: str):
+        base = Path(f"/sys/class/net/{nic}")
+        try:
+            oper = (base / "operstate").read_text().strip().lower()
+            flags_hex = (base / "flags").read_text().strip()
+            flags = int(flags_hex, 16)
+            self.link_up = oper in ("up", "unknown") and bool(flags & 0x1)
+        except Exception:
+            self.link_up = True
+
+        try:
+            self.mac_addr = (base / "address").read_text().strip().upper()
+        except OSError:
+            self.mac_addr = "00:00:00:00:00:00"
+
+        try:
+            self.mtu = int((base / "mtu").read_text().strip())
+        except Exception:
+            self.mtu = 1500
+
+        if nic == "lo":
+            self.speed_str = "LOOPBACK"
+        elif (base / "wireless").exists():
+            self.speed_str = "802.11 RF"
+        else:
+            try:
+                spd = int((base / "speed").read_text().strip())
+                self.speed_str = f"{spd} Mb/s" if spd > 0 else "AUTO"
+            except Exception:
+                self.speed_str = "VIRTUAL" if not self.link_up else "LINK UP"
+
+        v4, v6 = self._iface_addrs.get(nic, ("-", "-"))
+        if os.environ.get("DT_SCREENSHOT_DEMO") == "1":
+            self.mac_addr = "02:00:5E:10:00:01"
+            self.ipv4_addr = "192.0.2.42/24"
+            self.ipv6_addr = "2001:db8::42"
+        else:
+            self.ipv4_addr = v4
+            self.ipv6_addr = v6
+
+    def detect_local_subnet(self) -> str:
+        for nic in self.nic_names:
+            if nic == "lo":
+                continue
+            v4, _ = self._iface_addrs.get(nic, ("-", "-"))
+            ip_only = v4.split("/")[0]
+            if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip_only) and not ip_only.startswith("127."):
+                octs = ip_only.split(".")
+                return f"{octs[0]}.{octs[1]}.{octs[2]}.0/24"
+        return "192.168.1.0/24"
+
+
+# ---------------------------------------------------------------------------
+# Cairo Vintage Analog Gauges, Phosphor Strip-Chart & World Radar Renderer
+# ---------------------------------------------------------------------------
+@dataclass
+class TraceHop:
+    hop: int
+    ip: str
+    rtt_ms: float | None
+    lat: float
+    lon: float
+    city: str
+    cc: str
+    asn: str
+    dist_km: float
+    has_geo: bool = True
+
+
+class NetCairoRenderer:
+    """Shared Cairo renderer for Top Analog Dials, Strip-Chart, World Radar & Self-Test."""
+
+    @staticmethod
+    def draw_screw(cr: cairo.Context, cx: float, cy: float, r: float, angle: float, brass: bool = True):
+        cr.new_sub_path()
+        cr.arc(cx + 0.6, cy + 0.6, r + 0.7, 0, 2 * math.pi)
+        cr.set_source_rgba(0.03, 0.04, 0.05, 0.75)
+        cr.fill()
+        pat = cairo.LinearGradient(cx - r, cy - r, cx + r, cy + r)
+        if brass:
+            pat.add_color_stop_rgb(0.0, 0.88, 0.74, 0.44)
+            pat.add_color_stop_rgb(1.0, 0.42, 0.32, 0.14)
+        else:
+            pat.add_color_stop_rgb(0.0, 0.76, 0.80, 0.86)
+            pat.add_color_stop_rgb(1.0, 0.28, 0.31, 0.38)
+        cr.new_sub_path()
+        cr.arc(cx, cy, r, 0, 2 * math.pi)
+        cr.set_source(pat)
+        cr.fill()
+        cr.set_line_width(max(1.0, r * 0.42))
+        cr.set_source_rgb(0.14, 0.15, 0.18)
+        cr.move_to(cx - (r * 0.72) * math.cos(angle), cy - (r * 0.72) * math.sin(angle))
+        cr.line_to(cx + (r * 0.72) * math.cos(angle), cy + (r * 0.72) * math.sin(angle))
+        cr.stroke()
+
+    @staticmethod
+    def draw_jewel_lamp(
+        cr: cairo.Context,
+        cx: float,
+        cy: float,
+        r: float,
+        rgb: tuple[float, float, float],
+        lit: bool,
+        label: str = "",
+        dark_face: bool = False,
+    ):
+        cr.new_sub_path()
+        cr.arc(cx, cy, r + 1.6, 0, 2 * math.pi)
+        cr.set_source_rgb(0.20, 0.22, 0.26)
+        cr.fill()
+        cr.new_sub_path()
+        cr.arc(cx, cy, r + 0.8, 0, 2 * math.pi)
+        cr.set_source_rgb(0.66, 0.70, 0.76)
+        cr.fill()
+
+        if lit:
+            glow = cairo.RadialGradient(cx, cy, r * 0.2, cx, cy, r * 2.3)
+            glow.add_color_stop_rgba(0.0, rgb[0], rgb[1], rgb[2], 0.48)
+            glow.add_color_stop_rgba(1.0, rgb[0], rgb[1], rgb[2], 0.0)
+            cr.arc(cx, cy, r * 2.3, 0, 2 * math.pi)
+            cr.set_source(glow)
+            cr.fill()
+
+            gem = cairo.RadialGradient(cx - r * 0.3, cy - r * 0.3, r * 0.1, cx, cy, r)
+            gem.add_color_stop_rgb(0.0, min(1.0, rgb[0] + 0.35), min(1.0, rgb[1] + 0.35), min(1.0, rgb[2] + 0.35))
+            gem.add_color_stop_rgb(0.7, rgb[0], rgb[1], rgb[2])
+            gem.add_color_stop_rgb(1.0, rgb[0] * 0.42, rgb[1] * 0.42, rgb[2] * 0.42)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.set_source(gem)
+            cr.fill()
+            cr.arc(cx - r * 0.3, cy - r * 0.3, r * 0.26, 0, 2 * math.pi)
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.75)
+            cr.fill()
+        else:
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.set_source_rgb(rgb[0] * 0.22, rgb[1] * 0.22, rgb[2] * 0.22)
+            cr.fill()
+
+        if label:
+            cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            cr.set_font_size(7.2)
+            if dark_face:
+                cr.set_source_rgb(0.72, 0.92, 0.80) if lit else cr.set_source_rgb(0.42, 0.54, 0.48)
+            else:
+                cr.set_source_rgb(0.16, 0.12, 0.08) if lit else cr.set_source_rgb(0.38, 0.32, 0.24)
+            cr.move_to(cx + r + 3.2, cy + 2.6)
+            cr.show_text(label)
+
+    @staticmethod
+    def draw_vfd_inset(
+        cr: cairo.Context, x: float, y: float, w: float, h: float, line1: str, line2: str, amber_vfd: bool = False
+    ):
+        cr.rectangle(x, y, w, h)
+        cr.set_source_rgb(0.09, 0.06, 0.03) if amber_vfd else cr.set_source_rgb(0.04, 0.08, 0.08)
+        cr.fill()
+
+        cr.set_line_width(1.2)
+        cr.set_source_rgb(0.01, 0.02, 0.02)
+        cr.move_to(x, y + h)
+        cr.line_to(x, y)
+        cr.line_to(x + w, y)
+        cr.stroke()
+        cr.set_source_rgb(0.36, 0.40, 0.48)
+        cr.move_to(x, y + h)
+        cr.line_to(x + w, y + h)
+        cr.line_to(x + w, y)
+        cr.stroke()
+
+        c_main = (1.00, 0.74, 0.24) if amber_vfd else (0.28, 0.98, 0.85)
+        c_sub = (0.88, 0.62, 0.22) if amber_vfd else (0.48, 0.88, 0.78)
+
+        cr.save()
+        cr.rectangle(x + 2, y + 1, w - 4, h - 2)
+        cr.clip()
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(9.6)
+        ext1 = cr.text_extents(line1)
+        tx1 = x + max(3.0, (w - ext1.width) * 0.5)
+        cr.set_source_rgba(c_main[0], c_main[1], c_main[2], 0.22)
+        cr.move_to(tx1 + 0.7, y + 11.8)
+        cr.show_text(line1)
+        cr.set_source_rgb(*c_main)
+        cr.move_to(tx1, y + 11.2)
+        cr.show_text(line1)
+
+        cr.set_font_size(7.7)
+        ext2 = cr.text_extents(line2)
+        tx2 = x + max(3.0, (w - ext2.width) * 0.5)
+        cr.set_source_rgb(*c_sub)
+        cr.move_to(tx2, y + h - 3.8)
+        cr.show_text(line2)
+        cr.restore()
+
+    @classmethod
+    def draw_analog_dial(
+        cls,
+        cr: cairo.Context,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+        title: str,
+        unit_lbl: str,
+        norm_val: float,
+        peak_norm: float | None,
+        marks: list[tuple[float, str, bool]],
+        red_span: tuple[float, float] | None,
+        dark_phosphor: bool,
+        vfd_l1: str,
+        vfd_l2: str,
+        lamps: list[tuple[str, tuple[float, float, float], bool]],
+        screw_seed: int = 0,
+    ):
+        bezel_pat = cairo.LinearGradient(x, y, x, y + h)
+        if dark_phosphor:
+            bezel_pat.add_color_stop_rgb(0.0, 0.29, 0.33, 0.39)
+            bezel_pat.add_color_stop_rgb(0.5, 0.19, 0.22, 0.27)
+            bezel_pat.add_color_stop_rgb(1.0, 0.12, 0.14, 0.18)
+        else:
+            bezel_pat.add_color_stop_rgb(0.0, 0.52, 0.46, 0.35)
+            bezel_pat.add_color_stop_rgb(0.5, 0.36, 0.32, 0.25)
+            bezel_pat.add_color_stop_rgb(1.0, 0.21, 0.19, 0.15)
+        cr.rectangle(x, y, w, h)
+        cr.set_source(bezel_pat)
+        cr.fill()
+
+        # Outer 3D Motif bevel
+        cr.set_line_width(1.5)
+        cr.set_source_rgb(0.50, 0.56, 0.65) if dark_phosphor else cr.set_source_rgb(0.68, 0.64, 0.52)
+        cr.move_to(x + 0.8, y + h - 0.8)
+        cr.line_to(x + 0.8, y + 0.8)
+        cr.line_to(x + w - 0.8, y + 0.8)
+        cr.stroke()
+        cr.set_source_rgb(0.08, 0.09, 0.11)
+        cr.move_to(x + 0.8, y + h - 0.8)
+        cr.line_to(x + w - 0.8, y + h - 0.8)
+        cr.line_to(x + w - 0.8, y + 0.8)
+        cr.stroke()
+
+        # 4 Corner Screws
+        for (sx, sy), ang in zip(
+            [(x + 7.0, y + 7.0), (x + w - 7.0, y + 7.0), (x + 7.0, y + h - 7.0), (x + w - 7.0, y + h - 7.0)],
+            (0.4 + screw_seed * 0.3, -0.6 + screw_seed * 0.2, 1.1 - screw_seed * 0.25, -0.2 + screw_seed * 0.35),
+        ):
+            cls.draw_screw(cr, sx, sy, 3.2, ang, brass=not dark_phosphor)
+
+        # Top Engraved Nameplate
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(8.2)
+        ext_t = cr.text_extents(title)
+        cr.set_source_rgb(0.74, 0.96, 0.86) if dark_phosphor else cr.set_source_rgb(0.96, 0.92, 0.78)
+        cr.move_to(x + (w - ext_t.width) * 0.5, y + 11.2)
+        cr.show_text(title)
+
+        # Dial Face
+        mx, my = x + 8.0, y + 15.0
+        mw, mh = w - 16.0, h - 22.0
+        if dark_phosphor:
+            fpat = cairo.RadialGradient(mx + mw * 0.5, my + mh * 0.45, 5.0, mx + mw * 0.5, my + mh * 0.5, mw * 0.72)
+            fpat.add_color_stop_rgb(0.0, 0.07, 0.15, 0.13)
+            fpat.add_color_stop_rgb(0.65, 0.04, 0.08, 0.08)
+            fpat.add_color_stop_rgb(1.0, 0.02, 0.04, 0.05)
+        else:
+            fpat = cairo.RadialGradient(mx + mw * 0.5, my + 5.0, 6.0, mx + mw * 0.5, my + mh * 0.55, mw * 0.76)
+            fpat.add_color_stop_rgb(0.0, 1.00, 0.96, 0.82)
+            fpat.add_color_stop_rgb(0.58, 0.98, 0.89, 0.66)
+            fpat.add_color_stop_rgb(1.0, 0.86, 0.73, 0.48)
+        cr.rectangle(mx, my, mw, mh)
+        cr.set_source(fpat)
+        cr.fill()
+
+        # Inner Glass Shadow
+        cr.set_line_width(1.4)
+        cr.set_source_rgba(0.04, 0.03, 0.02, 0.65)
+        cr.move_to(mx, my + mh)
+        cr.line_to(mx, my)
+        cr.line_to(mx + mw, my)
+        cr.stroke()
+
+        # Jewel Pilot Lamps
+        if lamps:
+            spacing = (mw - 14.0) / max(1, len(lamps))
+            for idx, (lbl, col, lit) in enumerate(lamps):
+                cls.draw_jewel_lamp(cr, mx + 11.0 + idx * spacing, my + 9.5, 3.2, col, lit, lbl, dark_face=dark_phosphor)
+
+        # Radial Scale Geometry
+        vfd_h = 26.0
+        vfd_y = my + mh - vfd_h - 3.5
+        piv_x = mx + mw * 0.5
+        piv_y = vfd_y + 6.5
+        arc_r = min(mw * 0.42, max(34.0, piv_y - (my + 24.0)))
+        a0 = -math.pi * 0.81
+        a1 = -math.pi * 0.19
+
+        if red_span is not None:
+            ra0 = a0 + red_span[0] * (a1 - a0)
+            ra1 = a0 + red_span[1] * (a1 - a0)
+            cr.new_sub_path()
+            cr.set_line_width(3.6)
+            cr.set_source_rgb(0.96, 0.26, 0.22) if dark_phosphor else cr.set_source_rgb(0.80, 0.14, 0.12)
+            cr.arc(piv_x, piv_y, arc_r + 1.6, ra0, ra1)
+            cr.stroke()
+
+        # Scale baseline arc
+        cr.new_sub_path()
+        cr.set_line_width(1.3)
+        cr.set_source_rgb(0.32, 0.94, 0.66) if dark_phosphor else cr.set_source_rgb(0.18, 0.14, 0.09)
+        cr.arc(piv_x, piv_y, arc_r, a0, a1)
+        cr.stroke()
+
+        # Minor 20 subdivisions
+        cr.set_line_width(0.85)
+        cr.set_source_rgba(0.32, 0.86, 0.60, 0.70) if dark_phosphor else cr.set_source_rgba(0.24, 0.19, 0.12, 0.72)
+        for i in range(21):
+            ang = a0 + (i / 20.0) * (a1 - a0)
+            cr.move_to(piv_x + (arc_r - 2.5) * math.cos(ang), piv_y + (arc_r - 2.5) * math.sin(ang))
+            cr.line_to(piv_x + (arc_r + 2.2) * math.cos(ang), piv_y + (arc_r + 2.2) * math.sin(ang))
+            cr.stroke()
+
+        # Major ticks & labels
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(7.8)
+        for frac, lbl, is_red in marks:
+            ang = a0 + frac * (a1 - a0)
+            if is_red:
+                cr.set_source_rgb(1.00, 0.35, 0.30) if dark_phosphor else cr.set_source_rgb(0.78, 0.12, 0.10)
+            else:
+                cr.set_source_rgb(0.46, 0.98, 0.74) if dark_phosphor else cr.set_source_rgb(0.14, 0.11, 0.08)
+            cr.set_line_width(1.5)
+            cr.move_to(piv_x + (arc_r - 4.2) * math.cos(ang), piv_y + (arc_r - 4.2) * math.sin(ang))
+            cr.line_to(piv_x + (arc_r + 4.4) * math.cos(ang), piv_y + (arc_r + 4.4) * math.sin(ang))
+            cr.stroke()
+            tx = piv_x + (arc_r + 11.6) * math.cos(ang)
+            ty = piv_y + (arc_r + 11.6) * math.sin(ang)
+            ext = cr.text_extents(lbl)
+            cr.move_to(tx - ext.width * 0.5, ty + ext.height * 0.38)
+            cr.show_text(lbl)
+
+        # Peak-Hold Tick Triangle on Scale Arc
+        if peak_norm is not None and peak_norm > 0.015:
+            pk = max(0.0, min(1.0, peak_norm))
+            pang = a0 + pk * (a1 - a0)
+            px0 = piv_x + (arc_r - 1.0) * math.cos(pang)
+            py0 = piv_y + (arc_r - 1.0) * math.sin(pang)
+            px1 = piv_x + (arc_r + 6.8) * math.cos(pang - 0.045)
+            py1 = piv_y + (arc_r + 6.8) * math.sin(pang - 0.045)
+            px2 = piv_x + (arc_r + 6.8) * math.cos(pang + 0.045)
+            py2 = piv_y + (arc_r + 6.8) * math.sin(pang + 0.045)
+            cr.move_to(px0, py0)
+            cr.line_to(px1, py1)
+            cr.line_to(px2, py2)
+            cr.close_path()
+            cr.set_source_rgb(1.00, 0.72, 0.18) if dark_phosphor else cr.set_source_rgb(0.88, 0.24, 0.08)
+            cr.fill()
+
+        # Center Unit Legend
+        cr.set_font_size(7.6)
+        cr.set_source_rgba(0.45, 0.90, 0.70, 0.86) if dark_phosphor else cr.set_source_rgba(0.28, 0.22, 0.14, 0.86)
+        u_ext = cr.text_extents(unit_lbl)
+        cr.move_to(piv_x - u_ext.width * 0.5, piv_y - arc_r * 0.44)
+        cr.show_text(unit_lbl)
+
+        # Ballistic Needle
+        cr.save()
+        cr.rectangle(mx + 1, my + 1, mw - 2, mh - 2)
+        cr.clip()
+        n_ang = a0 + max(0.0, min(1.0, norm_val)) * (a1 - a0)
+        tip_r = arc_r + 6.8
+
+        cr.set_line_width(2.1)
+        cr.set_source_rgba(0.05, 0.04, 0.02, 0.36)
+        cr.move_to(piv_x + 1.8, piv_y + 1.8)
+        cr.line_to(piv_x + 1.8 + tip_r * math.cos(n_ang), piv_y + 1.8 + tip_r * math.sin(n_ang))
+        cr.stroke()
+
+        if dark_phosphor:
+            cr.set_line_width(2.0)
+            cr.set_source_rgb(0.74, 0.98, 0.84)
+            cr.move_to(piv_x - 6.0 * math.cos(n_ang), piv_y - 6.0 * math.sin(n_ang))
+            cr.line_to(piv_x + (tip_r * 0.65) * math.cos(n_ang), piv_y + (tip_r * 0.65) * math.sin(n_ang))
+            cr.stroke()
+            cr.set_line_width(2.2)
+            cr.set_source_rgb(1.00, 0.46, 0.16)
+            cr.move_to(piv_x + (tip_r * 0.60) * math.cos(n_ang), piv_y + (tip_r * 0.60) * math.sin(n_ang))
+            cr.line_to(piv_x + tip_r * math.cos(n_ang), piv_y + tip_r * math.sin(n_ang))
+            cr.stroke()
+        else:
+            cr.set_line_width(1.9)
+            cr.set_source_rgb(0.16, 0.15, 0.15)
+            cr.move_to(piv_x - 6.0 * math.cos(n_ang), piv_y - 6.0 * math.sin(n_ang))
+            cr.line_to(piv_x + (tip_r * 0.55) * math.cos(n_ang), piv_y + (tip_r * 0.55) * math.sin(n_ang))
+            cr.stroke()
+            cr.set_line_width(2.0)
+            cr.set_source_rgb(0.80, 0.12, 0.10)
+            cr.move_to(piv_x + (tip_r * 0.50) * math.cos(n_ang), piv_y + (tip_r * 0.50) * math.sin(n_ang))
+            cr.line_to(piv_x + tip_r * math.cos(n_ang), piv_y + tip_r * math.sin(n_ang))
+            cr.stroke()
+
+        cr.new_sub_path()
+        cr.arc(piv_x, piv_y, 6.8, 0, 2 * math.pi)
+        cr.set_source_rgb(0.18, 0.19, 0.22)
+        cr.fill()
+        cr.new_sub_path()
+        cr.arc(piv_x, piv_y, 3.2, 0, 2 * math.pi)
+        cr.set_source_rgb(0.56, 0.62, 0.70) if dark_phosphor else cr.set_source_rgb(0.74, 0.68, 0.52)
+        cr.fill()
+        cr.restore()
+
+        # Bottom Digital VFD Readout
+        cls.draw_vfd_inset(cr, mx + 5.0, vfd_y, mw - 10.0, vfd_h, vfd_l1, vfd_l2, amber_vfd=not dark_phosphor)
+
+    @staticmethod
+    def draw_phosphor_stripchart(
+        cr: cairo.Context,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+        rx_hist: collections.deque[float],
+        tx_hist: collections.deque[float],
+        rx_now: float,
+        tx_now: float,
+    ):
+        # Sunken Tektronix Phosphor CRT Screen
+        cr.rectangle(x, y, w, h)
+        bg = cairo.LinearGradient(x, y, x, y + h)
+        bg.add_color_stop_rgb(0.0, 0.03, 0.08, 0.08)
+        bg.add_color_stop_rgb(1.0, 0.02, 0.05, 0.06)
+        cr.set_source(bg)
+        cr.fill()
+
+        # Graticule Grid
+        cr.set_line_width(0.75)
+        cr.set_source_rgba(0.18, 0.55, 0.48, 0.35)
+        for i in range(1, 4):
+            gy = y + (h * i) / 4.0
+            cr.move_to(x + 2, gy)
+            cr.line_to(x + w - 2, gy)
+            cr.stroke()
+        for i in range(1, 8):
+            gx = x + (w * i) / 8.0
+            cr.move_to(gx, y + 2)
+            cr.line_to(gx, y + h - 2)
+            cr.stroke()
+
+        peak_val = max(max(rx_hist, default=0.0), max(tx_hist, default=0.0), 64_000.0)
+        ceil_bps, _, _ = choose_throughput_scale(peak_val)
+
+        pad_t, pad_b = 15.0, 5.0
+        plot_h = max(12.0, h - pad_t - pad_b)
+        n = len(rx_hist)
+
+        def draw_trace(samples: collections.deque[float], rgb: tuple[float, float, float], fill_alpha: float):
+            if n < 2:
+                return
+            pts: list[tuple[float, float]] = []
+            for idx, val in enumerate(samples):
+                px = x + 3.0 + (idx / float(n - 1)) * (w - 6.0)
+                frac = max(0.0, min(1.0, val / ceil_bps))
+                py = y + pad_t + plot_h * (1.0 - frac)
+                pts.append((px, py))
+
+            if fill_alpha > 0.0:
+                cr.move_to(pts[0][0], y + pad_t + plot_h)
+                for px, py in pts:
+                    cr.line_to(px, py)
+                cr.line_to(pts[-1][0], y + pad_t + plot_h)
+                cr.close_path()
+                cr.set_source_rgba(rgb[0], rgb[1], rgb[2], fill_alpha)
+                cr.fill()
+
+            # Soft outer phosphor glow
+            cr.set_line_width(3.0)
+            cr.set_source_rgba(rgb[0], rgb[1], rgb[2], 0.24)
+            cr.move_to(*pts[0])
+            for px, py in pts[1:]:
+                cr.line_to(px, py)
+            cr.stroke()
+
+            # Crisp core beam
+            cr.set_line_width(1.4)
+            cr.set_source_rgb(*rgb)
+            cr.move_to(*pts[0])
+            for px, py in pts[1:]:
+                cr.line_to(px, py)
+            cr.stroke()
+
+        draw_trace(tx_hist, (1.00, 0.72, 0.22), 0.10)
+        draw_trace(rx_hist, (0.26, 0.98, 0.80), 0.16)
+
+        # Legend Overlay
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(7.6)
+        cr.set_source_rgb(0.28, 0.98, 0.82)
+        cr.move_to(x + 6.0, y + 10.8)
+        cr.show_text(f"RX {fmt_bits_short(rx_now)}/s")
+        cr.set_source_rgb(1.00, 0.74, 0.24)
+        cr.move_to(x + 98.0, y + 10.8)
+        cr.show_text(f"TX {fmt_bits_short(tx_now)}/s")
+        cr.set_source_rgba(0.68, 0.88, 0.82, 0.85)
+        ceil_txt = f"FS {fmt_bits_short(ceil_bps)}"
+        ext = cr.text_extents(ceil_txt)
+        cr.move_to(x + w - ext.width - 6.0, y + 10.8)
+        cr.show_text(ceil_txt)
+
+        # Sunken Bevel Frame
+        cr.set_line_width(1.4)
+        cr.set_source_rgb(0.02, 0.04, 0.04)
+        cr.move_to(x, y + h)
+        cr.line_to(x, y)
+        cr.line_to(x + w, y)
+        cr.stroke()
+        cr.set_source_rgb(0.36, 0.42, 0.50)
+        cr.move_to(x, y + h)
+        cr.line_to(x + w, y + h)
+        cr.line_to(x + w, y)
+        cr.stroke()
+
+    @staticmethod
+    def draw_world_radar(
+        cr: cairo.Context,
+        w: float,
+        h: float,
+        hops: list[TraceHop],
+        selected_hop: int | None,
+        auto_fit: bool,
+        pulse_phase: float,
+        target_label: str,
+        ping_summary: str,
+    ) -> list[tuple[int, float, float]]:
+        """
+        Render Dark Vector World Map + Glowing Great-Circle Hop Arcs + Hop Beacons.
+        Returns [(hop_num, screen_x, screen_y), ...] for mouse hit-testing.
+        """
+        # 1. Deep Ocean Radar Background
+        bg = cairo.LinearGradient(0, 0, 0, h)
+        bg.add_color_stop_rgb(0.0, 0.03, 0.07, 0.10)
+        bg.add_color_stop_rgb(0.5, 0.02, 0.05, 0.08)
+        bg.add_color_stop_rgb(1.0, 0.02, 0.04, 0.06)
+        cr.rectangle(0, 0, w, h)
+        cr.set_source(bg)
+        cr.fill()
+
+        # Viewport Lon/Lat Bounds (WORLD vs AUTO-FIT)
+        lon_min, lon_max = -180.0, 180.0
+        lat_min, lat_max = -66.0, 82.0
+        geo_hops = [hp for hp in hops if hp.has_geo]
+        if auto_fit and len(geo_hops) >= 2:
+            lons = [HOME_QTH_LON] + [hp.lon for hp in geo_hops]
+            lats = [HOME_QTH_LAT] + [hp.lat for hp in geo_hops]
+            span_lon = max(lons) - min(lons)
+            if span_lon < 190.0:
+                pad_x = max(18.0, span_lon * 0.25)
+                pad_y = max(12.0, (max(lats) - min(lats)) * 0.30)
+                lon_min = max(-180.0, min(lons) - pad_x)
+                lon_max = min(180.0, max(lons) + pad_x)
+                lat_min = max(-70.0, min(lats) - pad_y)
+                lat_max = min(84.0, max(lats) + pad_y)
+                # Preserve ~2:1 aspect ratio so continents never look stretched
+                cur_ar = (lon_max - lon_min) / max(10.0, lat_max - lat_min)
+                win_ar = max(1.2, w / max(80.0, h))
+                if cur_ar < win_ar:
+                    extra = ((lat_max - lat_min) * win_ar - (lon_max - lon_min)) * 0.5
+                    lon_min = max(-180.0, lon_min - extra)
+                    lon_max = min(180.0, lon_max + extra)
+                else:
+                    extra = ((lon_max - lon_min) / win_ar - (lat_max - lat_min)) * 0.5
+                    lat_min = max(-72.0, lat_min - extra)
+                    lat_max = min(84.0, lat_max + extra)
+
+        def proj(lon: float, lat: float) -> tuple[float, float]:
+            px = ((lon - lon_min) / max(1e-3, lon_max - lon_min)) * w
+            py = ((lat_max - lat) / max(1e-3, lat_max - lat_min)) * h
+            return px, py
+
+        cr.save()
+        cr.rectangle(1, 1, w - 2, h - 2)
+        cr.clip()
+
+        # 2. Phosphor Latitude / Longitude Graticule
+        cr.set_line_width(0.65)
+        cr.set_source_rgba(0.14, 0.44, 0.44, 0.32)
+        for glon in range(-180, 181, 30):
+            if lon_min <= glon <= lon_max:
+                gx, _ = proj(glon, 0.0)
+                cr.move_to(gx, 0)
+                cr.line_to(gx, h)
+                cr.stroke()
+        for glat in range(-60, 81, 30):
+            if lat_min <= glat <= lat_max:
+                _, gy = proj(0.0, glat)
+                cr.move_to(0, gy)
+                cr.line_to(w, gy)
+                cr.stroke()
+
+        # Equator & Tropics subtle dashed lines
+        cr.set_dash([4.0, 4.0])
+        cr.set_source_rgba(0.24, 0.68, 0.62, 0.35)
+        for sl in (0.0, 23.44, -23.44):
+            if lat_min <= sl <= lat_max:
+                _, sy = proj(0.0, sl)
+                cr.move_to(0, sy)
+                cr.line_to(w, sy)
+                cr.stroke()
+        cr.set_dash([])
+
+        # 3. Embedded Vector World Continents & Lakes
+        for is_hole, pts in WORLD_POLYGONS:
+            if len(pts) < 3:
+                continue
+            p0x, p0y = proj(pts[0][0], pts[0][1])
+            cr.move_to(p0x, p0y)
+            for plon, plat in pts[1:]:
+                px, py = proj(plon, plat)
+                cr.line_to(px, py)
+            cr.close_path()
+            if is_hole:
+                cr.set_source_rgb(0.03, 0.06, 0.09)
+                cr.fill_preserve()
+                cr.set_line_width(0.6)
+                cr.set_source_rgba(0.18, 0.56, 0.52, 0.55)
+                cr.stroke()
+            else:
+                cr.set_source_rgb(0.07, 0.16, 0.16)
+                cr.fill_preserve()
+                cr.set_line_width(0.85)
+                cr.set_source_rgba(0.26, 0.78, 0.68, 0.78)
+                cr.stroke()
+
+        # Geopolitical & US/Idaho State Borders
+        cr.set_line_width(0.65)
+        cr.set_source_rgba(0.24, 0.66, 0.58, 0.42)
+        for bline in BORDER_POLYLINES:
+            if len(bline) < 2:
+                continue
+            bx0, by0 = proj(bline[0][0], bline[0][1])
+            cr.move_to(bx0, by0)
+            for blon, blat in bline[1:]:
+                bx, by = proj(blon, blat)
+                cr.line_to(bx, by)
+            cr.stroke()
+
+        # 4. Glowing Neon Hop-by-Hop Great-Circle Arcs from Home QTH
+        prev_lat, prev_lon = HOME_QTH_LAT, HOME_QTH_LON
+        all_arc_screen_pts: list[tuple[float, float]] = []
+
+        for hp in hops:
+            if not hp.has_geo or hp.ip == "*":
+                continue
+            segs = great_circle_segments(prev_lat, prev_lon, hp.lat, hp.lon, steps=44)
+            is_sel = selected_hop == hp.hop
+            rtt = hp.rtt_ms if hp.rtt_ms is not None else 45.0
+            if is_sel:
+                col = (1.00, 0.92, 0.34)
+            elif rtt < 45.0:
+                col = (0.28, 0.98, 0.84)
+            elif rtt < 120.0:
+                col = (1.00, 0.72, 0.22)
+            else:
+                col = (1.00, 0.40, 0.56)
+
+            for seg in segs:
+                spts = [proj(lon, lat) for lon, lat in seg]
+                all_arc_screen_pts.extend(spts)
+                if len(spts) < 2:
+                    continue
+                # Outer wide neon halo
+                cr.set_line_width(6.2 if is_sel else 4.6)
+                cr.set_source_rgba(col[0], col[1], col[2], 0.18 if not is_sel else 0.32)
+                cr.move_to(*spts[0])
+                for sx, sy in spts[1:]:
+                    cr.line_to(sx, sy)
+                cr.stroke()
+
+                # Mid glow
+                cr.set_line_width(2.8 if is_sel else 2.2)
+                cr.set_source_rgba(col[0], col[1], col[2], 0.48)
+                cr.move_to(*spts[0])
+                for sx, sy in spts[1:]:
+                    cr.line_to(sx, sy)
+                cr.stroke()
+
+                # Crisp white-hot core beam
+                cr.set_line_width(1.35 if not is_sel else 1.8)
+                cr.set_source_rgb(min(1.0, col[0] + 0.22), min(1.0, col[1] + 0.22), min(1.0, col[2] + 0.22))
+                cr.move_to(*spts[0])
+                for sx, sy in spts[1:]:
+                    cr.line_to(sx, sy)
+                cr.stroke()
+
+            prev_lat, prev_lon = hp.lat, hp.lon
+
+        # Animated Packet Tracer Pulse along Active Great-Circle Path
+        if len(all_arc_screen_pts) >= 2:
+            idx_f = (pulse_phase % 1.0) * (len(all_arc_screen_pts) - 1)
+            idx0 = int(idx_f)
+            px, py = all_arc_screen_pts[idx0]
+            pg = cairo.RadialGradient(px, py, 1.0, px, py, 9.0)
+            pg.add_color_stop_rgba(0.0, 1.0, 1.0, 0.95, 0.95)
+            pg.add_color_stop_rgba(0.4, 0.35, 1.0, 0.88, 0.65)
+            pg.add_color_stop_rgba(1.0, 0.20, 0.95, 0.80, 0.0)
+            cr.arc(px, py, 9.0, 0, 2 * math.pi)
+            cr.set_source(pg)
+            cr.fill()
+
+        # 5. Home QTH Diamond Reticle + Numbered Hop Beacons
+        hit_targets: list[tuple[int, float, float]] = []
+        hx, hy = proj(HOME_QTH_LON, HOME_QTH_LAT)
+        hit_targets.append((0, hx, hy))
+
+        # Expanding radar ring around Home QTH / Final Hop
+        ring_r = 6.0 + 13.0 * (pulse_phase % 1.0)
+        ring_a = 0.55 * (1.0 - (pulse_phase % 1.0))
+        cr.new_sub_path()
+        cr.arc(hx, hy, ring_r, 0, 2 * math.pi)
+        cr.set_line_width(1.2)
+        cr.set_source_rgba(1.00, 0.80, 0.26, ring_a)
+        cr.stroke()
+
+        # Home QTH Gold Diamond
+        cr.move_to(hx, hy - 6.0)
+        cr.line_to(hx + 6.0, hy)
+        cr.line_to(hx, hy + 6.0)
+        cr.line_to(hx - 6.0, hy)
+        cr.close_path()
+        cr.set_source_rgb(1.00, 0.78, 0.20)
+        cr.fill_preserve()
+        cr.set_line_width(1.2)
+        cr.set_source_rgb(0.10, 0.08, 0.04)
+        cr.stroke()
+
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(7.6)
+        cr.set_source_rgb(1.00, 0.86, 0.42)
+        cr.move_to(hx + 8.0, hy - 4.0)
+        cr.show_text("HOME QTH")
+
+        placed_boxes: list[tuple[float, float, float, float]] = [(hx + 6, hy - 13, 86, 12)]
+        for idx, hp in enumerate(hops):
+            if not hp.has_geo or hp.ip == "*":
+                continue
+            bx, by = proj(hp.lon, hp.lat)
+            hit_targets.append((hp.hop, bx, by))
+            is_last = idx == len(hops) - 1
+            is_sel = selected_hop == hp.hop
+
+            if is_last:
+                cr.new_sub_path()
+                cr.arc(bx, by, ring_r, 0, 2 * math.pi)
+                cr.set_line_width(1.3)
+                cr.set_source_rgba(0.32, 1.00, 0.86, ring_a)
+                cr.stroke()
+
+            rad = 7.4 if (is_sel or is_last) else 6.2
+            glow = cairo.RadialGradient(bx, by, 1.0, bx, by, rad * 2.1)
+            bcol = (1.00, 0.90, 0.30) if is_sel else ((1.00, 0.46, 0.34) if is_last else (0.26, 0.96, 0.82))
+            glow.add_color_stop_rgba(0.0, bcol[0], bcol[1], bcol[2], 0.55)
+            glow.add_color_stop_rgba(1.0, bcol[0], bcol[1], bcol[2], 0.0)
+            cr.arc(bx, by, rad * 2.1, 0, 2 * math.pi)
+            cr.set_source(glow)
+            cr.fill()
+
+            cr.arc(bx, by, rad, 0, 2 * math.pi)
+            cr.set_source_rgb(0.06, 0.14, 0.15)
+            cr.fill_preserve()
+            cr.set_line_width(1.6)
+            cr.set_source_rgb(*bcol)
+            cr.stroke()
+
+            num_s = str(hp.hop)
+            cr.set_font_size(7.4)
+            ext_n = cr.text_extents(num_s)
+            cr.set_source_rgb(0.96, 1.00, 0.98)
+            cr.move_to(bx - ext_n.width * 0.5, by + ext_n.height * 0.38)
+            cr.show_text(num_s)
+
+            # Callout City Label (with non-overlap offset check)
+            if hp.city and (is_sel or is_last or len(placed_boxes) < 12):
+                tag = f"{hp.city[:14]}" + (f" {hp.rtt_ms:.0f}ms" if hp.rtt_ms is not None else "")
+                ext_c = cr.text_extents(tag)
+                tw, th = ext_c.width + 6.0, 12.0
+                for dx, dy in ((9.0, 3.0), (9.0, -11.0), (-tw - 8.0, 3.0), (-tw - 8.0, -11.0)):
+                    tx, ty = bx + dx, by + dy
+                    if tx < 4 or tx + tw > w - 4 or ty < 18 or ty + th > h - 18:
+                        continue
+                    overlap = any(
+                        not (tx + tw < ox or tx > ox + ow or ty + th < oy or ty > oy + oh)
+                        for ox, oy, ow, oh in placed_boxes
+                    )
+                    if not overlap or is_sel or is_last:
+                        placed_boxes.append((tx, ty, tw, th))
+                        cr.rectangle(tx, ty - 9.0, tw, th)
+                        cr.set_source_rgba(0.03, 0.08, 0.10, 0.82)
+                        cr.fill()
+                        cr.set_source_rgb(*bcol)
+                        cr.move_to(tx + 3.0, ty)
+                        cr.show_text(tag)
+                        break
+
+        # 6. Tactical Radar HUD Overlay Banner
+        cr.rectangle(6.0, 6.0, min(w - 12.0, 350.0), 20.0)
+        cr.set_source_rgba(0.03, 0.09, 0.11, 0.84)
+        cr.fill()
+        cr.set_font_size(8.0)
+        cr.set_source_rgb(0.42, 0.98, 0.86)
+        cr.move_to(11.0, 19.0)
+        tot_km = hops[-1].dist_km if hops else 0.0
+        hud = f"TGT: {target_label}  |  HOPS: {len(hops)}  |  GC: {tot_km:,.0f} km"
+        cr.show_text(hud[:54])
+
+        if ping_summary:
+            ext_p = cr.text_extents(ping_summary)
+            pw = min(w - 12.0, ext_p.width + 14.0)
+            cr.rectangle(6.0, h - 24.0, pw, 18.0)
+            cr.set_source_rgba(0.03, 0.09, 0.11, 0.84)
+            cr.fill()
+            cr.set_source_rgb(1.00, 0.80, 0.30)
+            cr.move_to(12.0, h - 12.0)
+            cr.show_text(ping_summary)
+
+        cr.restore()
+
+        # Sunken Motif Bevel Frame
+        cr.set_line_width(1.6)
+        cr.set_source_rgb(0.02, 0.04, 0.05)
+        cr.move_to(0.8, h - 0.8)
+        cr.line_to(0.8, 0.8)
+        cr.line_to(w - 0.8, 0.8)
+        cr.stroke()
+        cr.set_source_rgb(0.36, 0.42, 0.50)
+        cr.move_to(0.8, h - 0.8)
+        cr.line_to(w - 0.8, h - 0.8)
+        cr.line_to(w - 0.8, 0.8)
+        cr.stroke()
+        return hit_targets
+
+
+# ---------------------------------------------------------------------------
+# Curated Demo Traceroute Builder (for instant preview or air-gapped demo)
+# ---------------------------------------------------------------------------
+DEMO_ROUTES: dict[str, list[tuple[str, float, float, float, str, str, str]]] = {
+    "1.1.1.1": [
+        ("192.0.2.1", 1.1, 41.730, -72.705, "Local LAN GW", "LAN", "Local Router"),
+        ("67.59.224.1", 9.4, 40.7608, -111.8910, "Salt Lake City", "US", "AS7018 Regional IX"),
+        ("12.122.114.5", 19.8, 37.3382, -121.8863, "San Jose", "US", "AS7018 Tier-1 Core"),
+        ("1.1.1.1", 21.6, 37.7749, -122.4194, "San Francisco", "US", "AS13335 Cloudflare"),
+    ],
+    "kiwisdr.com": [
+        ("192.0.2.1", 1.2, 41.730, -72.705, "Local LAN GW", "LAN", "Local Router"),
+        ("67.59.224.1", 9.8, 40.7608, -111.8910, "Salt Lake City", "US", "AS7018 Regional IX"),
+        ("129.250.3.42", 24.5, 34.0522, -118.2437, "Los Angeles", "US", "AS2914 NTT Pacific"),
+        ("202.84.141.9", 136.4, -18.1416, 178.4419, "Suva Cable", "FJ", "Southern Cross"),
+        ("103.26.48.14", 158.2, -36.8485, 174.7633, "Auckland", "NZ", "AS45179 KiwiSDR NZ"),
+    ],
+    "default": [
+        ("192.0.2.1", 1.0, 41.730, -72.705, "Local LAN GW", "LAN", "Local Router"),
+        ("67.59.224.1", 8.9, 40.7608, -111.8910, "Salt Lake City", "US", "Regional IX"),
+        ("4.69.148.22", 18.2, 39.7392, -104.9903, "Denver", "US", "AS3356 Lumen Core"),
+        ("4.69.201.90", 36.4, 41.8781, -87.6298, "Chicago", "US", "AS3356 Lumen Core"),
+        ("140.82.112.3", 52.8, 39.0438, -77.4874, "Ashburn, VA", "US", "AS36459 East IX"),
+    ],
+}
+
+
+def build_demo_hops(target: str) -> list[TraceHop]:
+    key = target if target in DEMO_ROUTES else ("kiwisdr.com" if "kiwi" in target else "default")
+    spec = DEMO_ROUTES[key]
+    out: list[TraceHop] = []
+    for idx, (ip, rtt, lat, lon, city, cc, asn) in enumerate(spec, start=1):
+        dkm = haversine_km(HOME_QTH_LAT, HOME_QTH_LON, lat, lon)
+        out.append(TraceHop(idx, ip, rtt, lat, lon, city, cc, asn, dkm, True))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Pure-Python UDP DNS Packet Builder (Zero-Dependency MX/TXT/NS/A Inspector)
+# ---------------------------------------------------------------------------
+def get_system_nameservers() -> list[str]:
+    ns: list[str] = []
+    try:
+        for ln in Path("/etc/resolv.conf").read_text(encoding="utf-8", errors="replace").splitlines():
+            s = ln.strip()
+            if s.startswith("nameserver"):
+                parts = s.split()
+                if len(parts) >= 2:
+                    ns.append(parts[1])
+    except OSError:
+        pass
+    return ns or ["1.1.1.1", "8.8.8.8"]
+
+
+# ---------------------------------------------------------------------------
+# Main GTK3CDE SunNet / SGI NetVisualizer Console Window
+# ---------------------------------------------------------------------------
+class DtNetWindow(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="dtNet — Analog Network Telemetry & World Traceroute Console")
+        self.set_default_size(1100, 650)
+        self.set_size_request(940, 560)
+
+        icon_p = Path(__file__).resolve().parent.parent / "assets" / "icons" / "dtnet.png"
+        if icon_p.is_file():
+            try:
+                self.set_icon_from_file(str(icon_p))
+            except Exception:
+                pass
+
+        chrome, sel, well = load_cde_palette()
+        prov = Gtk.CssProvider()
+        prov.load_from_data(build_net_css(chrome, sel, well))
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        self.sampler = NetTelemetrySampler()
+        self.geo = IpGeoResolver()
+        self.dark_phosphor = False
+        self.dial3_mode = "AUTO"  # AUTO | RTT | RF
+        self.auto_fit_map = False
+
+        # Ballistic needle spring state [pos, vel]
+        self._needle_rx = [0.0, 0.0]
+        self._needle_tx = [0.0, 0.0]
+        self._needle_d3 = [0.0, 0.0]
+        self._pulse_phase = 0.0
+
+        # Traceroute & Continuous Ping state
+        self.trace_hops: list[TraceHop] = []
+        self.selected_hop: int | None = None
+        self._radar_hits: list[tuple[int, float, float]] = []
+        self._trace_stop = threading.Event()
+        self._trace_running = False
+        self._cping_stop = threading.Event()
+        self._cping_running = False
+        self._cping_stats = ""
+        self._bg_ping_stop = threading.Event()
+
+        # Sockets state
+        self._sock_filter = "ALL"
+        self._sock_auto = True
+        self._all_sockets: list[dict] = []
+
+        # LAN Sweep state
+        self._sweep_stop = threading.Event()
+        self._sweep_running = False
+
+        self._load_state()
+        self.sampler.sample()
+
+        self._build_ui()
+        self.connect("destroy", self._on_destroy)
+
+        # Start periodic timers: 18fps Cairo ballistics, 1s NIC sampler, 3s socket refresh, background RTT probe
+        GLib.timeout_add(55, self._on_anim_tick)
+        GLib.timeout_add(1000, self._on_sample_tick)
+        GLib.timeout_add(3000, self._on_socket_auto_tick)
+
+        self._refresh_nic_combo()
+        self._update_nic_vfd()
+        self._refresh_sockets()
+        self._load_arp_into_sweep_table()
+        self._start_ambient_rtt_thread()
+
+        # Seed initial Home QTH -> Demo preview if offline, or ready state
+        if os.environ.get("DT_SCREENSHOT_DEMO") == "1":
+            self.ent_target.set_text("kiwisdr.com")
+            self.sampler.rtt_ms = 14.2
+            self.sampler.rtt_peak_ms = 24.8
+        self.trace_hops = build_demo_hops(self.ent_target.get_text().strip() or "1.1.1.1")
+        self._populate_hop_tree()
+
+    def _load_state(self):
+        try:
+            if STATE_FILE.is_file():
+                st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+                self.dark_phosphor = bool(st.get("dark_phosphor", False))
+                self.dial3_mode = str(st.get("dial3_mode", "AUTO"))
+        except Exception:
+            pass
+
+    def _save_state(self):
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            STATE_FILE.write_text(
+                json.dumps({"dark_phosphor": self.dark_phosphor, "dial3_mode": self.dial3_mode}, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def _on_destroy(self, *_args):
+        self._trace_stop.set()
+        self._cping_stop.set()
+        self._bg_ping_stop.set()
+        self._sweep_stop.set()
+        self._save_state()
+        Gtk.main_quit()
+
+    # -----------------------------------------------------------------------
+    # UI Construction
+    # -----------------------------------------------------------------------
+    def _build_ui(self):
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        root.set_margin_top(4)
+        root.set_margin_bottom(4)
+        root.set_margin_start(4)
+        root.set_margin_end(4)
+        self.add(root)
+
+        # 1. Top Instrument Nameplate & Mode Switches
+        hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        hdr.get_style_context().add_class("net-strip")
+        root.pack_start(hdr, False, False, 0)
+
+        lbl_brand = Gtk.Label(label="◆ dtNet  //  SUNNET / SGI ANALOG NETWORK TELEMETRY & WORLD RADAR")
+        lbl_brand.get_style_context().add_class("net-engraved")
+        hdr.pack_start(lbl_brand, False, False, 4)
+
+        # Right-side instrument controls
+        self.btn_reset_pk = Gtk.Button(label="PEAK RST")
+        self.btn_reset_pk.connect("clicked", lambda *_: self.sampler.reset_peaks())
+        hdr.pack_end(self.btn_reset_pk, False, False, 0)
+
+        self.btn_d3_mode = Gtk.Button(label=f"DIAL 3: {self.dial3_mode}")
+        self.btn_d3_mode.set_tooltip_text("Switch Dial 3 between AUTO, live Ping RTT (0..250 ms), and Wi-Fi RF Signal (dBm)")
+        self.btn_d3_mode.connect("clicked", self._on_cycle_dial3_mode)
+        hdr.pack_end(self.btn_d3_mode, False, False, 0)
+
+        self.btn_face_dark = Gtk.Button(label="DARK PHOSPHOR")
+        self.btn_face_warm = Gtk.Button(label="WARM AMBER")
+        self.btn_face_dark.connect("clicked", lambda *_: self._set_dial_face(True))
+        self.btn_face_warm.connect("clicked", lambda *_: self._set_dial_face(False))
+        hdr.pack_end(self.btn_face_dark, False, False, 0)
+        hdr.pack_end(self.btn_face_warm, False, False, 0)
+        self._sync_face_buttons()
+
+        # 2. Top Analog Telemetry Rack (3 Edge-Lit Analog Dials + Strip-Chart & NIC VFD)
+        rack = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        rack.get_style_context().add_class("net-cabinet")
+        root.pack_start(rack, False, False, 0)
+
+        self.dials_area = Gtk.DrawingArea()
+        self.dials_area.set_size_request(680, 184)
+        self.dials_area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.dials_area.connect("button-press-event", self._on_dials_clicked)
+        self.dials_area.connect("draw", self._on_draw_dials)
+        rack.pack_start(self.dials_area, True, True, 0)
+
+        # Right Telemetry Column: NIC Selector + Dual-Trace Strip-Chart + NIC VFD
+        nic_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        nic_col.set_size_request(385, 184)
+        rack.pack_start(nic_col, False, False, 0)
+
+        nic_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        lbl_if = Gtk.Label(label="INTERFACE:")
+        lbl_if.get_style_context().add_class("net-engraved")
+        nic_bar.pack_start(lbl_if, False, False, 0)
+
+        self.cmb_nic = Gtk.ComboBoxText()
+        self.cmb_nic.connect("changed", self._on_nic_changed)
+        nic_bar.pack_start(self.cmb_nic, True, True, 0)
+
+        self.lbl_link_badge = Gtk.Label(label="● LINK UP")
+        self.lbl_link_badge.get_style_context().add_class("net-engraved")
+        nic_bar.pack_end(self.lbl_link_badge, False, False, 2)
+        nic_col.pack_start(nic_bar, False, False, 0)
+
+        self.strip_area = Gtk.DrawingArea()
+        self.strip_area.set_size_request(380, 96)
+        self.strip_area.connect("draw", self._on_draw_stripchart)
+        nic_col.pack_start(self.strip_area, True, True, 0)
+
+        self.lbl_nic_vfd = Gtk.Label()
+        self.lbl_nic_vfd.set_xalign(0.0)
+        self.lbl_nic_vfd.set_selectable(True)
+        self.lbl_nic_vfd.get_style_context().add_class("net-vfd-box")
+        nic_col.pack_start(self.lbl_nic_vfd, False, False, 0)
+
+        # 3. 3-Tab Sunken Workstation Deck
+        self.notebook = Gtk.Notebook()
+        root.pack_start(self.notebook, True, True, 0)
+
+        self._build_tab_traceroute()
+        self._build_tab_sockets()
+        self._build_tab_lan_bench()
+
+        # 4. CDE Recessed Status Bar
+        self.lbl_status = Gtk.Label(
+            label=f"READY  |  HOME QTH: {HOME_QTH_NAME} ({HOME_QTH_LAT:.4f}N, {HOME_QTH_LON:.4f}W)  |  /proc/net telemetry active"
+        )
+        self.lbl_status.set_xalign(0.0)
+        self.lbl_status.get_style_context().add_class("cde-status")
+        root.pack_start(self.lbl_status, False, False, 0)
+
+        self.show_all()
+
+    # -----------------------------------------------------------------------
+    # Tab 1: World Traceroute Radar
+    # -----------------------------------------------------------------------
+    def _build_tab_traceroute(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        vbox.set_margin_top(4)
+        vbox.set_margin_bottom(4)
+        vbox.set_margin_start(4)
+        vbox.set_margin_end(4)
+
+        tbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        tbar.get_style_context().add_class("net-strip")
+        vbox.pack_start(tbar, False, False, 0)
+
+        lbl_t = Gtk.Label(label="TARGET:")
+        lbl_t.get_style_context().add_class("net-engraved")
+        tbar.pack_start(lbl_t, False, False, 2)
+
+        self.ent_target = Gtk.Entry()
+        self.ent_target.set_text("1.1.1.1")
+        self.ent_target.set_width_chars(18)
+        self.ent_target.connect("activate", lambda *_: self._on_start_stop_trace())
+        tbar.pack_start(self.ent_target, False, False, 0)
+
+        self.cmb_presets = Gtk.ComboBoxText()
+        for host, desc in TRACE_PRESETS:
+            self.cmb_presets.append(host, desc)
+        self.cmb_presets.set_active(0)
+        self.cmb_presets.connect("changed", self._on_preset_selected)
+        tbar.pack_start(self.cmb_presets, False, False, 0)
+
+        self.cmb_trace_mode = Gtk.ComboBoxText()
+        for mid, mtxt in [
+            ("AUTO", "AUTO PROBE"),
+            ("PING_TTL", "PING TTL (1..24)"),
+            ("TRACEROUTE", "TRACEROUTE -n"),
+            ("TRACEPATH", "TRACEPATH -n"),
+        ]:
+            self.cmb_trace_mode.append(mid, mtxt)
+        self.cmb_trace_mode.set_active(0)
+        tbar.pack_start(self.cmb_trace_mode, False, False, 0)
+
+        self.btn_trace = Gtk.Button(label="▶ TRACE ROUTE")
+        self.btn_trace.get_style_context().add_class("btn-trace")
+        self.btn_trace.connect("clicked", lambda *_: self._on_start_stop_trace())
+        tbar.pack_start(self.btn_trace, False, False, 0)
+
+        self.btn_cping = Gtk.ToggleButton(label="▶ CONTINUOUS PING")
+        self.btn_cping.connect("toggled", self._on_toggle_continuous_ping)
+        tbar.pack_start(self.btn_cping, False, False, 0)
+
+        btn_demo = Gtk.Button(label="DEMO ARC")
+        btn_demo.set_tooltip_text("Plot curated multi-hop reference great-circle route (works offline)")
+        btn_demo.connect("clicked", self._on_load_demo_route)
+        tbar.pack_start(btn_demo, False, False, 0)
+
+        self.btn_fit = Gtk.ToggleButton(label="AUTO-FIT")
+        self.btn_fit.connect("toggled", self._on_toggle_autofit)
+        tbar.pack_end(self.btn_fit, False, False, 0)
+
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        paned.set_position(645)
+        vbox.pack_start(paned, True, True, 0)
+
+        self.radar_area = Gtk.DrawingArea()
+        self.radar_area.set_size_request(500, 260)
+        self.radar_area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.radar_area.connect("button-press-event", self._on_radar_clicked)
+        self.radar_area.connect("draw", self._on_draw_radar)
+        paned.pack1(self.radar_area, True, False)
+
+        # Right: Tractor-Feed Greenbar Hop RTT Table
+        hop_scroll = Gtk.ScrolledWindow()
+        hop_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        hop_scroll.get_style_context().add_class("net-bevel-in")
+
+        # cols: hop_int, hop_str, ip, rtt_str, loc, asn, km_str, bg_hex
+        self.hop_store = Gtk.ListStore(int, str, str, str, str, str, str, str)
+        self.hop_tree = Gtk.TreeView(model=self.hop_store)
+        self.hop_tree.get_style_context().add_class("greenbar")
+        self.hop_tree.set_headers_visible(True)
+        self.hop_tree.get_selection().connect("changed", self._on_hop_row_selected)
+
+        for idx, (title, width) in enumerate(
+            [("#", 30), ("HOP IP", 108), ("RTT", 62), ("LOCATION", 118), ("ASN / ISP", 125), ("GC km", 58)], start=1
+        ):
+            ren = Gtk.CellRendererText()
+            if idx in (1, 3, 6):
+                ren.set_property("xalign", 1.0)
+            col = Gtk.TreeViewColumn(title, ren, text=idx, cell_background=7)
+            col.set_resizable(True)
+            col.set_min_width(width)
+            self.hop_tree.append_column(col)
+
+        hop_scroll.add(self.hop_tree)
+        paned.pack2(hop_scroll, True, False)
+
+        self.notebook.append_page(vbox, Gtk.Label(label="WORLD TRACEROUTE RADAR"))
+
+    # -----------------------------------------------------------------------
+    # Tab 2: Active Sockets & Ports (/proc/net)
+    # -----------------------------------------------------------------------
+    def _build_tab_sockets(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        vbox.set_margin_top(4)
+        vbox.set_margin_bottom(4)
+        vbox.set_margin_start(4)
+        vbox.set_margin_end(4)
+
+        fbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        fbar.get_style_context().add_class("net-strip")
+        vbox.pack_start(fbar, False, False, 0)
+
+        self._sock_btns: dict[str, Gtk.Button] = {}
+        for key, lbl in [
+            ("ALL", "ALL"),
+            ("LISTEN", "LISTEN ONLY"),
+            ("ESTABLISHED", "ESTABLISHED"),
+            ("TCP", "TCP"),
+            ("UDP", "UDP"),
+        ]:
+            b = Gtk.Button(label=lbl)
+            b.connect("clicked", lambda _w, k=key: self._set_socket_filter(k))
+            fbar.pack_start(b, False, False, 0)
+            self._sock_btns[key] = b
+        self._sync_socket_filter_btns()
+
+        lbl_s = Gtk.Label(label="FILTER:")
+        lbl_s.get_style_context().add_class("net-engraved")
+        fbar.pack_start(lbl_s, False, False, 4)
+
+        self.ent_sock_search = Gtk.Entry()
+        self.ent_sock_search.set_placeholder_text("Port, IP, service, PID, process...")
+        self.ent_sock_search.set_width_chars(24)
+        self.ent_sock_search.connect("changed", lambda *_: self._populate_socket_tree())
+        fbar.pack_start(self.ent_sock_search, True, True, 0)
+
+        btn_ref = Gtk.Button(label="⟳ REFRESH")
+        btn_ref.connect("clicked", lambda *_: self._refresh_sockets())
+        fbar.pack_start(btn_ref, False, False, 0)
+
+        self.btn_sock_auto = Gtk.ToggleButton(label="AUTO 3s")
+        self.btn_sock_auto.set_active(True)
+        self.btn_sock_auto.connect("toggled", lambda w: setattr(self, "_sock_auto", w.get_active()))
+        fbar.pack_start(self.btn_sock_auto, False, False, 0)
+
+        self.lbl_sock_counts = Gtk.Label(label="SOCKETS: 0")
+        self.lbl_sock_counts.get_style_context().add_class("net-engraved")
+        fbar.pack_end(self.lbl_sock_counts, False, False, 4)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.get_style_context().add_class("net-bevel-in")
+        vbox.pack_start(scroll, True, True, 0)
+
+        # proto, state, local, remote, service, queue, proc, bg_hex
+        self.sock_store = Gtk.ListStore(str, str, str, str, str, str, str, str)
+        self.sock_tree = Gtk.TreeView(model=self.sock_store)
+        self.sock_tree.get_style_context().add_class("greenbar")
+
+        for idx, (title, width) in enumerate(
+            [
+                ("PROTO", 62),
+                ("STATE", 104),
+                ("LOCAL ADDR:PORT", 205),
+                ("REMOTE ADDR:PORT", 205),
+                ("SERVICE", 96),
+                ("TX:RX Q", 74),
+                ("PID / PROCESS", 180),
+            ]
+        ):
+            ren = Gtk.CellRendererText()
+            col = Gtk.TreeViewColumn(title, ren, text=idx, cell_background=7)
+            col.set_sort_column_id(idx)
+            col.set_resizable(True)
+            col.set_min_width(width)
+            self.sock_tree.append_column(col)
+
+        scroll.add(self.sock_tree)
+        self.notebook.append_page(vbox, Gtk.Label(label="ACTIVE SOCKETS & PORTS (/proc/net)"))
+
+    # -----------------------------------------------------------------------
+    # Tab 3: LAN Sweep & Bench Tools
+    # -----------------------------------------------------------------------
+    def _build_tab_lan_bench(self):
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        paned.set_position(535)
+        paned.set_margin_top(4)
+        paned.set_margin_bottom(4)
+        paned.set_margin_start(4)
+        paned.set_margin_end(4)
+
+        # Left Module: Subnet & ARP Neighbor Sweeper
+        left_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        left_box.set_margin_end(3)
+
+        lbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        lbar.get_style_context().add_class("net-strip")
+        left_box.pack_start(lbar, False, False, 0)
+
+        lbl_sub = Gtk.Label(label="SUBNET:")
+        lbl_sub.get_style_context().add_class("net-engraved")
+        lbar.pack_start(lbl_sub, False, False, 2)
+
+        self.ent_subnet = Gtk.Entry()
+        self.ent_subnet.set_text(self.sampler.detect_local_subnet())
+        self.ent_subnet.set_width_chars(16)
+        lbar.pack_start(self.ent_subnet, False, False, 0)
+
+        self.btn_sweep = Gtk.Button(label="▶ SWEEP /24")
+        self.btn_sweep.get_style_context().add_class("btn-trace")
+        self.btn_sweep.connect("clicked", self._on_start_stop_sweep)
+        lbar.pack_start(self.btn_sweep, False, False, 0)
+
+        btn_arp = Gtk.Button(label="ARP TABLE")
+        btn_arp.connect("clicked", lambda *_: self._load_arp_into_sweep_table())
+        lbar.pack_start(btn_arp, False, False, 0)
+
+        btn_to_bench = Gtk.Button(label="→ BENCH")
+        btn_to_bench.set_tooltip_text("Send selected host into the right-hand Bench Inspector")
+        btn_to_bench.connect("clicked", self._on_send_sweep_host_to_bench)
+        lbar.pack_end(btn_to_bench, False, False, 0)
+
+        lscroll = Gtk.ScrolledWindow()
+        lscroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        lscroll.get_style_context().add_class("net-bevel-in")
+        left_box.pack_start(lscroll, True, True, 0)
+
+        # ip, rtt, mac, host_vendor, open_ports, bg_hex
+        self.sweep_store = Gtk.ListStore(str, str, str, str, str, str)
+        self.sweep_tree = Gtk.TreeView(model=self.sweep_store)
+        self.sweep_tree.get_style_context().add_class("greenbar")
+        self.sweep_tree.connect("row-activated", lambda *_: self._on_send_sweep_host_to_bench())
+
+        for idx, (title, width) in enumerate(
+            [("IP ADDRESS", 106), ("RTT", 56), ("MAC / ARP", 124), ("HOST / VENDOR", 112), ("OPEN PORTS", 110)]
+        ):
+            ren = Gtk.CellRendererText()
+            col = Gtk.TreeViewColumn(title, ren, text=idx, cell_background=5)
+            col.set_sort_column_id(idx)
+            col.set_resizable(True)
+            col.set_min_width(width)
+            self.sweep_tree.append_column(col)
+
+        lscroll.add(self.sweep_tree)
+        paned.pack1(left_box, True, False)
+
+        # Right Module: DNS / TCP Port / TLS Cert / HTTP Header Bench Inspector
+        right_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        right_box.set_margin_start(3)
+
+        rbar1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        rbar1.get_style_context().add_class("net-strip")
+        right_box.pack_start(rbar1, False, False, 0)
+
+        lbl_bh = Gtk.Label(label="HOST/URL:")
+        lbl_bh.get_style_context().add_class("net-engraved")
+        rbar1.pack_start(lbl_bh, False, False, 2)
+
+        self.ent_bench_host = Gtk.Entry()
+        self.ent_bench_host.set_text("github.com")
+        self.ent_bench_host.set_width_chars(18)
+        self.ent_bench_host.connect("activate", lambda *_: self._run_bench_tool("ALL"))
+        rbar1.pack_start(self.ent_bench_host, True, True, 0)
+
+        lbl_bp = Gtk.Label(label="PORT:")
+        lbl_bp.get_style_context().add_class("net-engraved")
+        rbar1.pack_start(lbl_bp, False, False, 0)
+
+        self.ent_bench_port = Gtk.Entry()
+        self.ent_bench_port.set_text("443")
+        self.ent_bench_port.set_width_chars(6)
+        rbar1.pack_start(self.ent_bench_port, False, False, 0)
+
+        rbar2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        rbar2.get_style_context().add_class("net-strip")
+        right_box.pack_start(rbar2, False, False, 0)
+
+        for mode, lbl in [
+            ("DNS", "DNS"),
+            ("TCP", "TCP PORTS"),
+            ("TLS", "TLS CERT"),
+            ("HTTP", "HTTP HEADER"),
+            ("ALL", "★ RUN ALL 4"),
+        ]:
+            b = Gtk.Button(label=lbl)
+            if mode == "ALL":
+                b.get_style_context().add_class("btn-amber")
+            b.connect("clicked", lambda _w, m=mode: self._run_bench_tool(m))
+            rbar2.pack_start(b, False, False, 0)
+
+        btn_clr = Gtk.Button(label="CLEAR")
+        btn_clr.connect("clicked", lambda *_: self.bench_buf.set_text(""))
+        rbar2.pack_end(btn_clr, False, False, 0)
+
+        bscroll = Gtk.ScrolledWindow()
+        bscroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        bscroll.get_style_context().add_class("net-bevel-in")
+        right_box.pack_start(bscroll, True, True, 0)
+
+        self.bench_view = Gtk.TextView()
+        self.bench_view.set_editable(False)
+        self.bench_view.set_monospace(True)
+        self.bench_view.set_left_margin(6)
+        self.bench_view.set_right_margin(6)
+        self.bench_view.set_top_margin(5)
+        self.bench_view.get_style_context().add_class("bench-console")
+        self.bench_buf = self.bench_view.get_buffer()
+        self.bench_buf.set_text(
+            "=== dtNet Protocol & Security Bench Inspector ===\n"
+            "Enter any hostname, IPv4/IPv6 address, or URL above and select:\n"
+            "  [DNS]         A / AAAA / PTR / CNAME + system resolver inspection\n"
+            "  [TCP PORTS]   SYN->ACK handshake latency + ASCII service banner grab\n"
+            "  [TLS CERT]    X.509 Subject, Issuer, SANs, Cipher & Expiry countdown\n"
+            "  [HTTP HEADER] Live HTTP/HTTPS status, latency & security headers\n"
+        )
+        bscroll.add(self.bench_view)
+        paned.pack2(right_box, True, False)
+
+        self.notebook.append_page(paned, Gtk.Label(label="LAN SWEEP & BENCH TOOLS"))
+
+    # -----------------------------------------------------------------------
+    # Top Telemetry Rack Logic & Ballistic Cairo Drawing
+    # -----------------------------------------------------------------------
+    def _set_dial_face(self, dark: bool):
+        self.dark_phosphor = dark
+        self._sync_face_buttons()
+        self._save_state()
+        self.dials_area.queue_draw()
+
+    def _sync_face_buttons(self):
+        for btn, active, cls_name in [
+            (self.btn_face_dark, self.dark_phosphor, "sw-active"),
+            (self.btn_face_warm, not self.dark_phosphor, "btn-amber"),
+        ]:
+            ctx = btn.get_style_context()
+            if active:
+                ctx.add_class(cls_name)
+            else:
+                ctx.remove_class(cls_name)
+
+    def _on_cycle_dial3_mode(self, *_args):
+        modes = ["AUTO", "RTT", "RF"]
+        idx = (modes.index(self.dial3_mode) + 1) % len(modes) if self.dial3_mode in modes else 0
+        self.dial3_mode = modes[idx]
+        self.btn_d3_mode.set_label(f"DIAL 3: {self.dial3_mode}")
+        self._save_state()
+        self.dials_area.queue_draw()
+
+    def _on_dials_clicked(self, widget: Gtk.Widget, ev: Gdk.EventButton):
+        w = widget.get_allocated_width()
+        if w > 0 and ev.x > (w * 2.0 / 3.0):
+            self._on_cycle_dial3_mode()
+
+    def _refresh_nic_combo(self):
+        cur = self.sampler.selected_iface
+        self.cmb_nic.remove_all()
+        self.cmb_nic.append("ALL", "ALL (NON-LO AGGREGATE)")
+        for nic in self.sampler.nic_names:
+            self.cmb_nic.append(nic, nic)
+        self.cmb_nic.set_active_id(cur if (cur == "ALL" or cur in self.sampler.nic_names) else "ALL")
+
+    def _on_nic_changed(self, combo: Gtk.ComboBoxText):
+        nid = combo.get_active_id()
+        if nid:
+            self.sampler.selected_iface = nid
+            self.sampler.sample()
+            self._update_nic_vfd()
+            self.strip_area.queue_draw()
+
+    def _update_nic_vfd(self):
+        s = self.sampler
+        if s.link_up:
+            self.lbl_link_badge.set_markup('<span foreground="#58fcb8" weight="bold">● LINK UP</span>')
+        else:
+            self.lbl_link_badge.set_markup('<span foreground="#ff6b6b" weight="bold">○ LINK DOWN</span>')
+
+        v6_short = s.ipv6_addr if len(s.ipv6_addr) <= 22 else s.ipv6_addr[:21] + "…"
+        txt = (
+            f"IPv4: {s.ipv4_addr:<18} SPD: {s.speed_str:<9} MTU: {s.mtu}\n"
+            f"IPv6: {v6_short:<18} MAC: {s.mac_addr}\n"
+            f"TOT RX: {fmt_bytes_gib(s.tot_rx_bytes):<10} TX: {fmt_bytes_gib(s.tot_tx_bytes):<10} ERR/DRP: {s.tot_errs}/{s.tot_drops}"
+        )
+        self.lbl_nic_vfd.set_text(txt)
+
+    @staticmethod
+    def _step_needle(state: list[float], target: float):
+        # Damped spring-mass analog meter ballistics (18 fps)
+        force = (target - state[0]) * 0.28
+        state[1] = (state[1] + force) * 0.64
+        state[0] = max(0.0, min(1.0, state[0] + state[1]))
+
+    def _use_rf_on_dial3(self) -> bool:
+        if self.dial3_mode == "RF":
+            return True
+        if self.dial3_mode == "RTT":
+            return False
+        return self.sampler.wifi_present
+
+    def _on_anim_tick(self) -> bool:
+        s = self.sampler
+        rx_ceil, _, _ = choose_throughput_scale(max(s.rx_bps, s.rx_peak_bps))
+        tx_ceil, _, _ = choose_throughput_scale(max(s.tx_bps, s.tx_peak_bps))
+
+        self._step_needle(self._needle_rx, min(1.0, s.rx_bps / rx_ceil))
+        self._step_needle(self._needle_tx, min(1.0, s.tx_bps / tx_ceil))
+
+        if self._use_rf_on_dial3():
+            d3_target = max(0.0, min(1.0, (s.wifi_dbm + 100.0) / 70.0)) if s.wifi_present else 0.0
+        else:
+            d3_target = max(0.0, min(1.0, (s.rtt_ms or 0.0) / 250.0))
+        self._step_needle(self._needle_d3, d3_target)
+
+        self._pulse_phase = (self._pulse_phase + 0.022) % 1.0
+        self.dials_area.queue_draw()
+        if self.notebook.get_current_page() == 0:
+            self.radar_area.queue_draw()
+        return True
+
+    def _on_sample_tick(self) -> bool:
+        prev_nics = list(self.sampler.nic_names)
+        self.sampler.sample()
+        if self.sampler.nic_names != prev_nics:
+            self._refresh_nic_combo()
+        self._update_nic_vfd()
+        self.strip_area.queue_draw()
+        return True
+
+    def _on_draw_dials(self, widget: Gtk.Widget, cr: cairo.Context):
+        w = float(widget.get_allocated_width())
+        h = float(widget.get_allocated_height())
+        s = self.sampler
+        gap = 6.0
+        gw = (w - 2.0 * gap) / 3.0
+
+        # Dial 1: RX THROUGHPUT
+        rx_ceil, rx_unit, rx_marks = choose_throughput_scale(max(s.rx_bps, s.rx_peak_bps))
+        NetCairoRenderer.draw_analog_dial(
+            cr, 0.0, 0.0, gw, h,
+            "RX THROUGHPUT", rx_unit,
+            self._needle_rx[0],
+            min(1.0, s.rx_peak_bps / rx_ceil),
+            rx_marks, (0.80, 1.0),
+            self.dark_phosphor,
+            fmt_bits_rate(s.rx_bps),
+            f"PK {fmt_bits_short(s.rx_peak_bps)} | {s.rx_pps:.0f} pkt/s",
+            [("RX ACT", (0.22, 0.96, 0.58), s.rx_pps > 0.2), ("PEAK", (0.96, 0.24, 0.22), s.rx_bps > rx_ceil * 0.8)],
+            screw_seed=1,
+        )
+
+        # Dial 2: TX THROUGHPUT
+        tx_ceil, tx_unit, tx_marks = choose_throughput_scale(max(s.tx_bps, s.tx_peak_bps))
+        NetCairoRenderer.draw_analog_dial(
+            cr, gw + gap, 0.0, gw, h,
+            "TX THROUGHPUT", tx_unit,
+            self._needle_tx[0],
+            min(1.0, s.tx_peak_bps / tx_ceil),
+            tx_marks, (0.80, 1.0),
+            self.dark_phosphor,
+            fmt_bits_rate(s.tx_bps),
+            f"PK {fmt_bits_short(s.tx_peak_bps)} | {s.tx_pps:.0f} pkt/s",
+            [("TX ACT", (1.00, 0.72, 0.20), s.tx_pps > 0.2), ("ERR/DRP", (0.96, 0.24, 0.22), s.err_delta > 0)],
+            screw_seed=2,
+        )
+
+        # Dial 3: RTT LATENCY or WI-FI RF LINK
+        x3 = 2.0 * (gw + gap)
+        if self._use_rf_on_dial3():
+            rf_marks = [
+                (0.0, "-100", True), (0.214, "-85", True), (0.428, "-70", False),
+                (0.643, "-55", False), (0.857, "-40", False), (1.0, "-30", False),
+            ]
+            l1 = f"{s.wifi_dbm:.0f} dBm ({s.wifi_qual_pct:.0f}%)" if s.wifi_present else "NO WIRELESS NIC"
+            l2 = f"{s.wifi_iface} | NF {s.wifi_noise_dbm:.0f}dBm" if s.wifi_present else "CLICK DIAL -> RTT"
+            NetCairoRenderer.draw_analog_dial(
+                cr, x3, 0.0, gw, h,
+                "RF LINK QUALITY", "Signal Level (dBm)",
+                self._needle_d3[0], None,
+                rf_marks, (0.0, 0.25),
+                self.dark_phosphor, l1, l2,
+                [("802.11", (0.24, 0.96, 0.62), s.wifi_present), ("LOW RF", (1.0, 0.62, 0.18), s.wifi_present and s.wifi_dbm < -78)],
+                screw_seed=3,
+            )
+        else:
+            rtt_marks = [
+                (0.0, "0", False), (0.2, "50", False), (0.4, "100", False),
+                (0.6, "150", True), (0.8, "200", True), (1.0, "250", True),
+            ]
+            l1 = f"{s.rtt_ms:5.1f} ms" if s.rtt_ms is not None else "--- ms (OFFLINE)"
+            l2 = f"JIT ±{s.rtt_jitter_ms:.1f}ms | {s.rtt_target[:12]}"
+            NetCairoRenderer.draw_analog_dial(
+                cr, x3, 0.0, gw, h,
+                "RTT LATENCY", "ICMP RTT (0-250 ms)",
+                self._needle_d3[0],
+                min(1.0, s.rtt_peak_ms / 250.0) if s.rtt_peak_ms > 0 else None,
+                rtt_marks, (0.60, 1.0),
+                self.dark_phosphor, l1, l2,
+                [("ECHO OK", (0.24, 0.96, 0.62), s.rtt_ms is not None), ("JITTER", (1.0, 0.70, 0.20), s.rtt_jitter_ms > 15.0)],
+                screw_seed=3,
+            )
+
+    def _on_draw_stripchart(self, widget: Gtk.Widget, cr: cairo.Context):
+        w = float(widget.get_allocated_width())
+        h = float(widget.get_allocated_height())
+        NetCairoRenderer.draw_phosphor_stripchart(
+            cr, 0.0, 0.0, w, h,
+            self.sampler.rx_hist, self.sampler.tx_hist,
+            self.sampler.rx_bps, self.sampler.tx_bps,
+        )
+
+    # -----------------------------------------------------------------------
+    # Ambient & Continuous Ping Threads (Non-Blocking)
+    # -----------------------------------------------------------------------
+    def _start_ambient_rtt_thread(self):
+        def worker():
+            last_rtt: float | None = None
+            while not self._bg_ping_stop.is_set():
+                if not self._cping_running:
+                    tgt = self.sampler.rtt_target or "1.1.1.1"
+                    rtt = self._single_ping_ms(tgt)
+                    if rtt is not None:
+                        jit = abs(rtt - last_rtt) if last_rtt is not None else 0.0
+                        last_rtt = rtt
+                        self.sampler.rtt_ms = rtt
+                        self.sampler.rtt_peak_ms = max(self.sampler.rtt_peak_ms * 0.98, rtt)
+                        self.sampler.rtt_jitter_ms = 0.7 * self.sampler.rtt_jitter_ms + 0.3 * jit
+                    else:
+                        self.sampler.rtt_ms = None
+                self._bg_ping_stop.wait(2.5)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _single_ping_ms(target: str) -> float | None:
+        if not shutil.which("ping"):
+            return None
+        try:
+            proc = subprocess.run(
+                ["ping", "-n", "-c", "1", "-W", "1", target],
+                capture_output=True, text=True, timeout=1.8,
+            )
+            m = PING_REPLY_RE.search(proc.stdout)
+            if m:
+                return float(m.group(2))
+        except Exception:
+            pass
+        return None
+
+    def _on_toggle_continuous_ping(self, btn: Gtk.ToggleButton):
+        if btn.get_active():
+            target = self.ent_target.get_text().strip() or "1.1.1.1"
+            self.sampler.rtt_target = target
+            self._cping_stop.clear()
+            self._cping_running = True
+            btn.set_label("■ STOP PING")
+            btn.get_style_context().add_class("btn-stop")
+            threading.Thread(target=self._continuous_ping_worker, args=(target,), daemon=True).start()
+        else:
+            self._cping_stop.set()
+            self._cping_running = False
+            btn.set_label("▶ CONTINUOUS PING")
+            btn.get_style_context().remove_class("btn-stop")
+
+    def _continuous_ping_worker(self, target: str):
+        sent = 0
+        rcvd = 0
+        rtts: list[float] = []
+        while not self._cping_stop.is_set():
+            sent += 1
+            rtt = self._single_ping_ms(target)
+            if rtt is not None:
+                rcvd += 1
+                if rtts:
+                    jit = abs(rtt - rtts[-1])
+                    self.sampler.rtt_jitter_ms = 0.65 * self.sampler.rtt_jitter_ms + 0.35 * jit
+                rtts.append(rtt)
+                if len(rtts) > 60:
+                    rtts.pop(0)
+                self.sampler.rtt_ms = rtt
+                self.sampler.rtt_peak_ms = max(self.sampler.rtt_peak_ms, rtt)
+                loss = 100.0 * (sent - rcvd) / sent
+                mn, av, mx = min(rtts), sum(rtts) / len(rtts), max(rtts)
+                summary = f"PING {target}: {rtt:.1f}ms (min/avg/max {mn:.1f}/{av:.1f}/{mx:.1f}ms | jit ±{self.sampler.rtt_jitter_ms:.1f}ms | loss {loss:.0f}%)"
+            else:
+                self.sampler.rtt_ms = None
+                loss = 100.0 * (sent - rcvd) / sent
+                summary = f"PING {target}: TIMEOUT / OFFLINE (sent {sent}, loss {loss:.0f}%)"
+
+            GLib.idle_add(self._update_ping_hud, summary)
+            self._cping_stop.wait(1.0)
+
+    def _update_ping_hud(self, summary: str):
+        self._cping_stats = summary
+        self.lbl_status.set_text(summary)
+        self.radar_area.queue_draw()
+        return False
+
+    # -----------------------------------------------------------------------
+    # World Traceroute Radar Actions & Background Worker
+    # -----------------------------------------------------------------------
+    def _on_preset_selected(self, combo: Gtk.ComboBoxText):
+        hid = combo.get_active_id()
+        if hid:
+            self.ent_target.set_text(hid)
+            self.sampler.rtt_target = hid
+
+    def _on_toggle_autofit(self, btn: Gtk.ToggleButton):
+        self.auto_fit_map = btn.get_active()
+        self.radar_area.queue_draw()
+
+    def _on_load_demo_route(self, *_args):
+        tgt = self.ent_target.get_text().strip() or "1.1.1.1"
+        self.trace_hops = build_demo_hops(tgt)
+        self.selected_hop = None
+        self._populate_hop_tree()
+        self.radar_area.queue_draw()
+        self.lbl_status.set_text(f"DEMO GREAT-CIRCLE ROUTE LOADED: {HOME_QTH_NAME} -> {tgt} ({len(self.trace_hops)} hops)")
+
+    def _on_draw_radar(self, widget: Gtk.Widget, cr: cairo.Context):
+        w = float(widget.get_allocated_width())
+        h = float(widget.get_allocated_height())
+        tgt = self.ent_target.get_text().strip() or "1.1.1.1"
+        self._radar_hits = NetCairoRenderer.draw_world_radar(
+            cr, w, h, self.trace_hops, self.selected_hop,
+            self.auto_fit_map, self._pulse_phase, tgt, self._cping_stats,
+        )
+
+    def _on_radar_clicked(self, _widget: Gtk.Widget, ev: Gdk.EventButton):
+        best_hop = None
+        best_d2 = 196.0  # 14px radius
+        for hnum, hx, hy in self._radar_hits:
+            d2 = (ev.x - hx) ** 2 + (ev.y - hy) ** 2
+            if d2 < best_d2:
+                best_d2 = d2
+                best_hop = hnum
+        self.selected_hop = best_hop
+        self.radar_area.queue_draw()
+
+    def _on_hop_row_selected(self, selection: Gtk.TreeSelection):
+        model, it = selection.get_selected()
+        if it:
+            self.selected_hop = model.get_value(it, 0)
+            self.radar_area.queue_draw()
+
+    def _populate_hop_tree(self):
+        self.hop_store.clear()
+        for idx, hp in enumerate(self.trace_hops):
+            bg = "#eaf4ea" if idx % 2 == 1 else "#f7fbf6"
+            rtt_s = f"{hp.rtt_ms:6.1f} ms" if hp.rtt_ms is not None else "   *    "
+            loc = f"{hp.city}, {hp.cc}".strip(", ") if hp.ip != "*" else "(no ICMP reply)"
+            km_s = f"{hp.dist_km:6.0f}" if hp.ip != "*" else "-"
+            self.hop_store.append([hp.hop, str(hp.hop), hp.ip, rtt_s, loc, hp.asn, km_s, bg])
+
+    def _on_start_stop_trace(self):
+        if self._trace_running:
+            self._trace_stop.set()
+            return
+        target = self.ent_target.get_text().strip()
+        if not target:
+            return
+        self.sampler.rtt_target = target
+        mode = self.cmb_trace_mode.get_active_id() or "AUTO"
+        self._trace_stop.clear()
+        self._trace_running = True
+        self.trace_hops = []
+        self._populate_hop_tree()
+        self.radar_area.queue_draw()
+        self.btn_trace.set_label("■ STOP TRACE")
+        self.btn_trace.get_style_context().remove_class("btn-trace")
+        self.btn_trace.get_style_context().add_class("btn-stop")
+        self.lbl_status.set_text(f"TRACING GREAT-CIRCLE ROUTE: {HOME_QTH_NAME} -> {target} ...")
+        threading.Thread(target=self._trace_worker, args=(target, mode), daemon=True).start()
+
+    def _trace_worker(self, target: str, mode: str):
+        try:
+            dest_ip = socket.gethostbyname(target)
+        except OSError as exc:
+            GLib.idle_add(
+                self._finish_trace,
+                f"DNS / NETWORK OFFLINE ({exc}) — click [DEMO ARC] to preview world radar offline.",
+            )
+            return
+
+        collected: list[tuple[int, str, float | None]] = []
+
+        def push_hop(hnum: int, hip: str, rtt: float | None):
+            collected.append((hnum, hip, rtt))
+            if hip != "*":
+                gmap = self.geo.resolve_many([hip])
+                g = gmap.get(hip, {"lat": HOME_QTH_LAT, "lon": HOME_QTH_LON, "city": "Unknown", "cc": "", "asn": "-"})
+                dkm = haversine_km(HOME_QTH_LAT, HOME_QTH_LON, g["lat"], g["lon"])
+                hop_obj = TraceHop(hnum, hip, rtt, g["lat"], g["lon"], g["city"], g["cc"], g["asn"], dkm, True)
+            else:
+                hop_obj = TraceHop(hnum, "*", None, HOME_QTH_LAT, HOME_QTH_LON, "", "", "-", 0.0, False)
+            GLib.idle_add(self._append_live_hop, hop_obj)
+
+        used_external = False
+        if mode in ("AUTO", "TRACEROUTE") and shutil.which("traceroute"):
+            used_external = self._run_cmd_traceroute(["traceroute", "-n", "-q", "2", "-w", "1", "-m", "24", dest_ip], push_hop)
+        if not used_external and not collected and mode in ("AUTO", "TRACEPATH") and shutil.which("tracepath"):
+            used_external = self._run_cmd_traceroute(["tracepath", "-n", "-m", "24", dest_ip], push_hop)
+
+        # Universal zero-privilege Linux fallback: `ping -n -t <ttl> -c 1 -W 1`
+        if not collected and not self._trace_stop.is_set() and shutil.which("ping"):
+            consecutive_stars = 0
+            for ttl in range(1, 25):
+                if self._trace_stop.is_set():
+                    break
+                t0 = time.monotonic()
+                try:
+                    proc = subprocess.run(
+                        ["ping", "-n", "-t", str(ttl), "-c", "1", "-W", "1", dest_ip],
+                        capture_output=True, text=True, timeout=1.6,
+                    )
+                    out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+                except Exception as exc:
+                    out = str(exc)
+                elapsed_ms = (time.monotonic() - t0) * 1000.0
+                if "Network is unreachable" in out or "Invalid argument" in out and ttl == 1:
+                    break
+                hip, rtt, reached = parse_ping_ttl_output(out, elapsed_ms)
+                push_hop(ttl, hip, rtt)
+                if reached or hip == dest_ip:
+                    break
+                consecutive_stars = consecutive_stars + 1 if hip == "*" else 0
+                if consecutive_stars >= 6 and ttl >= 12:
+                    break
+
+        if not collected:
+            GLib.idle_add(
+                self._finish_trace,
+                f"NETWORK UNREACHABLE TO {dest_ip} — click [DEMO ARC] to preview world traceroute arcs.",
+            )
+        else:
+            GLib.idle_add(
+                self._finish_trace,
+                f"TRACE COMPLETE: {target} ({dest_ip}) — {len(collected)} hops mapped from {HOME_QTH_NAME}",
+            )
+
+    def _run_cmd_traceroute(self, cmd: list[str], push_hop) -> bool:
+        got_any_ip = False
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            assert proc.stdout is not None
+            for ln in proc.stdout:
+                if self._trace_stop.is_set():
+                    proc.terminate()
+                    break
+                parsed = parse_traceroute_line(ln)
+                if parsed:
+                    hnum, hip, rtt = parsed
+                    if hip != "*":
+                        got_any_ip = True
+                    push_hop(hnum, hip, rtt)
+            proc.wait(timeout=1.5)
+        except Exception:
+            return False
+        return got_any_ip
+
+    def _append_live_hop(self, hop_obj: TraceHop):
+        self.trace_hops = [h for h in self.trace_hops if h.hop != hop_obj.hop] + [hop_obj]
+        self.trace_hops.sort(key=lambda x: x.hop)
+        if hop_obj.rtt_ms is not None:
+            self.sampler.rtt_ms = hop_obj.rtt_ms
+        self._populate_hop_tree()
+        self.radar_area.queue_draw()
+        return False
+
+    def _finish_trace(self, msg: str):
+        self._trace_running = False
+        self.btn_trace.set_label("▶ TRACE ROUTE")
+        self.btn_trace.get_style_context().remove_class("btn-stop")
+        self.btn_trace.get_style_context().add_class("btn-trace")
+        self.lbl_status.set_text(msg)
+        self.radar_area.queue_draw()
+        return False
+
+    # -----------------------------------------------------------------------
+    # Tab 2: Pure /proc/net Socket Inspector
+    # -----------------------------------------------------------------------
+    def _set_socket_filter(self, key: str):
+        self._sock_filter = key
+        self._sync_socket_filter_btns()
+        self._populate_socket_tree()
+
+    def _sync_socket_filter_btns(self):
+        for k, btn in self._sock_btns.items():
+            ctx = btn.get_style_context()
+            if k == self._sock_filter:
+                ctx.add_class("sw-active")
+            else:
+                ctx.remove_class("sw-active")
+
+    def _on_socket_auto_tick(self) -> bool:
+        if self._sock_auto and self.notebook.get_current_page() == 1:
+            self._refresh_sockets()
+        return True
+
+    def _refresh_sockets(self):
+        inode_map = scan_inode_to_process_map()
+        rows: list[dict] = []
+        for path_s, proto_lbl, v6 in [
+            ("/proc/net/tcp", "TCP", False),
+            ("/proc/net/tcp6", "TCP6", True),
+            ("/proc/net/udp", "UDP", False),
+            ("/proc/net/udp6", "UDP6", True),
+        ]:
+            p = Path(path_s)
+            if p.is_file():
+                try:
+                    txt = p.read_text(encoding="utf-8", errors="replace")
+                    rows.extend(parse_proc_net_sockets_text(txt, proto_lbl, is_ipv6=v6))
+                except OSError:
+                    continue
+
+        for r in rows:
+            r["proc"] = inode_map.get(r["inode"], f"uid:{r['uid']}" if r["inode"] != "0" else "-")
+
+        state_rank = {"LISTEN": 0, "ESTABLISHED": 1, "SYN_SENT": 2, "CLOSE_WAIT": 3, "TIME_WAIT": 4}
+        rows.sort(key=lambda r: (state_rank.get(r["state"], 5), r["proto"], r["lport"]))
+        self._all_sockets = rows
+
+        n_listen = sum(1 for r in rows if r["state"] == "LISTEN")
+        n_estab = sum(1 for r in rows if r["state"] == "ESTABLISHED")
+        n_udp = sum(1 for r in rows if r["proto"].startswith("UDP"))
+        self.lbl_sock_counts.set_text(f"TOTAL: {len(rows)}  |  LISTEN: {n_listen}  |  ESTAB: {n_estab}  |  UDP: {n_udp}")
+        self._populate_socket_tree()
+
+    def _populate_socket_tree(self):
+        self.sock_store.clear()
+        q = self.ent_sock_search.get_text().strip().lower()
+        flt = self._sock_filter
+        idx = 0
+        for r in self._all_sockets:
+            if flt == "LISTEN" and r["state"] != "LISTEN":
+                continue
+            if flt == "ESTABLISHED" and r["state"] != "ESTABLISHED":
+                continue
+            if flt == "TCP" and not r["proto"].startswith("TCP"):
+                continue
+            if flt == "UDP" and not r["proto"].startswith("UDP"):
+                continue
+            if q:
+                blob = f"{r['proto']} {r['state']} {r['local']} {r['remote']} {r['service']} {r['proc']}".lower()
+                if q not in blob:
+                    continue
+            bg = "#eaf4ea" if idx % 2 == 1 else "#f7fbf6"
+            idx += 1
+            self.sock_store.append([r["proto"], r["state"], r["local"], r["remote"], r["service"], r["queue"], r["proc"], bg])
+
+    # -----------------------------------------------------------------------
+    # Tab 3: LAN Sweep & Protocol Bench Tools
+    # -----------------------------------------------------------------------
+    def _read_arp_map(self) -> dict[str, dict[str, str]]:
+        out: dict[str, dict[str, str]] = {}
+        try:
+            arp_txt = Path("/proc/net/arp").read_text(encoding="utf-8", errors="replace")
+            for item in parse_proc_net_arp_text(arp_txt):
+                out[item["ip"]] = item
+        except OSError:
+            pass
+        return out
+
+    def _load_arp_into_sweep_table(self):
+        self.sweep_store.clear()
+        arp_map = self._read_arp_map()
+        for idx, (ip_a, info) in enumerate(sorted(arp_map.items())):
+            bg = "#eaf4ea" if idx % 2 == 1 else "#f7fbf6"
+            hv = info["vendor"] or info["dev"]
+            self.sweep_store.append([ip_a, "ARP", info["mac"], hv, "(click SWEEP)", bg])
+
+    def _on_send_sweep_host_to_bench(self, *_args):
+        model, it = self.sweep_tree.get_selection().get_selected()
+        if it:
+            ip_a = model.get_value(it, 0)
+            self.ent_bench_host.set_text(ip_a)
+            self._run_bench_tool("TCP")
+
+    def _on_start_stop_sweep(self, *_args):
+        if self._sweep_running:
+            self._sweep_stop.set()
+            return
+        cidr = self.ent_subnet.get_text().strip()
+        m = re.match(r"^(\d+\.\d+\.\d+)\.\d+(?:/\d+)?$", cidr)
+        if not m:
+            self.lbl_status.set_text("INVALID /24 SUBNET FORMAT — example: 192.168.1.0/24")
+            return
+        prefix = m.group(1)
+        self._sweep_stop.clear()
+        self._sweep_running = True
+        self.sweep_store.clear()
+        self.btn_sweep.set_label("■ STOP")
+        self.btn_sweep.get_style_context().remove_class("btn-trace")
+        self.btn_sweep.get_style_context().add_class("btn-stop")
+        self.lbl_status.set_text(f"SWEEPING LAN SUBNET {prefix}.1..254 (ICMP + TCP {SWEEP_PORTS})...")
+        threading.Thread(target=self._lan_sweep_worker, args=(prefix,), daemon=True).start()
+
+    def _lan_sweep_worker(self, prefix: str):
+        hosts = [f"{prefix}.{i}" for i in range(1, 255)]
+        found = 0
+
+        def probe_host(ip_a: str) -> dict | None:
+            if self._sweep_stop.is_set():
+                return None
+            open_p: list[int] = []
+            best_ms: float | None = None
+            for port in SWEEP_PORTS:
+                if self._sweep_stop.is_set():
+                    return None
+                t0 = time.monotonic()
+                try:
+                    with socket.create_connection((ip_a, port), timeout=0.22):
+                        ms = (time.monotonic() - t0) * 1000.0
+                        open_p.append(port)
+                        best_ms = ms if best_ms is None else min(best_ms, ms)
+                except ConnectionRefusedError:
+                    ms = (time.monotonic() - t0) * 1000.0
+                    best_ms = ms if best_ms is None else min(best_ms, ms)
+                except OSError:
+                    continue
+
+            if best_ms is None and not open_p:
+                rtt_p = self._single_ping_ms(ip_a)
+                if rtt_p is not None:
+                    best_ms = rtt_p
+
+            arp_map = self._read_arp_map()
+            arp_entry = arp_map.get(ip_a)
+            if best_ms is None and not open_p and not arp_entry:
+                return None
+
+            hname = ""
+            try:
+                hname = socket.gethostbyaddr(ip_a)[0]
+            except OSError:
+                pass
+
+            mac = arp_entry["mac"] if arp_entry else "-"
+            vendor = arp_entry["vendor"] if arp_entry else ""
+            hv = hname or vendor or "-"
+            p_str = ",".join(str(p) for p in open_p) if open_p else "-"
+            rtt_s = f"{best_ms:.1f}ms" if best_ms is not None else "ARP"
+            return {"ip": ip_a, "rtt": rtt_s, "mac": mac, "hv": hv[:26], "ports": p_str}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
+            futs = [pool.submit(probe_host, h) for h in hosts]
+            for fut in concurrent.futures.as_completed(futs):
+                if self._sweep_stop.is_set():
+                    break
+                res = fut.result()
+                if res:
+                    found += 1
+                    GLib.idle_add(self._append_sweep_row, res, found)
+
+        GLib.idle_add(self._finish_sweep, prefix, found)
+
+    def _append_sweep_row(self, res: dict, idx: int):
+        bg = "#eaf4ea" if idx % 2 == 1 else "#f7fbf6"
+        self.sweep_store.append([res["ip"], res["rtt"], res["mac"], res["hv"], res["ports"], bg])
+        return False
+
+    def _finish_sweep(self, prefix: str, found: int):
+        self._sweep_running = False
+        self.btn_sweep.set_label("▶ SWEEP /24")
+        self.btn_sweep.get_style_context().remove_class("btn-stop")
+        self.btn_sweep.get_style_context().add_class("btn-trace")
+        if found == 0:
+            self._load_arp_into_sweep_table()
+        self.lbl_status.set_text(f"LAN SWEEP COMPLETE: {prefix}.0/24 — {found} active host(s) responded.")
+        return False
+
+    # -----------------------------------------------------------------------
+    # Bench Inspector (DNS / TCP Banner / TLS Cert / HTTP Header)
+    # -----------------------------------------------------------------------
+    def _append_bench_text(self, text: str):
+        end_it = self.bench_buf.get_end_iter()
+        self.bench_buf.insert(end_it, text)
+        mark = self.bench_buf.create_mark(None, self.bench_buf.get_end_iter(), False)
+        self.bench_view.scroll_to_mark(mark, 0.0, False, 0.0, 1.0)
+        return False
+
+    def _run_bench_tool(self, mode: str):
+        raw_target = self.ent_bench_host.get_text().strip()
+        if not raw_target:
+            return
+        try:
+            port = int(self.ent_bench_port.get_text().strip())
+        except ValueError:
+            port = 443
+
+        parsed = urllib.parse.urlparse(raw_target if "://" in raw_target else f"https://{raw_target}")
+        host = parsed.hostname or raw_target
+        if parsed.port:
+            port = parsed.port
+
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        GLib.idle_add(self._append_bench_text, f"\n[{ts}] >>> BENCH {mode} :: {host}:{port} <<<\n")
+        threading.Thread(target=self._bench_worker, args=(mode, raw_target, host, port), daemon=True).start()
+
+    def _bench_worker(self, mode: str, raw_target: str, host: str, port: int):
+        sections: list[str] = []
+
+        if mode in ("DNS", "ALL"):
+            lines = ["[DNS RESOLVER]"]
+            lines.append(f"  System Nameservers : {', '.join(get_system_nameservers())}")
+            t0 = time.monotonic()
+            try:
+                infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+                ms = (time.monotonic() - t0) * 1000.0
+                addrs = sorted({info[4][0] for info in infos})
+                lines.append(f"  Lookup Latency     : {ms:.1f} ms")
+                for a in addrs:
+                    fam = "AAAA" if ":" in a else "A   "
+                    ptr = ""
+                    try:
+                        ptr = f"  (PTR: {socket.gethostbyaddr(a)[0]})"
+                    except OSError:
+                        pass
+                    lines.append(f"  {fam} Record        : {a}{ptr}")
+            except OSError as exc:
+                lines.append(f"  DNS Error / Offline: {exc}")
+            sections.append("\n".join(lines) + "\n")
+
+        if mode in ("TCP", "ALL"):
+            lines = ["[TCP PORT & BANNER PROBE]"]
+            ports_to_test = [port] if mode == "TCP" else list(dict.fromkeys([port, 22, 80, 443, 8073, 8080]))
+            for p in ports_to_test:
+                t0 = time.monotonic()
+                try:
+                    with socket.create_connection((host, p), timeout=2.0) as sock:
+                        ms = (time.monotonic() - t0) * 1000.0
+                        sock.settimeout(0.6)
+                        banner = ""
+                        if p in (21, 22, 25, 110, 143, 587, 6667):
+                            try:
+                                raw_b = sock.recv(128)
+                                banner = raw_b.decode("utf-8", errors="replace").strip().splitlines()[0][:60]
+                            except OSError:
+                                pass
+                        svc = port_service_name(p, "tcp")
+                        b_note = f" | Banner: {banner}" if banner else ""
+                        lines.append(f"  TCP {p:<5} ({svc:<10}): OPEN  ({ms:.1f} ms SYN/ACK){b_note}")
+                except OSError as exc:
+                    lines.append(f"  TCP {p:<5} ({port_service_name(p, 'tcp'):<10}): CLOSED/UNREACHABLE ({exc})")
+            sections.append("\n".join(lines) + "\n")
+
+        if mode in ("TLS", "ALL"):
+            lines = ["[TLS / X.509 CERTIFICATE]"]
+            tls_port = port if port not in (80, 22, 53) else 443
+            ctx = ssl.create_default_context()
+            t0 = time.monotonic()
+            try:
+                with socket.create_connection((host, tls_port), timeout=2.8) as raw_sock:
+                    with ctx.wrap_socket(raw_sock, server_hostname=host) as ssock:
+                        ms = (time.monotonic() - t0) * 1000.0
+                        cert = ssock.getpeercert() or {}
+                        cipher = ssock.cipher()
+                        subj = dict(x[0] for x in cert.get("subject", ()))
+                        issr = dict(x[0] for x in cert.get("issuer", ()))
+                        not_after = cert.get("notAfter", "")
+                        sans = [v for k, v in cert.get("subjectAltName", ()) if k == "DNS"]
+                        days_str = ""
+                        if not_after:
+                            try:
+                                exp_ts = ssl.cert_time_to_seconds(not_after)
+                                days_left = int((exp_ts - time.time()) / 86400)
+                                days_str = f" ({days_left} days remaining)"
+                            except Exception:
+                                pass
+                        lines.append(f"  Protocol & Cipher  : {ssock.version()} / {cipher[0] if cipher else '?'} ({ms:.1f} ms)")
+                        lines.append(f"  Subject CN         : {subj.get('commonName', '-')}")
+                        lines.append(f"  Issuer             : {issr.get('organizationName', issr.get('commonName', '-'))}")
+                        lines.append(f"  Expires (notAfter) : {not_after}{days_str}")
+                        if sans:
+                            lines.append(f"  SANs ({len(sans):>2})          : {', '.join(sans[:5])}")
+            except Exception as exc:
+                lines.append(f"  TLS Handshake Info : {exc}")
+            sections.append("\n".join(lines) + "\n")
+
+        if mode in ("HTTP", "ALL"):
+            lines = ["[HTTP / HTTPS RESPONSE HEADERS]"]
+            url = raw_target if "://" in raw_target else (f"http://{host}:{port}" if port == 80 else f"https://{host}:{port}")
+            req = urllib.request.Request(url, headers={"User-Agent": UA}, method="HEAD")
+            t0 = time.monotonic()
+            try:
+                with urllib.request.urlopen(req, timeout=3.2) as resp:
+                    ms = (time.monotonic() - t0) * 1000.0
+                    lines.append(f"  URL                : {resp.geturl()}")
+                    lines.append(f"  Status             : HTTP {resp.status} {resp.reason} ({ms:.1f} ms)")
+                    for hk, hv in list(resp.headers.items())[:14]:
+                        lines.append(f"  {hk:<19}: {hv[:72]}")
+            except urllib.error.HTTPError as hexc:
+                ms = (time.monotonic() - t0) * 1000.0
+                lines.append(f"  Status             : HTTP {hexc.code} {hexc.reason} ({ms:.1f} ms)")
+                for hk, hv in list(hexc.headers.items())[:10]:
+                    lines.append(f"  {hk:<19}: {hv[:72]}")
+            except Exception as exc:
+                lines.append(f"  HTTP Fetch Offline : {exc}")
+            sections.append("\n".join(lines) + "\n")
+
+        GLib.idle_add(self._append_bench_text, "\n".join(sections))
+
+
+# ---------------------------------------------------------------------------
+# Headless Self-Test Suite (`./dtnet --self-test`)
+# ---------------------------------------------------------------------------
+def run_self_test() -> int:
+    # 1. Verify /proc/net/dev live + synthetic parser & auto-scaling scale selection
+    live_dev = Path("/proc/net/dev").read_text(encoding="utf-8", errors="replace")
+    live_parsed = parse_proc_net_dev_text(live_dev)
+    assert "lo" in live_parsed, "Expected lo interface in /proc/net/dev"
+
+    synth_dev = (
+        "Inter-|   Receive                                                |  Transmit\n"
+        " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n"
+        "  eth0: 104857600   82000    1    2    0     0          0       120 52428800   41000    0    1    0     0       0          0\n"
+        " wlan0:  20971520   19400    0    0    0     0          0        40  8388608    9100    0    0    0     0       0          0\n"
+    )
+    sdev = parse_proc_net_dev_text(synth_dev)
+    assert sdev["eth0"]["rx_bytes"] == 104857600 and sdev["wlan0"]["tx_packets"] == 9100
+    ceil_bps, ulbl, marks = choose_throughput_scale(14_500_000.0)
+    assert ceil_bps == 100_000_000.0 and "Mbps" in ulbl and len(marks) == 6
+
+    # 2. Verify /proc/net/tcp & /proc/net/tcp6 hex IPv4/IPv6 + port + state parser
+    synth_tcp = (
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+        "   0: 0100007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000   101        0 20481 1 0000000000000000 100 0 0 10 0\n"
+        "   1: 0A01A8C0:9C40 01010101:01BB 01 00000000:00000000 02:00000520 00000000  1000        0 38912 1 0000000000000000 20 4 30 10 -1\n"
+    )
+    tcp_rows = parse_proc_net_sockets_text(synth_tcp, "TCP", is_ipv6=False)
+    assert len(tcp_rows) == 2
+    assert tcp_rows[0]["local"] == "127.0.0.1:53" and tcp_rows[0]["state"] == "LISTEN" and tcp_rows[0]["service"] == "domain"
+    assert tcp_rows[1]["local"] == "192.168.1.10:40000" and tcp_rows[1]["remote"] == "1.1.1.1:443" and tcp_rows[1]["state"] == "ESTABLISHED"
+
+    synth_tcp6 = (
+        "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+        "   0: 00000000000000000000000001000000:0016 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 19991 1 0000000000000000 100 0 0 10 0\n"
+    )
+    tcp6_rows = parse_proc_net_sockets_text(synth_tcp6, "TCP6", is_ipv6=True)
+    assert len(tcp6_rows) == 1 and tcp6_rows[0]["local"] == "[::1]:22" and tcp6_rows[0]["service"] == "ssh"
+
+    _ = scan_inode_to_process_map()
+
+    # 3. Verify /proc/net/arp & /proc/net/wireless parsers
+    synth_arp = (
+        "IP address       HW type     Flags       HW address            Mask     Device\n"
+        "192.168.1.1      0x1         0x2         f0:9f:c2:11:22:33     *        eth0\n"
+        "192.168.1.42     0x1         0x2         dc:a6:32:aa:bb:cc     *        eth0\n"
+    )
+    arp_rows = parse_proc_net_arp_text(synth_arp)
+    assert len(arp_rows) == 2 and arp_rows[0]["vendor"] == "Ubiquiti" and arp_rows[1]["vendor"] == "RaspberryPi"
+
+    synth_wifi = (
+        "Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE\n"
+        " face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22\n"
+        " wlan0: 0000   58.  -52.  -93.       0      0      0      2      0        0\n"
+    )
+    wmap = parse_proc_net_wireless_text(synth_wifi)
+    assert "wlan0" in wmap and wmap["wlan0"]["level_dbm"] == -52.0 and 80.0 < wmap["wlan0"]["qual_pct"] < 85.0
+
+    # 4. Verify Traceroute / Tracepath / `ping -t <ttl>` TTL parsers
+    h1 = parse_traceroute_line(" 2  67.59.224.1  8.842 ms  9.110 ms")
+    assert h1 is not None and h1[0] == 2 and h1[1] == "67.59.224.1" and abs((h1[2] or 0) - 8.976) < 0.05
+    h_star = parse_traceroute_line(" 4  * * *")
+    assert h_star == (4, "*", None)
+    p_ttl = parse_ping_ttl_output("From 129.250.3.42 icmp_seq=1 Time to live exceeded\n", 24.3)
+    assert p_ttl == ("129.250.3.42", 24.3, False)
+    p_fin = parse_ping_ttl_output("64 bytes from 1.1.1.1: icmp_seq=1 ttl=57 time=21.4 ms\n", 22.0)
+    assert p_fin == ("1.1.1.1", 21.4, True)
+
+    # 5. Verify Great-Circle Haversine & Antimeridian Arc Splitting (Newington CT -> Auckland NZ)
+    assert len(WORLD_POLYGONS) >= 60
+    dist_nz = haversine_km(HOME_QTH_LAT, HOME_QTH_LON, -36.8485, 174.7633)
+    assert 13500.0 < dist_nz < 15000.0
+    segs_nz = great_circle_segments(HOME_QTH_LAT, HOME_QTH_LON, -36.8485, 174.7633, steps=48)
+    assert len(segs_nz) == 2, "Expected trans-Pacific great-circle path to split cleanly across ±180° dateline"
+
+    # 6. Verify Offscreen Cairo Rendering (Analog Dials + Strip-Chart + World Radar Map)
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1100, 650)
+    cr = cairo.Context(surf)
+    _, _, dmarks = choose_throughput_scale(12_000_000.0)
+    NetCairoRenderer.draw_analog_dial(
+        cr, 0, 0, 230, 184, "RX THROUGHPUT", "Mbps (0-100M)", 0.42, 0.68,
+        dmarks, (0.8, 1.0), False, "42.00 Mbps", "PK 68.0M | 3800 pkt/s",
+        [("RX ACT", (0.2, 0.95, 0.6), True), ("PEAK", (0.95, 0.2, 0.2), False)], 1,
+    )
+    NetCairoRenderer.draw_analog_dial(
+        cr, 236, 0, 230, 184, "TX THROUGHPUT", "Mbps (0-10M)", 0.28, 0.50,
+        dmarks, (0.8, 1.0), True, "2.80 Mbps", "PK 5.0M | 410 pkt/s",
+        [("TX ACT", (1.0, 0.7, 0.2), True), ("ERR", (0.95, 0.2, 0.2), False)], 2,
+    )
+    rx_dq = collections.deque([1_000_000.0 * ((i % 9) + 1) for i in range(60)], maxlen=120)
+    tx_dq = collections.deque([400_000.0 * ((i % 5) + 1) for i in range(60)], maxlen=120)
+    NetCairoRenderer.draw_phosphor_stripchart(cr, 480, 0, 380, 96, rx_dq, tx_dq, 6_400_000.0, 1_200_000.0)
+
+    surf_map = cairo.ImageSurface(cairo.FORMAT_ARGB32, 680, 360)
+    cr_map = cairo.Context(surf_map)
+    demo_hops = build_demo_hops("kiwisdr.com")
+    hits = NetCairoRenderer.draw_world_radar(
+        cr_map, 680, 360, demo_hops, 3, False, 0.35, "kiwisdr.com", "PING kiwisdr.com: 158.2ms"
+    )
+    assert len(hits) >= 5
+    buf = surf.get_data()
+    assert sum(buf[:4096]) > 0 and sum(surf_map.get_data()[:4096]) > 0
+
+    print("DTNET_SELF_TEST_OK")
+    return 0
+
+
+def main() -> int:
+    if "--self-test" in sys.argv:
+        return run_self_test()
+    ok, _ = Gtk.init_check(sys.argv)
+    if not ok:
+        sys.stderr.write("dtNet: Unable to initialize X11/GTK display (use --self-test for headless check).\n")
+        return 1
+    win = DtNetWindow()
+    win.show_all()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

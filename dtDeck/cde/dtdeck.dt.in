@@ -1,0 +1,22 @@
+set DtDbVersion=1.0
+
+ACTION dtDeck
+{
+     LABEL         dtDeck
+     ICON          dtdeck
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtdeck "%(File)Arg_1%"
+     DESCRIPTION   dtDeck — Vintage 4-Track Simul-Sync Tape & Aircheck Studio.
+}
+
+ACTION dtDeck
+{
+     LABEL         dtDeck
+     ARG_COUNT     0
+     ICON          dtdeck
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtdeck
+     DESCRIPTION   dtDeck — Vintage 4-Track Simul-Sync Tape & Aircheck Studio.
+}

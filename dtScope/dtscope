@@ -1,0 +1,2780 @@
+#!/usr/bin/env python3
+"""
+dtScope — Hybrid Vintage Tektronix 465B Analog CRT & HP 54600 Digital Storage Oscilloscope for CDE
+
+Features:
+  - Authentic 1980s/1990s benchtop instrument faceplate styled for CDE (OSF/Motif 3D bevels):
+      * Top Glowing Vacuum Fluorescent Display (VFD) Frequency Counter & Telemetry Bar:
+        FREQ (Hz), PERIOD (ms), Vpp, Vrms, PEAK (dBFS), DOMINANT FFT (Hz), and TRIG'D lock LED
+      * Sunken 10x8 Division Etched Graticule CRT Bezel (~30 fps) with beam bloom & phosphor persistence
+      * 4 CRT Phosphor / DSO Themes: P31 GREEN, P7 AMBER, P4 WHITE, DSO DIGITAL (with ΔT/ΔV cursors)
+      * 5 Display Modes: SCOPE (Y-T), DUAL (CH1 + GEN/R), FFT SPECTRUM (4096-pt Hanning), WATERFALL, X-Y LISSAJOUS
+      * 6 Spun-Aluminum Scope Rotary Knobs: TIME/DIV, VOLTS/DIV, TRIG LEVEL, Y-POS, INTENSITY, PERSIST
+      * Live Audio Sources: DESKTOP MONITOR (PulseAudio/PipeWire .monitor), MIC/LINE-IN, INTERNAL SYNTH/CAL
+      * Built-in Bench Function & Radio Tone Generator Deck (SINE, SQUARE, TRIANGLE, SAWTOOTH, WHITE NOISE,
+        2-TONE SSB 700+1900 Hz, 1 kHz PROBE COMP, EIA CTCSS PL 67.0-254.1 Hz, 4x4 DTMF Keypad, Speaker Out)
+"""
+
+import json
+import math
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import cairo
+import gi
+import numpy as np
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("Pango", "1.0")
+gi.require_version("Gst", "1.0")
+from gi.repository import Gdk, GLib, Gst, Gtk, Pango
+
+Gst.init(None)
+
+HOME = Path.home()
+CONFIG_DIR = HOME / ".config" / "dtscope"
+STATE_FILE = CONFIG_DIR / "state.json"
+
+SAMPLE_RATE = 48000
+RING_LEN = 36000  # 750 ms @ 48 kHz -> covers full 500 ms sweep at 50 ms/div + trigger margin
+FFT_SIZE = 4096
+MEAS_SIZE = 8192
+WF_W = 480
+WF_H = 220
+
+# Standard 38 EIA/TIA CTCSS Sub-Audible Continuous Tone-Coded Squelch System frequencies (Hz)
+CTCSS_TONES: list[float] = [
+    67.0, 69.3, 71.9, 74.4, 77.0, 79.7, 82.5, 85.4, 88.5, 91.5,
+    94.8, 97.4, 100.0, 103.5, 107.2, 110.9, 114.8, 118.8, 123.0, 127.3,
+    131.8, 136.5, 141.3, 146.2, 151.4, 156.7, 162.2, 167.9, 173.8, 179.9,
+    186.2, 192.8, 203.5, 210.7, 218.1, 225.7, 233.6, 241.8, 250.3, 254.1,
+]
+
+# ITU-T 4x4 DTMF Dual-Tone Frequencies (Hz)
+DTMF_ROWS = (697.0, 770.0, 852.0, 941.0)
+DTMF_COLS = (1209.0, 1336.0, 1477.0, 1633.0)
+DTMF_GRID = [
+    ["1", "2", "3", "A"],
+    ["4", "5", "6", "B"],
+    ["7", "8", "9", "C"],
+    ["*", "0", "#", "D"],
+]
+DTMF_FREQS: dict[str, tuple[float, float]] = {
+    DTMF_GRID[r][c]: (DTMF_ROWS[r], DTMF_COLS[c])
+    for r in range(4)
+    for c in range(4)
+}
+
+PHOSPHOR_THEMES: dict[str, dict] = {
+    "P31": {
+        "label": "P31 GREEN",
+        "glass_top": (0.024, 0.082, 0.050),
+        "glass_bot": (0.012, 0.044, 0.026),
+        "grat": (0.16, 0.44, 0.28, 0.56),
+        "grat_sub": (0.18, 0.52, 0.34, 0.72),
+        "ch1_halo": (0.06, 0.86, 0.42),
+        "ch1_core": (0.38, 1.00, 0.66),
+        "ch1_hot": (0.86, 1.00, 0.92),
+        "ch2_halo": (0.08, 0.68, 0.78),
+        "ch2_core": (0.34, 0.96, 0.94),
+        "peak": (0.96, 0.82, 0.28),
+        "cursor_t": (0.48, 1.00, 0.80),
+        "cursor_v": (1.00, 0.78, 0.30),
+        "hud": (0.46, 0.98, 0.74),
+    },
+    "P7": {
+        "label": "P7 AMBER",
+        "glass_top": (0.078, 0.048, 0.014),
+        "glass_bot": (0.042, 0.024, 0.006),
+        "grat": (0.46, 0.30, 0.10, 0.56),
+        "grat_sub": (0.58, 0.38, 0.14, 0.72),
+        "ch1_halo": (0.94, 0.50, 0.05),
+        "ch1_core": (1.00, 0.75, 0.18),
+        "ch1_hot": (1.00, 0.95, 0.76),
+        "ch2_halo": (0.92, 0.28, 0.10),
+        "ch2_core": (1.00, 0.52, 0.28),
+        "peak": (1.00, 0.92, 0.52),
+        "cursor_t": (1.00, 0.84, 0.36),
+        "cursor_v": (0.45, 0.96, 0.78),
+        "hud": (1.00, 0.80, 0.32),
+    },
+    "P4": {
+        "label": "P4 WHITE",
+        "glass_top": (0.056, 0.064, 0.078),
+        "glass_bot": (0.028, 0.033, 0.042),
+        "grat": (0.32, 0.37, 0.44, 0.54),
+        "grat_sub": (0.42, 0.48, 0.56, 0.72),
+        "ch1_halo": (0.54, 0.70, 0.94),
+        "ch1_core": (0.88, 0.94, 1.00),
+        "ch1_hot": (1.00, 1.00, 1.00),
+        "ch2_halo": (0.28, 0.66, 0.96),
+        "ch2_core": (0.54, 0.86, 1.00),
+        "peak": (1.00, 0.78, 0.36),
+        "cursor_t": (0.76, 0.90, 1.00),
+        "cursor_v": (1.00, 0.76, 0.42),
+        "hud": (0.86, 0.92, 1.00),
+    },
+    "DSO": {
+        "label": "DSO DIGITAL",
+        "glass_top": (0.022, 0.032, 0.056),
+        "glass_bot": (0.012, 0.018, 0.034),
+        "grat": (0.24, 0.35, 0.52, 0.66),
+        "grat_sub": (0.34, 0.48, 0.68, 0.82),
+        "ch1_halo": (0.88, 0.76, 0.08),
+        "ch1_core": (1.00, 0.93, 0.22),
+        "ch1_hot": (1.00, 0.99, 0.82),
+        "ch2_halo": (0.08, 0.74, 0.92),
+        "ch2_core": (0.22, 0.94, 1.00),
+        "peak": (1.00, 0.36, 0.88),
+        "cursor_t": (0.26, 0.96, 1.00),
+        "cursor_v": (1.00, 0.42, 0.88),
+        "hud": (0.38, 0.96, 1.00),
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# CDE Palette Loader & Vintage Oscilloscope Motif CSS
+# ---------------------------------------------------------------------------
+def load_cde_palette() -> tuple[str, str, str]:
+    chrome, sel, well = "#aeb2c3", "#2c567e", "#fff7e9"
+    try:
+        out = subprocess.check_output(["xrdb", "-query"], text=True, stderr=subprocess.DEVNULL, timeout=1.5)
+        pal_name = "Crimson.dp"
+        for ln in out.splitlines():
+            if "ColorPalette:" in ln:
+                pal_name = ln.split(":", 1)[1].strip()
+                break
+        for pdir in (HOME / ".dt/palettes", Path("/usr/dt/palettes")):
+            pf = pdir / pal_name
+            if pf.is_file():
+                hexes = [l.strip() for l in pf.read_text().splitlines() if l.strip().startswith("#")]
+                if len(hexes) >= 4:
+                    def norm16(h: str) -> str:
+                        h = h.lstrip("#")
+                        return f"#{h[0:2]}{h[4:6]}{h[8:10]}" if len(h) == 12 else "#" + h[:6]
+                    chrome, sel, well = norm16(hexes[1]), norm16(hexes[2]), norm16(hexes[3])
+                break
+    except Exception:
+        pass
+    return chrome, sel, well
+
+
+def build_scope_css(chrome: str, sel: str, _well: str) -> bytes:
+    css = f"""
+    window, dialog, .background {{
+        background-color: {chrome};
+        color: #101216;
+        font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+        font-size: 8.5pt;
+    }}
+    .rx-cabinet {{
+        background-color: #2f343f;
+        border-top: 2px solid #5a6275;
+        border-left: 2px solid #5a6275;
+        border-right: 2px solid #171a20;
+        border-bottom: 2px solid #171a20;
+        padding: 5px;
+    }}
+    .rx-strip {{
+        background-color: #383e4b;
+        border-top: 2px solid #575f70;
+        border-left: 2px solid #575f70;
+        border-right: 2px solid #1c2028;
+        border-bottom: 2px solid #1c2028;
+        padding: 3px 5px;
+    }}
+    .crt-frame {{
+        background-color: #1a1e25;
+        border-top: 3px solid #101318;
+        border-left: 3px solid #101318;
+        border-right: 3px solid #565f72;
+        border-bottom: 3px solid #565f72;
+        padding: 2px;
+    }}
+    .rx-engraved {{
+        color: #d7deeb;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 7.8pt;
+    }}
+    .rx-sec-hdr {{
+        color: #96e6d8;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8pt;
+    }}
+    button {{
+        background-image: none;
+        background-color: #464d5c;
+        color: #edf2f7;
+        border-top: 2px solid #757f94;
+        border-left: 2px solid #757f94;
+        border-right: 2px solid #1d2129;
+        border-bottom: 2px solid #1d2129;
+        border-radius: 0px;
+        padding: 2px 6px;
+        min-height: 0px;
+        min-width: 0px;
+        box-shadow: none;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8pt;
+    }}
+    button label {{
+        color: #edf2f7;
+    }}
+    button:hover {{
+        background-color: #525a6b;
+    }}
+    button:active, button:checked {{
+        background-color: #282d37;
+        border-top: 2px solid #191c22;
+        border-left: 2px solid #191c22;
+        border-right: 2px solid #6d768a;
+        border-bottom: 2px solid #6d768a;
+    }}
+    button.sw-active {{
+        background-color: #1f4d3d;
+        color: #6afcc6;
+        border-top: 2px solid #112b22;
+        border-left: 2px solid #112b22;
+        border-right: 2px solid #4fa688;
+        border-bottom: 2px solid #4fa688;
+    }}
+    button.sw-active label {{
+        color: #6afcc6;
+    }}
+    button.sw-amber {{
+        background-color: #5c3e14;
+        color: #ffd269;
+        border-top: 2px solid #302008;
+        border-left: 2px solid #302008;
+        border-right: 2px solid #b88433;
+        border-bottom: 2px solid #b88433;
+    }}
+    button.sw-amber label {{
+        color: #ffd269;
+    }}
+    button.btn-gen-on {{
+        background-color: #b84318;
+        color: #fff4ec;
+        border-top: 2px solid #ff9466;
+        border-left: 2px solid #ff9466;
+        border-right: 2px solid #591d07;
+        border-bottom: 2px solid #591d07;
+    }}
+    button.btn-gen-on label {{
+        color: #ffffff;
+    }}
+    button.dtmf-btn {{
+        background-color: #323846;
+        padding: 1px 4px;
+        font-size: 8.2pt;
+    }}
+    button.dtmf-col-a {{
+        background-color: #4a3538;
+    }}
+    button.dtmf-col-a label {{
+        color: #ffb899;
+    }}
+    entry, spinbutton {{
+        background-color: #141c1d;
+        color: #5efce0;
+        border-top: 2px solid #0b1011;
+        border-left: 2px solid #0b1011;
+        border-right: 2px solid #566074;
+        border-bottom: 2px solid #566074;
+        border-radius: 0px;
+        padding: 1px 4px;
+        min-height: 22px;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8.5pt;
+    }}
+    combobox button.combo {{
+        background-color: #202630;
+        color: #d8f8ee;
+        border-top: 2px solid #14171d;
+        border-left: 2px solid #14171d;
+        border-right: 2px solid #626b7f;
+        border-bottom: 2px solid #626b7f;
+        padding: 2px 5px;
+    }}
+    combobox button.combo label, combobox cellview {{
+        color: #d8f8ee;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8pt;
+    }}
+    menu {{
+        background-color: #2b303b;
+        color: #edf2f7;
+        border: 1px solid #6c758a;
+    }}
+    menuitem {{
+        color: #edf2f7;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8pt;
+        padding: 2px 8px;
+    }}
+    menuitem:hover {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    .cde-status {{
+        background-color: {chrome};
+        color: #101216;
+        padding: 2px 8px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8pt;
+    }}
+    """
+    return css.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Spun-Aluminum Machined Rotary Knob Widget (Drag / Wheel / Double-Click Reset)
+# ---------------------------------------------------------------------------
+class RotaryKnob(Gtk.DrawingArea):
+    def __init__(
+        self,
+        label: str,
+        init_val: float,
+        default_val: float,
+        on_change,
+        fmt_fn=None,
+        accent_rgb: tuple[float, float, float] = (1.0, 0.44, 0.16),
+    ):
+        super().__init__()
+        self.label = label
+        self.value = max(0.0, min(1.0, init_val))
+        self.default_val = default_val
+        self.on_change = on_change
+        self.fmt_fn = fmt_fn
+        self.accent_rgb = accent_rgb
+        self._drag_y = None
+        self._drag_start_val = self.value
+
+        self.set_size_request(86, 74)
+        self.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+            | Gdk.EventMask.SCROLL_MASK
+        )
+        self.connect("draw", self._on_draw)
+        self.connect("button-press-event", self._on_press)
+        self.connect("button-release-event", self._on_release)
+        self.connect("motion-notify-event", self._on_motion)
+        self.connect("scroll-event", self._on_scroll)
+
+    def set_value(self, v: float, notify: bool = False):
+        self.value = max(0.0, min(1.0, v))
+        self.queue_draw()
+        if notify and self.on_change:
+            self.on_change(self.value)
+
+    def _on_press(self, _w, ev):
+        if ev.type == Gdk.EventType._2BUTTON_PRESS:
+            self.set_value(self.default_val, notify=True)
+            return True
+        if ev.button == 1:
+            self._drag_y = ev.y
+            self._drag_start_val = self.value
+            return True
+        return False
+
+    def _on_release(self, _w, _ev):
+        self._drag_y = None
+        return True
+
+    def _on_motion(self, _w, ev):
+        if self._drag_y is not None:
+            dy = self._drag_y - ev.y
+            self.set_value(self._drag_start_val + dy / 115.0, notify=True)
+            return True
+        return False
+
+    def _on_scroll(self, _w, ev):
+        step = 0.035
+        if ev.direction == Gdk.ScrollDirection.UP:
+            self.set_value(self.value + step, notify=True)
+        elif ev.direction == Gdk.ScrollDirection.DOWN:
+            self.set_value(self.value - step, notify=True)
+        elif ev.direction == Gdk.ScrollDirection.SMOOTH:
+            _, _dx, dy = ev.get_scroll_deltas()
+            self.set_value(self.value - dy * 0.025, notify=True)
+        return True
+
+    def _on_draw(self, w, cr: cairo.Context):
+        alloc = w.get_allocation()
+        cx = alloc.width * 0.5
+        cy = 28.5
+        r = 18.5
+
+        a_start = math.radians(135.0)
+        a_span = math.radians(270.0)
+        for i in range(11):
+            frac = i / 10.0
+            ang = a_start + frac * a_span
+            r0 = r + 3.0
+            r1 = r + (6.2 if i in (0, 5, 10) else 4.6)
+            cr.set_line_width(1.4 if i in (0, 5, 10) else 1.0)
+            if frac <= self.value + 0.001:
+                cr.set_source_rgb(0.32, 0.94, 0.82)
+            else:
+                cr.set_source_rgb(0.58, 0.63, 0.72)
+            cr.move_to(cx + r0 * math.cos(ang), cy + r0 * math.sin(ang))
+            cr.line_to(cx + r1 * math.cos(ang), cy + r1 * math.sin(ang))
+            cr.stroke()
+
+        # Drop shadow
+        cr.arc(cx + 1.4, cy + 2.0, r + 1.0, 0, 2 * math.pi)
+        cr.set_source_rgba(0.04, 0.05, 0.07, 0.78)
+        cr.fill()
+
+        # Knurled skirt
+        cr.arc(cx, cy, r, 0, 2 * math.pi)
+        cr.set_source_rgb(0.16, 0.18, 0.22)
+        cr.fill()
+
+        cr.set_line_width(1.0)
+        cr.set_source_rgba(0.45, 0.50, 0.60, 0.55)
+        for k in range(16):
+            ka = k * (2.0 * math.pi / 16.0)
+            cr.move_to(cx + (r - 2.3) * math.cos(ka), cy + (r - 2.3) * math.sin(ka))
+            cr.line_to(cx + r * math.cos(ka), cy + r * math.sin(ka))
+            cr.stroke()
+
+        # Brushed spun-aluminum cap
+        pat = cairo.LinearGradient(cx - r, cy - r, cx + r, cy + r)
+        pat.add_color_stop_rgb(0.0, 0.84, 0.87, 0.92)
+        pat.add_color_stop_rgb(0.5, 0.54, 0.58, 0.66)
+        pat.add_color_stop_rgb(1.0, 0.29, 0.33, 0.39)
+        cr.arc(cx, cy, r - 3.0, 0, 2 * math.pi)
+        cr.set_source(pat)
+        cr.fill()
+
+        # Pointer indicator
+        val_ang = a_start + self.value * a_span
+        cr.set_line_width(2.3)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_source_rgb(*self.accent_rgb)
+        cr.move_to(cx + 3.5 * math.cos(val_ang), cy + 3.5 * math.sin(val_ang))
+        cr.line_to(cx + (r - 4.3) * math.cos(val_ang), cy + (r - 4.3) * math.sin(val_ang))
+        cr.stroke()
+
+        # Engraved label + glowing value sub-readout
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(8.4)
+        ext = cr.text_extents(self.label)
+        cr.set_source_rgb(0.86, 0.90, 0.96)
+        cr.move_to(cx - ext.width * 0.5, 60.5)
+        cr.show_text(self.label)
+
+        if self.fmt_fn:
+            sub = self.fmt_fn(self.value)
+            cr.set_font_size(8.0)
+            ext2 = cr.text_extents(sub)
+            cr.set_source_rgb(0.42, 0.95, 0.84)
+            cr.move_to(cx - ext2.width * 0.5, 71.0)
+            cr.show_text(sub)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Phase-Coherent Bench Function, CTCSS PL & DTMF Tone Generator + Audio I/O
+# ---------------------------------------------------------------------------
+def discover_pulse_sources() -> tuple[str | None, str | None]:
+    """Discover default PulseAudio/PipeWire .monitor source and microphone source via pactl."""
+    monitor_src = None
+    mic_src = None
+    try:
+        sink = subprocess.check_output(
+            ["pactl", "get-default-sink"], text=True, stderr=subprocess.DEVNULL, timeout=1.2
+        ).strip()
+        if sink:
+            monitor_src = f"{sink}.monitor"
+    except Exception:
+        pass
+
+    try:
+        src_out = subprocess.check_output(
+            ["pactl", "list", "short", "sources"], text=True, stderr=subprocess.DEVNULL, timeout=1.2
+        )
+        monitors = []
+        mics = []
+        for ln in src_out.splitlines():
+            parts = ln.split()
+            if len(parts) >= 2:
+                name = parts[1]
+                if name.endswith(".monitor"):
+                    monitors.append(name)
+                else:
+                    mics.append(name)
+        if monitor_src and monitors and monitor_src not in monitors:
+            monitor_src = monitors[0]
+        elif not monitor_src and monitors:
+            monitor_src = monitors[0]
+        if mics:
+            mic_src = mics[0]
+    except Exception:
+        pass
+
+    try:
+        def_src = subprocess.check_output(
+            ["pactl", "get-default-source"], text=True, stderr=subprocess.DEVNULL, timeout=1.2
+        ).strip()
+        if def_src and not def_src.endswith(".monitor"):
+            mic_src = def_src
+    except Exception:
+        pass
+
+    return monitor_src, mic_src
+
+
+class ScopeAudioAndGenEngine:
+    """Manages live S16LE 48kHz audio capture, phase-continuous bench generator, and DSP ring buffers."""
+
+    def __init__(self, on_status_cb=None):
+        self.on_status_cb = on_status_cb
+
+        # Ring buffers (float32 in [-1.0, +1.0])
+        self.lock = threading.Lock()
+        self.ring_ext_l = np.zeros(RING_LEN, dtype=np.float32)
+        self.ring_ext_r = np.zeros(RING_LEN, dtype=np.float32)
+        self.ring_gen_a = np.zeros(RING_LEN, dtype=np.float32)
+        self.ring_gen_b = np.zeros(RING_LEN, dtype=np.float32)  # Quadrature / reference channel
+        self.last_ext_rms = 0.0
+        self.last_ext_active_ts = 0.0
+
+        # Source selection: "monitor" | "mic" | "synth"
+        self.input_source = "monitor"
+        self.auto_cal_standby = True
+        self.probe_cal_1khz = False
+        self.ch2_mode = "auto"  # "auto" | "gen" | "stereo_r"
+
+        # Bench Generator state
+        self.gen_waveform = "SINE"  # SINE | SQUARE | TRIANGLE | SAWTOOTH | NOISE | 2-TONE
+        self.gen_freq_hz = 1000.0
+        self.gen_level = 0.65
+        self.gen_out_enabled = False
+        self.ctcss_hz = 0.0  # 0.0 = OFF
+        self.dtmf_held_key: str | None = None
+        self.dtmf_burst_key: str | None = None
+        self.dtmf_burst_until = 0.0
+
+        # Continuous phase accumulators (radians)
+        self._ph_main = 0.0
+        self._ph_ssb1 = 0.0
+        self._ph_ssb2 = 0.0
+        self._ph_ctcss = 0.0
+        self._ph_dtmf_lo = 0.0
+        self._ph_dtmf_hi = 0.0
+        self._ph_cal = 0.0
+        self._rng = np.random.default_rng(465)
+
+        # GStreamer pipelines
+        self.monitor_dev, self.mic_dev = discover_pulse_sources()
+        self.active_dev_label = "INTERNAL SYNTH"
+        self._cap_pipe = None
+        self._out_pipe = None
+        self._out_appsrc = None
+
+        self._stop_evt = threading.Event()
+        self._gen_thread = None
+
+    def start(self, headless: bool = False):
+        self._stop_evt.clear()
+        if not headless:
+            self.set_input_source(self.input_source)
+            self._gen_thread = threading.Thread(target=self._gen_pump_loop, daemon=True)
+            self._gen_thread.start()
+
+    def stop(self):
+        self._stop_evt.set()
+        if self._gen_thread and self._gen_thread.is_alive():
+            self._gen_thread.join(timeout=0.8)
+        self._gen_thread = None
+        self._stop_capture_pipeline()
+        self._stop_output_pipeline()
+
+    def _emit_status(self, msg: str):
+        if self.on_status_cb:
+            GLib.idle_add(self.on_status_cb, msg)
+
+    # ---- Audio Capture Pipeline ----
+    def _stop_capture_pipeline(self):
+        if self._cap_pipe is not None:
+            try:
+                self._cap_pipe.set_state(Gst.State.NULL)
+            except Exception:
+                pass
+            self._cap_pipe = None
+
+    def set_input_source(self, source_kind: str):
+        self.input_source = source_kind
+        self._stop_capture_pipeline()
+
+        if source_kind == "synth":
+            self.active_dev_label = "INTERNAL BENCH SYNTH"
+            self._emit_status("SOURCE: INTERNAL BENCH SYNTH / 1kHz PROBE COMP (48.0 kHz)")
+            return
+
+        # Re-discover PulseAudio/PipeWire sources dynamically
+        self.monitor_dev, self.mic_dev = discover_pulse_sources()
+
+        pipe = Gst.Pipeline.new("scope_capture")
+        src = None
+        dev_desc = "DEFAULT AUDIO"
+
+        if source_kind == "monitor":
+            if self.monitor_dev and Gst.ElementFactory.find("pulsesrc"):
+                src = Gst.ElementFactory.make("pulsesrc", "cap_src")
+                src.set_property("device", self.monitor_dev)
+                dev_desc = self.monitor_dev
+            elif Gst.ElementFactory.find("pulsesrc"):
+                src = Gst.ElementFactory.make("pulsesrc", "cap_src")
+                dev_desc = "pulsesrc (default)"
+            else:
+                src = Gst.ElementFactory.make("autoaudiosrc", "cap_src")
+                dev_desc = "autoaudiosrc"
+        else:  # "mic"
+            if self.mic_dev and Gst.ElementFactory.find("pulsesrc"):
+                src = Gst.ElementFactory.make("pulsesrc", "cap_src")
+                src.set_property("device", self.mic_dev)
+                dev_desc = self.mic_dev
+            elif Gst.ElementFactory.find("pulsesrc"):
+                src = Gst.ElementFactory.make("pulsesrc", "cap_src")
+                dev_desc = "pulsesrc (mic)"
+            else:
+                src = Gst.ElementFactory.make("autoaudiosrc", "cap_src")
+                dev_desc = "autoaudiosrc (mic)"
+
+        q = Gst.ElementFactory.make("queue", None)
+        q.set_property("max-size-buffers", 8)
+        q.set_property("leaky", 2)  # downstream
+        conv = Gst.ElementFactory.make("audioconvert", None)
+        res = Gst.ElementFactory.make("audioresample", None)
+        capsf = Gst.ElementFactory.make("capsfilter", None)
+        capsf.set_property(
+            "caps",
+            Gst.Caps.from_string("audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=2"),
+        )
+        appsink = Gst.ElementFactory.make("appsink", "cap_sink")
+        appsink.set_property("emit-signals", True)
+        appsink.set_property("sync", False)
+        appsink.set_property("drop", True)
+        appsink.set_property("max-buffers", 8)
+        appsink.connect("new-sample", self._on_capture_sample)
+
+        if not all((pipe, src, q, conv, res, capsf, appsink)):
+            self.active_dev_label = "SYNTH FALLBACK"
+            self._emit_status("AUDIO CAPTURE UNAVAILABLE — USING INTERNAL SYNTH")
+            return
+
+        for el in (src, q, conv, res, capsf, appsink):
+            pipe.add(el)
+        src.link(q)
+        q.link(conv)
+        conv.link(res)
+        res.link(capsf)
+        capsf.link(appsink)
+
+        bus = pipe.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self._on_cap_bus_error)
+
+        ret = pipe.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            pipe.set_state(Gst.State.NULL)
+            self.active_dev_label = "SYNTH STANDBY"
+            self._emit_status(f"CAPTURE OFFLINE ({dev_desc}) — SYNTH STANDBY ACTIVE")
+        else:
+            self._cap_pipe = pipe
+            self.active_dev_label = dev_desc
+            tag = "DESKTOP MONITOR" if source_kind == "monitor" else "MIC / LINE-IN"
+            self._emit_status(f"{tag}: {dev_desc} @ 48.0 kHz S16LE")
+
+    def _on_cap_bus_error(self, _bus, msg):
+        err, _dbg = msg.parse_error()
+        self._stop_capture_pipeline()
+        self.active_dev_label = "SYNTH STANDBY"
+        self._emit_status(f"AUDIO SRC STANDBY ({err.message[:42]}) — INTERNAL SYNTH READY")
+
+    def _on_capture_sample(self, appsink):
+        sample = appsink.emit("pull-sample")
+        if not sample:
+            return Gst.FlowReturn.OK
+        buf = sample.get_buffer()
+        ok, mapinfo = buf.map(Gst.MapFlags.READ)
+        if ok:
+            try:
+                pcm = np.frombuffer(mapinfo.data, dtype=np.int16)
+                n_frames = len(pcm) // 2
+                if n_frames > 0:
+                    stereo = pcm[: n_frames * 2].astype(np.float32).reshape(-1, 2) * (1.0 / 32768.0)
+                    ch_l = stereo[:, 0]
+                    ch_r = stereo[:, 1]
+                    rms = float(np.sqrt(np.mean(ch_l * ch_l + ch_r * ch_r) * 0.5))
+                    now = time.monotonic()
+                    with self.lock:
+                        if n_frames >= RING_LEN:
+                            self.ring_ext_l[:] = ch_l[-RING_LEN:]
+                            self.ring_ext_r[:] = ch_r[-RING_LEN:]
+                        else:
+                            self.ring_ext_l[:-n_frames] = self.ring_ext_l[n_frames:]
+                            self.ring_ext_l[-n_frames:] = ch_l
+                            self.ring_ext_r[:-n_frames] = self.ring_ext_r[n_frames:]
+                            self.ring_ext_r[-n_frames:] = ch_r
+                        self.last_ext_rms = rms
+                        if rms > 3.5e-4:
+                            self.last_ext_active_ts = now
+            finally:
+                buf.unmap(mapinfo)
+        return Gst.FlowReturn.OK
+
+    # ---- Speaker Output Pipeline for Bench Generator ----
+    def _stop_output_pipeline(self):
+        if self._out_pipe is not None:
+            try:
+                self._out_pipe.set_state(Gst.State.NULL)
+            except Exception:
+                pass
+            self._out_pipe = None
+            self._out_appsrc = None
+
+    def set_gen_speaker_out(self, enabled: bool):
+        self.gen_out_enabled = enabled
+        if not enabled:
+            self._stop_output_pipeline()
+            return
+        if self._out_pipe is not None:
+            return
+
+        pipe = Gst.Pipeline.new("scope_gen_out")
+        appsrc = Gst.ElementFactory.make("appsrc", "gen_src")
+        appsrc.set_property("is-live", True)
+        appsrc.set_property("block", False)
+        appsrc.set_property("format", Gst.Format.TIME)
+        appsrc.set_property(
+            "caps",
+            Gst.Caps.from_string("audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=2"),
+        )
+        q = Gst.ElementFactory.make("queue", None)
+        q.set_property("max-size-buffers", 6)
+        q.set_property("leaky", 2)
+        conv = Gst.ElementFactory.make("audioconvert", None)
+        res = Gst.ElementFactory.make("audioresample", None)
+        sink = Gst.ElementFactory.make("autoaudiosink", None)
+        if sink:
+            try:
+                sink.set_property("sync", False)
+            except Exception:
+                pass
+
+        if not all((pipe, appsrc, q, conv, res, sink)):
+            self.gen_out_enabled = False
+            return
+
+        for el in (appsrc, q, conv, res, sink):
+            pipe.add(el)
+        appsrc.link(q)
+        q.link(conv)
+        conv.link(res)
+        res.link(sink)
+
+        ret = pipe.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            pipe.set_state(Gst.State.NULL)
+            self.gen_out_enabled = False
+        else:
+            self._out_pipe = pipe
+            self._out_appsrc = appsrc
+
+    # ---- Synthesis Engine ----
+    def trigger_dtmf_burst(self, key: str, duration_s: float = 0.36):
+        if key in DTMF_FREQS:
+            self.dtmf_burst_key = key
+            self.dtmf_burst_until = time.monotonic() + duration_s
+
+    def synthesize_block(self, n_frames: int) -> tuple[np.ndarray, np.ndarray]:
+        """Synthesize n_frames of Bench Generator (gen_a) + Quadrature/Cal Reference (gen_b)."""
+        idx = np.arange(n_frames, dtype=np.float64)
+        two_pi = 2.0 * math.pi
+
+        # 1 kHz Probe Comp reference square wave (always maintained phase-coherent)
+        dph_cal = two_pi * 1000.0 / SAMPLE_RATE
+        ph_cal = self._ph_cal + idx * dph_cal
+        self._ph_cal = float((self._ph_cal + n_frames * dph_cal) % two_pi)
+        cal_sq = np.where(np.sin(ph_cal) >= 0.0, 0.5, -0.5).astype(np.float32)
+
+        # Active DTMF check
+        now = time.monotonic()
+        dtmf_key = self.dtmf_held_key
+        if dtmf_key is None and self.dtmf_burst_key is not None and now < self.dtmf_burst_until:
+            dtmf_key = self.dtmf_burst_key
+
+        amp = float(self.gen_level)
+
+        if self.probe_cal_1khz and dtmf_key is None:
+            sig_a = cal_sq.copy()
+            # Reference channel: 1 kHz quadrature sine for Lissajous & Dual comparison
+            sig_b = (0.5 * np.cos(ph_cal)).astype(np.float32)
+        elif dtmf_key is not None and dtmf_key in DTMF_FREQS:
+            flo, fhi = DTMF_FREQS[dtmf_key]
+            d_lo = two_pi * flo / SAMPLE_RATE
+            d_hi = two_pi * fhi / SAMPLE_RATE
+            p_lo = self._ph_dtmf_lo + idx * d_lo
+            p_hi = self._ph_dtmf_hi + idx * d_hi
+            self._ph_dtmf_lo = float((self._ph_dtmf_lo + n_frames * d_lo) % two_pi)
+            self._ph_dtmf_hi = float((self._ph_dtmf_hi + n_frames * d_hi) % two_pi)
+            # Standard telco +2 dB twist between low and high group
+            sig_a = (max(0.25, amp) * (0.44 * np.sin(p_lo) + 0.56 * np.sin(p_hi))).astype(np.float32)
+            sig_b = (max(0.25, amp) * 0.70 * np.sin(p_lo)).astype(np.float32)
+        else:
+            f = max(20.0, min(20000.0, float(self.gen_freq_hz)))
+            dph = two_pi * f / SAMPLE_RATE
+            ph = self._ph_main + idx * dph
+            self._ph_main = float((self._ph_main + n_frames * dph) % two_pi)
+
+            wf = self.gen_waveform
+            if wf == "SINE":
+                raw = np.sin(ph)
+                quad = np.cos(ph)
+            elif wf == "SQUARE":
+                raw = np.where(np.sin(ph) >= 0.0, 1.0, -1.0)
+                quad = np.sin(ph)
+            elif wf == "TRIANGLE":
+                raw = (2.0 / math.pi) * np.arcsin(np.sin(ph))
+                quad = (2.0 / math.pi) * np.arcsin(np.cos(ph))
+            elif wf == "SAWTOOTH":
+                u = (ph / two_pi) % 1.0
+                raw = 2.0 * u - 1.0
+                quad = np.sin(ph)
+            elif wf == "NOISE":
+                raw = self._rng.uniform(-1.0, 1.0, n_frames)
+                quad = self._rng.uniform(-1.0, 1.0, n_frames)
+            else:  # "2-TONE" (700 Hz + 1900 Hz ARRL SSB Two-Tone Test)
+                d1 = two_pi * 700.0 / SAMPLE_RATE
+                d2 = two_pi * 1900.0 / SAMPLE_RATE
+                p1 = self._ph_ssb1 + idx * d1
+                p2 = self._ph_ssb2 + idx * d2
+                self._ph_ssb1 = float((self._ph_ssb1 + n_frames * d1) % two_pi)
+                self._ph_ssb2 = float((self._ph_ssb2 + n_frames * d2) % two_pi)
+                raw = 0.5 * (np.sin(p1) + np.sin(p2))
+                quad = 0.5 * (np.cos(p1) + np.sin(p2))
+
+            # Mix sub-audible Ham CTCSS PL tone if enabled
+            if self.ctcss_hz > 0.0:
+                d_pl = two_pi * self.ctcss_hz / SAMPLE_RATE
+                p_pl = self._ph_ctcss + idx * d_pl
+                self._ph_ctcss = float((self._ph_ctcss + n_frames * d_pl) % two_pi)
+                raw = 0.84 * raw + 0.16 * np.sin(p_pl)
+
+            sig_a = (amp * raw).astype(np.float32)
+            sig_b = (amp * quad).astype(np.float32)
+
+        with self.lock:
+            if n_frames >= RING_LEN:
+                self.ring_gen_a[:] = sig_a[-RING_LEN:]
+                self.ring_gen_b[:] = sig_b[-RING_LEN:]
+            else:
+                self.ring_gen_a[:-n_frames] = self.ring_gen_a[n_frames:]
+                self.ring_gen_a[-n_frames:] = sig_a
+                self.ring_gen_b[:-n_frames] = self.ring_gen_b[n_frames:]
+                self.ring_gen_b[-n_frames:] = sig_b
+
+        return sig_a, sig_b
+
+    def _gen_pump_loop(self):
+        chunk_frames = 960  # 20 ms @ 48000 Hz
+        dt = chunk_frames / float(SAMPLE_RATE)
+        next_t = time.monotonic()
+
+        while not self._stop_evt.is_set():
+            sig_a, sig_b = self.synthesize_block(chunk_frames)
+
+            if self.gen_out_enabled and self._out_appsrc is not None:
+                stereo = np.empty(chunk_frames * 2, dtype=np.int16)
+                s_i16 = np.clip(sig_a * 30000.0, -32767.0, 32767.0).astype(np.int16)
+                stereo[0::2] = s_i16
+                stereo[1::2] = s_i16
+                try:
+                    self._out_appsrc.emit("push-buffer", Gst.Buffer.new_wrapped(stereo.tobytes()))
+                except Exception:
+                    pass
+
+            next_t += dt
+            sleep_s = next_t - time.monotonic()
+            if sleep_s > 0.001:
+                time.sleep(sleep_s)
+            elif sleep_s < -0.1:
+                next_t = time.monotonic()
+
+    def snapshot_channels(self) -> tuple[np.ndarray, np.ndarray, str]:
+        """Return (ch1, ch2, active_badge) arrays of length RING_LEN."""
+        now = time.monotonic()
+        with self.lock:
+            ext_l = self.ring_ext_l.copy()
+            ext_r = self.ring_ext_r.copy()
+            gen_a = self.ring_gen_a.copy()
+            gen_b = self.ring_gen_b.copy()
+            ext_live = (now - self.last_ext_active_ts) < 1.1
+
+        if self.probe_cal_1khz:
+            return gen_a, gen_b, "1kHz PROBE CAL"
+
+        if self.input_source == "synth":
+            ch2 = gen_b if self.ch2_mode != "gen" else gen_a
+            return gen_a, ch2, "INTERNAL SYNTH"
+
+        # External source (Desktop Monitor or Mic)
+        if not ext_live and self.auto_cal_standby:
+            return gen_a, gen_b, "SYNTH STANDBY (NO EXT AUDIO)"
+
+        if self.ch2_mode == "gen":
+            ch2 = gen_a
+        else:
+            ch2 = ext_r
+        badge = "DESKTOP MON" if self.input_source == "monitor" else "MIC / LINE"
+        return ext_l, ch2, badge
+
+
+# ---------------------------------------------------------------------------
+# Signal Processing: Sub-Sample Trigger, Telemetry & 4096-pt Hanning FFT
+# ---------------------------------------------------------------------------
+HANNING_WIN = np.hanning(FFT_SIZE).astype(np.float32)
+HANNING_COHERENT_GAIN = float(np.sum(HANNING_WIN) / FFT_SIZE)
+FFT_FREQS = np.fft.rfftfreq(FFT_SIZE, d=1.0 / SAMPLE_RATE)
+
+
+def build_waterfall_lut(theme_key: str) -> np.ndarray:
+    """Create a 256x4 BGRA uint8 lookup table matched to each CRT phosphor / DSO theme."""
+    t = np.linspace(0.0, 1.0, 256, dtype=np.float32)
+    lut = np.zeros((256, 4), dtype=np.uint8)
+    lut[:, 3] = 255
+
+    if theme_key == "P31":
+        r = np.clip((t - 0.55) * 2.1, 0.0, 1.0) * 220.0 + 6.0
+        g = np.power(t, 0.72) * 248.0 + 7.0
+        b = np.power(t, 1.15) * 165.0 + 12.0
+    elif theme_key == "P7":
+        r = np.power(t, 0.68) * 248.0 + 7.0
+        g = np.power(t, 1.15) * 210.0 + 4.0
+        b = np.clip((t - 0.62) * 2.4, 0.0, 1.0) * 195.0 + 3.0
+    elif theme_key == "P4":
+        r = np.power(t, 0.90) * 240.0 + 10.0
+        g = np.power(t, 0.85) * 245.0 + 12.0
+        b = np.power(t, 0.75) * 242.0 + 13.0
+    else:  # DSO multi-color thermal/cyan/yellow/magenta
+        r = np.clip(np.where(t < 0.45, t * 0.4, (t - 0.45) / 0.55), 0.0, 1.0) * 255.0
+        g = np.clip(np.sin(np.clip(t * 1.15, 0.0, 1.0) * math.pi * 0.85), 0.0, 1.0) * 245.0
+        b = np.clip(np.where(t < 0.5, 0.15 + t * 1.7, 1.0 - (t - 0.5) * 1.3), 0.0, 1.0) * 255.0
+
+    lut[:, 0] = np.clip(b, 0, 255).astype(np.uint8)  # Blue (BGRA little-endian)
+    lut[:, 1] = np.clip(g, 0, 255).astype(np.uint8)  # Green
+    lut[:, 2] = np.clip(r, 0, 255).astype(np.uint8)  # Red
+    return lut
+
+
+WF_LUTS = {k: build_waterfall_lut(k) for k in PHOSPHOR_THEMES}
+
+
+def compute_telemetry_and_fft(ch1: np.ndarray) -> dict:
+    """Compute VFD counter metrics + 4096-pt Hanning RFFT spectrum & harmonic peaks."""
+    seg = ch1[-MEAS_SIZE:]
+    v_max = float(np.max(seg))
+    v_min = float(np.min(seg))
+    vpp = v_max - v_min
+    vrms = float(np.sqrt(np.mean(seg * seg)))
+    peak_abs = max(abs(v_max), abs(v_min), 1e-5)
+    peak_dbfs = max(-96.0, min(0.0, 20.0 * math.log10(peak_abs)))
+
+    # 4096-pt Hanning-windowed FFT
+    fseg = ch1[-FFT_SIZE:] * HANNING_WIN
+    spec = np.fft.rfft(fseg)
+    mag = np.abs(spec) / (FFT_SIZE * HANNING_COHERENT_GAIN * 0.5)
+    mag[0] *= 0.5
+    spec_db = 20.0 * np.log10(np.maximum(mag, 1e-5))
+    spec_db = np.clip(spec_db, -96.0, 6.0)
+
+    # Dominant FFT peak with parabolic log-magnitude sub-bin interpolation (20 Hz .. 20 kHz)
+    k_lo = max(1, int(20.0 * FFT_SIZE / SAMPLE_RATE))
+    k_hi = min(len(spec_db) - 2, int(20000.0 * FFT_SIZE / SAMPLE_RATE))
+    sub_db = spec_db[k_lo : k_hi + 1]
+    pk_rel = int(np.argmax(sub_db))
+    pk_bin = k_lo + pk_rel
+    pk_val_db = float(spec_db[pk_bin])
+
+    dom_fft_hz = 0.0
+    if pk_val_db > -78.0 and 1 <= pk_bin < len(spec_db) - 1:
+        a = float(spec_db[pk_bin - 1])
+        b = float(spec_db[pk_bin])
+        g = float(spec_db[pk_bin + 1])
+        denom = a - 2.0 * b + g
+        delta = 0.5 * (a - g) / denom if abs(denom) > 1e-6 else 0.0
+        delta = max(-0.5, min(0.5, delta))
+        dom_fft_hz = (pk_bin + delta) * (SAMPLE_RATE / float(FFT_SIZE))
+
+    # Top 4 annotated local maxima peaks for FFT overlay
+    peaks: list[tuple[float, float]] = []
+    if pk_val_db > -76.0:
+        # Local maxima search with minimum bin separation (~85 Hz)
+        min_sep = 7
+        cand = []
+        for k in range(k_lo + 1, k_hi):
+            val = spec_db[k]
+            if val > -72.0 and val >= spec_db[k - 1] and val > spec_db[k + 1]:
+                cand.append((float(val), k))
+        cand.sort(reverse=True)
+        used_bins: list[int] = []
+        for val, k in cand:
+            if all(abs(k - uk) >= min_sep for uk in used_bins):
+                a, b, g = float(spec_db[k - 1]), float(spec_db[k]), float(spec_db[k + 1])
+                denom = a - 2.0 * b + g
+                d = max(-0.5, min(0.5, 0.5 * (a - g) / denom)) if abs(denom) > 1e-6 else 0.0
+                f_hz = (k + d) * (SAMPLE_RATE / float(FFT_SIZE))
+                peaks.append((f_hz, val))
+                used_bins.append(k)
+                if len(peaks) >= 4:
+                    break
+
+    # Precision Schmitt-hysteresis zero-crossing Frequency Counter on DC-removed lightly smoothed signal
+    freq_hz = 0.0
+    if vpp > 0.012:
+        centered = seg - float(np.mean(seg))
+        # Light 3-point smoothing filter to reject high-freq noise jitter on zero crossings
+        sm = 0.25 * centered[:-2] + 0.50 * centered[1:-1] + 0.25 * centered[2:]
+        hyst = max(0.004, 0.08 * float(np.max(np.abs(sm))))
+        crossings: list[float] = []
+        armed = bool(sm[0] < -hyst)
+        for i in range(len(sm) - 1):
+            y0 = float(sm[i])
+            y1 = float(sm[i + 1])
+            if not armed:
+                if y0 < -hyst:
+                    armed = True
+            else:
+                if y0 <= 0.0 < y1:
+                    frac = -y0 / (y1 - y0) if (y1 - y0) > 1e-9 else 0.0
+                    crossings.append(i + frac)
+                    armed = False
+
+        if len(crossings) >= 2:
+            span = crossings[-1] - crossings[0]
+            n_cycles = len(crossings) - 1
+            if span > 1.0:
+                est_hz = (n_cycles * SAMPLE_RATE) / span
+                if 15.0 <= est_hz <= 22000.0:
+                    freq_hz = est_hz
+
+    if freq_hz <= 0.0 and dom_fft_hz >= 20.0 and pk_val_db > -60.0:
+        freq_hz = dom_fft_hz
+
+    period_ms = (1000.0 / freq_hz) if freq_hz > 0.5 else 0.0
+
+    return {
+        "freq_hz": freq_hz,
+        "period_ms": period_ms,
+        "vpp": vpp,
+        "vrms": vrms,
+        "peak_dbfs": peak_dbfs,
+        "dom_fft_hz": dom_fft_hz,
+        "spec_db": spec_db,
+        "peaks": peaks,
+    }
+
+
+def extract_triggered_sweep(
+    ch1: np.ndarray,
+    ch2: np.ndarray,
+    sweep_samples: int,
+    trig_level: float,
+    rising: bool,
+) -> tuple[np.ndarray, np.ndarray, float, bool]:
+    """
+    Extract triggered (seg1, seg2, sub_sample_frac, locked) centered at X=50% of the CRT screen.
+    Returns sweep_samples + 2 samples for clean sub-sample interpolation across all 10 divisions.
+    """
+    half = max(8, sweep_samples // 2)
+    need = sweep_samples + 4
+    n = len(ch1)
+    if n < need + 16:
+        return ch1[-sweep_samples:], ch2[-sweep_samples:], 0.0, False
+
+    # Search recent window so trigger crosses at midpoint of the returned sweep
+    search_end = n - half - 3
+    search_span = min(max(sweep_samples * 2, 2400), search_end - half - 2)
+    search_start = max(half + 2, search_end - search_span)
+
+    y = ch1[search_start : search_end + 1]
+    hyst = 0.015
+
+    trig_idx = -1
+    frac = 0.0
+
+    if rising:
+        # Search backward from latest crossing for lowest latency display
+        cond = (y[:-1] <= trig_level) & (y[1:] > trig_level)
+        idxs = np.flatnonzero(cond)
+        for k in reversed(idxs):
+            abs_i = search_start + int(k)
+            # Check slight pre-crossing hysteresis to avoid noise chatter
+            pre_min = float(np.min(ch1[max(0, abs_i - 12) : abs_i + 1]))
+            if pre_min <= trig_level - hyst or ( float(np.max(ch1[abs_i : min(n, abs_i + 12)])) - pre_min ) > 0.02:
+                y0 = float(ch1[abs_i])
+                y1 = float(ch1[abs_i + 1])
+                frac = (trig_level - y0) / (y1 - y0) if abs(y1 - y0) > 1e-9 else 0.0
+                trig_idx = abs_i
+                break
+    else:
+        cond = (y[:-1] >= trig_level) & (y[1:] < trig_level)
+        idxs = np.flatnonzero(cond)
+        for k in reversed(idxs):
+            abs_i = search_start + int(k)
+            pre_max = float(np.max(ch1[max(0, abs_i - 12) : abs_i + 1]))
+            if pre_max >= trig_level + hyst or ( pre_max - float(np.min(ch1[abs_i : min(n, abs_i + 12)])) ) > 0.02:
+                y0 = float(ch1[abs_i])
+                y1 = float(ch1[abs_i + 1])
+                frac = (trig_level - y0) / (y1 - y0) if abs(y1 - y0) > 1e-9 else 0.0
+                trig_idx = abs_i
+                break
+
+    if trig_idx >= 0:
+        s0 = trig_idx - half
+        s1 = s0 + sweep_samples + 2
+        return ch1[s0:s1].copy(), ch2[s0:s1].copy(), max(0.0, min(1.0, frac)), True
+
+    # Untriggered fallback (latest window)
+    s1 = n
+    s0 = max(0, s1 - (sweep_samples + 2))
+    return ch1[s0:s1].copy(), ch2[s0:s1].copy(), 0.0, False
+
+
+# ---------------------------------------------------------------------------
+# Core Oscilloscope Display & Instrument Controller (Reusable for GUI + Self-Test)
+# ---------------------------------------------------------------------------
+class ScopeController:
+    def __init__(self, engine: ScopeAudioAndGenEngine):
+        self.engine = engine
+
+        # Display & Theme
+        self.display_mode = "SCOPE"  # SCOPE | DUAL | FFT | WATERFALL | XY
+        self.theme_key = "P31"       # P31 | P7 | P4 | DSO
+
+        # Scope Knob normalized values & mapped physical quantities
+        self.time_div_ms = 0.50      # 0.2 ms .. 50 ms
+        self.volts_gain = 1.00       # 0.2x .. 25x
+        self.trig_level = 0.00       # -1.0 .. +1.0
+        self.y_pos_div = 0.00        # -4.0 .. +4.0 divisions
+        self.intensity = 0.82        # 0.15 .. 1.00
+        self.persistence = 0.38      # 0.00 .. 0.95
+
+        # Trigger & Analysis options
+        self.trig_rising = True
+        self.trig_mode = "AUTO"      # AUTO | NORM | SINGLE
+        self.single_armed = False
+        self.frozen = False
+        self.fft_log = True
+        self.fft_peak_hold = True
+        self.cursors_manual = False
+
+        # Movable ΔT / ΔV Cursor normalized coordinates [0..1]
+        self.cur_t1 = 0.30
+        self.cur_t2 = 0.70
+        self.cur_v1 = 0.28
+        self.cur_v2 = 0.72
+
+        # Live processed buffers & telemetry
+        self.telemetry = {
+            "freq_hz": 0.0,
+            "period_ms": 0.0,
+            "vpp": 0.0,
+            "vrms": 0.0,
+            "peak_dbfs": -96.0,
+            "dom_fft_hz": 0.0,
+            "spec_db": np.full(FFT_SIZE // 2 + 1, -96.0, dtype=np.float32),
+            "peaks": [],
+        }
+        self.peak_hold_db = np.full(FFT_SIZE // 2 + 1, -96.0, dtype=np.float32)
+        self.active_badge = "DESKTOP MON"
+        self.trig_locked = False
+
+        self.held_seg1: np.ndarray | None = None
+        self.held_seg2: np.ndarray | None = None
+        self.held_frac = 0.0
+        self.held_xy1: np.ndarray | None = None
+        self.held_xy2: np.ndarray | None = None
+
+        # Persistence Cairo surface + Waterfall RGB24 pixel buffer
+        self._persist_surf: cairo.ImageSurface | None = None
+        self._persist_wh = (0, 0)
+        self._persist_mode_tag = ""
+        self._wf_buf = np.zeros((WF_H, WF_W, 4), dtype=np.uint8)
+        self._wf_buf[:, :, 3] = 255
+        self._crt_screen_rect = (16.0, 14.0, 640.0, 420.0)
+
+    @property
+    def cursors_visible(self) -> bool:
+        return self.theme_key == "DSO" or self.cursors_manual
+
+    def clear_persistence(self):
+        if self._persist_surf is not None:
+            pcr = cairo.Context(self._persist_surf)
+            pcr.set_operator(cairo.OPERATOR_CLEAR)
+            pcr.paint()
+
+    def reset_peak_hold(self):
+        self.peak_hold_db.fill(-96.0)
+
+    def step_dsp(self):
+        """Run one ~30 fps DSP update cycle unless frozen or single-shot captured."""
+        if self.frozen:
+            return
+        if self.trig_mode == "SINGLE" and not self.single_armed and self.held_seg1 is not None:
+            return
+
+        ch1, ch2, badge = self.engine.snapshot_channels()
+        self.active_badge = badge
+
+        tel = compute_telemetry_and_fft(ch1)
+        self.telemetry = tel
+
+        if self.fft_peak_hold:
+            # Slow ballistic decay on peak hold (-0.12 dB/frame) + instant attack
+            self.peak_hold_db = np.maximum(self.peak_hold_db - 0.08, tel["spec_db"])
+        else:
+            self.peak_hold_db[:] = tel["spec_db"]
+
+        sweep_samples = max(48, min(24000, int(round(10.0 * (self.time_div_ms / 1000.0) * SAMPLE_RATE))))
+        # Trigger level on screen corresponds to signal threshold = trig_level / volts_gain
+        eff_trig = (self.trig_level * 2.5) / max(0.2, self.volts_gain)
+        seg1, seg2, frac, locked = extract_triggered_sweep(
+            ch1, ch2, sweep_samples, eff_trig, self.trig_rising
+        )
+
+        if locked:
+            self.trig_locked = True
+            self.held_seg1 = seg1
+            self.held_seg2 = seg2
+            self.held_frac = frac
+            if self.trig_mode == "SINGLE" and self.single_armed:
+                self.single_armed = False
+        else:
+            self.trig_locked = False
+            if self.trig_mode == "AUTO" or self.held_seg1 is None:
+                self.held_seg1 = seg1
+                self.held_seg2 = seg2
+                self.held_frac = 0.0
+
+        # X-Y vector slice (2048 samples = 42.6 ms trail per frame)
+        self.held_xy1 = ch1[-2048:].copy()
+        self.held_xy2 = ch2[-2048:].copy()
+
+        # Advance Waterfall Spectrogram row
+        self._push_waterfall_row(tel["spec_db"])
+
+    def _push_waterfall_row(self, spec_db: np.ndarray):
+        self._wf_buf[1:] = self._wf_buf[:-1]
+        cols_x = np.linspace(0.0, 1.0, WF_W, dtype=np.float32)
+        if self.fft_log:
+            freqs = 20.0 * np.power(1000.0, cols_x)  # 20 Hz .. 20 kHz
+        else:
+            freqs = 20.0 + cols_x * (20000.0 - 20.0)
+        row_db = np.interp(freqs, FFT_FREQS, spec_db)
+        norm = np.clip((row_db + 88.0) / 84.0, 0.0, 1.0)
+        idx = (norm * 255.0).astype(np.uint8)
+        self._wf_buf[0] = WF_LUTS[self.theme_key][idx]
+
+    # ---- Top VFD Counter & Telemetry Bar Renderer ----
+    def draw_vfd_bar(self, cr: cairo.Context, W: float, H: float):
+        # Outer recessed VFD housing
+        cr.rectangle(0, 0, W, H)
+        cr.set_source_rgb(0.03, 0.06, 0.065)
+        cr.fill()
+
+        # 3D sunken glass bevel
+        cr.set_line_width(2.0)
+        cr.set_source_rgb(0.01, 0.02, 0.025)
+        cr.move_to(0, H)
+        cr.line_to(0, 0)
+        cr.line_to(W, 0)
+        cr.stroke()
+        cr.set_source_rgb(0.35, 0.40, 0.48)
+        cr.move_to(0, H)
+        cr.line_to(W, H)
+        cr.line_to(W, 0)
+        cr.stroke()
+
+        tel = self.telemetry
+        f_hz = tel["freq_hz"]
+        if f_hz >= 1000.0:
+            freq_txt = f"{f_hz:7.1f} Hz"
+        elif f_hz > 0.5:
+            freq_txt = f"{f_hz:7.2f} Hz"
+        else:
+            freq_txt = "  ---.- Hz"
+
+        per_txt = f"{tel['period_ms']:6.3f} ms" if tel["period_ms"] > 0.001 else " --.--- ms"
+        vpp_txt = f"{tel['vpp']:5.3f} V"
+        rms_txt = f"{tel['vrms']:5.3f} V"
+        pk_txt = f"{tel['peak_dbfs']:+5.1f} dB"
+        dom_txt = f"{tel['dom_fft_hz']:6.1f} Hz" if tel["dom_fft_hz"] >= 20.0 else " ---.- Hz"
+
+        cells = [
+            ("COUNTER FREQ", freq_txt, 1.24, (0.24, 0.99, 0.86)),
+            ("PERIOD", per_txt, 1.00, (0.36, 0.95, 0.82)),
+            ("AMPL Vpp", vpp_txt, 0.92, (0.36, 0.95, 0.82)),
+            ("TRUE Vrms", rms_txt, 0.92, (0.36, 0.95, 0.82)),
+            ("PEAK dBFS", pk_txt, 0.96, (1.00, 0.78, 0.30) if tel["peak_dbfs"] > -3.0 else (0.36, 0.95, 0.82)),
+            ("DOMINANT FFT", dom_txt, 1.06, (0.48, 0.92, 1.00)),
+        ]
+
+        led_w = 112.0
+        usable_w = max(400.0, W - led_w - 18.0)
+        w_sum = sum(c[2] for c in cells)
+        x = 8.0
+
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        for title, val, weight, col in cells:
+            cw = usable_w * (weight / w_sum)
+            # Subtle VFD cell frame
+            cr.rectangle(x + 2, 6, cw - 4, H - 12)
+            cr.set_source_rgba(0.08, 0.22, 0.22, 0.36)
+            cr.fill()
+
+            cr.set_font_size(8.2)
+            cr.set_source_rgb(0.42, 0.76, 0.72)
+            cr.move_to(x + 8, 17.5)
+            cr.show_text(title)
+
+            # Phosphor VFD segment glow + crisp digits
+            cr.set_font_size(15.0 if weight > 1.1 else 13.5)
+            cr.set_source_rgba(col[0], col[1], col[2], 0.20)
+            cr.move_to(x + 9.2, H - 11.0)
+            cr.show_text(val)
+            cr.set_source_rgb(*col)
+            cr.move_to(x + 8.0, H - 12.0)
+            cr.show_text(val)
+            x += cw
+
+        # Right Trigger Lock & Hold Status LED Block
+        lx = W - led_w - 6.0
+        cr.rectangle(lx, 6, led_w, H - 12)
+        cr.set_source_rgba(0.06, 0.14, 0.16, 0.55)
+        cr.fill()
+
+        if self.frozen or (self.trig_mode == "SINGLE" and not self.single_armed):
+            led_col = (0.28, 0.90, 1.00)
+            trig_lbl = "HOLD / STOPPED"
+        elif self.trig_locked:
+            led_col = (0.22, 1.00, 0.54)
+            trig_lbl = "TRIG'D  LOCK"
+        elif self.trig_mode == "SINGLE":
+            led_col = (1.00, 0.72, 0.20)
+            trig_lbl = "ARMED  SNGL"
+        else:
+            led_col = (1.00, 0.68, 0.22)
+            trig_lbl = "AUTO  FREE"
+
+        cr.set_font_size(8.2)
+        cr.set_source_rgb(0.46, 0.78, 0.74)
+        cr.move_to(lx + 8, 17.5)
+        cr.show_text(f"TRIG ({self.trig_mode})")
+
+        # Glowing LED lamp
+        led_cx, led_cy = lx + 14.0, H - 17.0
+        cr.arc(led_cx, led_cy, 6.8, 0, 2 * math.pi)
+        cr.set_source_rgba(led_col[0], led_col[1], led_col[2], 0.32)
+        cr.fill()
+        cr.arc(led_cx, led_cy, 4.0, 0, 2 * math.pi)
+        cr.set_source_rgb(*led_col)
+        cr.fill()
+
+        cr.set_font_size(9.5)
+        cr.set_source_rgb(*led_col)
+        cr.move_to(lx + 25.0, H - 13.5)
+        cr.show_text(trig_lbl[:11])
+
+    # ---- Main Hybrid Analog CRT / DSO Screen Renderer ----
+    def draw_crt(self, cr: cairo.Context, W: float, H: float):
+        th = PHOSPHOR_THEMES[self.theme_key]
+
+        # Molded dark bezel surround
+        cr.rectangle(0, 0, W, H)
+        cr.set_source_rgb(0.09, 0.105, 0.13)
+        cr.fill()
+
+        pad_x, pad_y = 14.0, 12.0
+        sx = pad_x
+        sy = pad_y
+        sw = max(120.0, W - 2.0 * pad_x)
+        sh = max(96.0, H - 2.0 * pad_y)
+        self._crt_screen_rect = (sx, sy, sw, sh)
+
+        # Recessed CRT bezel shadow rim
+        cr.rectangle(sx - 4, sy - 4, sw + 8, sh + 8)
+        cr.set_source_rgb(0.04, 0.045, 0.055)
+        cr.fill()
+
+        # Phosphor CRT Glass Gradient
+        glass = cairo.LinearGradient(sx, sy, sx, sy + sh)
+        glass.add_color_stop_rgb(0.0, *th["glass_top"])
+        glass.add_color_stop_rgb(1.0, *th["glass_bot"])
+        cr.rectangle(sx, sy, sw, sh)
+        cr.set_source(glass)
+        cr.fill()
+
+        # Prepare/update persistence trail surface for beam modes (SCOPE, DUAL, FFT, XY)
+        iw, ih = max(32, int(sw)), max(32, int(sh))
+        mode_tag = f"{self.display_mode}:{self.theme_key}"
+        if self._persist_surf is None or self._persist_wh != (iw, ih) or self._persist_mode_tag != mode_tag:
+            self._persist_surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, iw, ih)
+            self._persist_wh = (iw, ih)
+            self._persist_mode_tag = mode_tag
+
+        cr.save()
+        cr.rectangle(sx, sy, sw, sh)
+        cr.clip()
+
+        if self.display_mode == "WATERFALL":
+            self._draw_waterfall_mode(cr, sx, sy, sw, sh, th)
+        else:
+            # Decay existing phosphor persistence buffer
+            pcr = cairo.Context(self._persist_surf)
+            decay = 0.0 if self.persistence < 0.02 else min(0.95, self.persistence)
+            pcr.save()
+            pcr.set_operator(cairo.OPERATOR_DEST_IN)
+            pcr.set_source_rgba(0.0, 0.0, 0.0, decay)
+            pcr.paint()
+            pcr.restore()
+
+            # Draw live electron beam onto persistence buffer (local coords 0..iw, 0..ih)
+            if self.display_mode in ("SCOPE", "DUAL"):
+                self._draw_scope_traces(pcr, float(iw), float(ih), th)
+            elif self.display_mode == "FFT":
+                self._draw_fft_traces(pcr, float(iw), float(ih), th)
+            elif self.display_mode == "XY":
+                self._draw_xy_traces(pcr, float(iw), float(ih), th)
+
+            # Composite phosphor beam buffer onto CRT glass before/with etched internal graticule
+            cr.save()
+            cr.set_operator(cairo.OPERATOR_ADD)
+            cr.set_source_surface(self._persist_surf, sx, sy)
+            cr.paint()
+            cr.restore()
+
+            # Internal etched 10x8 graticule + center crosshair sub-ticks
+            self._draw_graticule(cr, sx, sy, sw, sh, th)
+
+            # Mode-specific non-persistent crisp annotations (FFT peak labels, trigger arrow, cursors, HUD)
+            if self.display_mode == "FFT":
+                self._draw_fft_annotations(cr, sx, sy, sw, sh, th)
+            elif self.display_mode in ("SCOPE", "DUAL"):
+                self._draw_trigger_markers(cr, sx, sy, sw, sh, th)
+
+        if self.cursors_visible:
+            self._draw_measurement_cursors(cr, sx, sy, sw, sh, th)
+
+        self._draw_crt_readout_hud(cr, sx, sy, sw, sh, th)
+
+        # Subtle curved CRT glass specular highlight at top edge
+        spec_grad = cairo.LinearGradient(sx, sy, sx, sy + sh * 0.28)
+        spec_grad.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.055)
+        spec_grad.add_color_stop_rgba(1.0, 1.0, 1.0, 1.0, 0.0)
+        cr.rectangle(sx, sy, sw, sh * 0.28)
+        cr.set_source(spec_grad)
+        cr.fill()
+
+        cr.restore()
+
+        # Crisp inner CRT bezel border
+        cr.rectangle(sx, sy, sw, sh)
+        cr.set_line_width(1.6)
+        cr.set_source_rgb(0.24, 0.28, 0.34)
+        cr.stroke()
+
+    def _draw_graticule(self, cr: cairo.Context, sx: float, sy: float, sw: float, sh: float, th: dict):
+        dx = sw / 10.0
+        dy = sh / 8.0
+
+        cr.set_line_width(1.0)
+        if self.theme_key == "DSO":
+            cr.set_dash([2.0, 3.0])
+        cr.set_source_rgba(*th["grat"])
+
+        for i in range(1, 10):
+            gx = sx + i * dx
+            cr.move_to(gx, sy)
+            cr.line_to(gx, sy + sh)
+        for j in range(1, 8):
+            gy = sy + j * dy
+            cr.move_to(sx, gy)
+            cr.line_to(sx + sw, gy)
+        cr.stroke()
+        cr.set_dash([])
+
+        # Solid center crosshair axes + 5 sub-divisions per division (50 x 40 sub-ticks)
+        cx = sx + 5.0 * dx
+        cy = sy + 4.0 * dy
+        cr.set_source_rgba(*th["grat_sub"])
+        cr.set_line_width(1.2)
+        cr.move_to(cx, sy)
+        cr.line_to(cx, sy + sh)
+        cr.move_to(sx, cy)
+        cr.line_to(sx + sw, cy)
+        cr.stroke()
+
+        cr.set_line_width(1.0)
+        sub_dx = sw / 50.0
+        for k in range(1, 50):
+            if k % 5 != 0:
+                tx = sx + k * sub_dx
+                cr.move_to(tx, cy - 3.5)
+                cr.line_to(tx, cy + 3.5)
+        sub_dy = sh / 40.0
+        for k in range(1, 40):
+            if k % 5 != 0:
+                ty = sy + k * sub_dy
+                cr.move_to(cx - 3.5, ty)
+                cr.line_to(cx + 3.5, ty)
+        cr.stroke()
+
+        # Tektronix-style 100% / 90% / 10% / 0% rise-time calibration marks on left & right
+        cr.set_font_size(7.8)
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        for div_off, pct in ((-2.5, "100"), (-2.0, "90"), (2.0, "10"), (2.5, "0%")):
+            my = cy + div_off * dy
+            cr.move_to(sx, my)
+            cr.line_to(sx + 5.0, my)
+            cr.stroke()
+            cr.move_to(sx + 7.0, my + 2.8)
+            cr.show_text(pct)
+
+    def _stroke_phosphor_beam(
+        self,
+        pcr: cairo.Context,
+        xs: np.ndarray,
+        ys: np.ndarray,
+        halo_rgb: tuple[float, float, float],
+        core_rgb: tuple[float, float, float],
+        hot_rgb: tuple[float, float, float] | None = None,
+    ):
+        if len(xs) < 2:
+            return
+        inten = self.intensity
+
+        pcr.new_path()
+        pcr.move_to(float(xs[0]), float(ys[0]))
+        for i in range(1, len(xs)):
+            pcr.line_to(float(xs[i]), float(ys[i]))
+
+        pcr.set_line_join(cairo.LINE_JOIN_ROUND)
+        pcr.set_line_cap(cairo.LINE_CAP_ROUND)
+
+        # 1. Wide phosphor bloom halo
+        pcr.set_line_width(5.2 * (0.65 + 0.55 * inten))
+        pcr.set_source_rgba(halo_rgb[0], halo_rgb[1], halo_rgb[2], 0.22 * inten)
+        pcr.stroke_preserve()
+
+        # 2. Main phosphor trace body
+        pcr.set_line_width(2.0 * (0.75 + 0.35 * inten))
+        pcr.set_source_rgba(core_rgb[0], core_rgb[1], core_rgb[2], min(1.0, 0.82 * inten + 0.16))
+        if hot_rgb is not None and inten > 0.45:
+            pcr.stroke_preserve()
+            pcr.set_line_width(0.95)
+            pcr.set_source_rgba(hot_rgb[0], hot_rgb[1], hot_rgb[2], 0.72 * inten)
+            pcr.stroke()
+        else:
+            pcr.stroke()
+
+    def _draw_scope_traces(self, pcr: cairo.Context, W: float, H: float, th: dict):
+        if self.held_seg1 is None or len(self.held_seg1) < 4:
+            return
+        seg1 = self.held_seg1
+        seg2 = self.held_seg2
+        n_total = len(seg1) - 2
+        if n_total < 2:
+            return
+
+        dy = H / 8.0
+        cy = H * 0.5 - self.y_pos_div * dy
+        scale_y = 2.5 * dy * self.volts_gain  # ±1.0 FS @ 1.0x spans ±2.5 divisions
+
+        # Resample/decimate cleanly to max ~720 screen points with sub-sample trigger shift
+        n_pts = min(720, max(160, int(W)))
+        if n_total <= n_pts:
+            t_idx = np.arange(len(seg1), dtype=np.float64)
+            xs = ((t_idx - self.held_frac) / float(n_total)) * W
+            ys1 = cy - seg1 * scale_y
+            ys2 = cy - seg2 * scale_y if seg2 is not None else None
+        else:
+            # Peak-preserving / interpolated projection onto n_pts columns
+            grid = np.linspace(0.0, float(n_total), n_pts) + self.held_frac
+            src_idx = np.arange(len(seg1), dtype=np.float64)
+            xs = np.linspace(0.0, W, n_pts)
+            ys1 = cy - np.interp(grid, src_idx, seg1) * scale_y
+            ys2 = (cy - np.interp(grid, src_idx, seg2) * scale_y) if seg2 is not None else None
+
+        if self.display_mode == "DUAL" and ys2 is not None:
+            # Slight vertical separation if user hasn't shifted, or overlaid on same graticule
+            self._stroke_phosphor_beam(pcr, xs, ys2, th["ch2_halo"], th["ch2_core"], None)
+
+        self._stroke_phosphor_beam(pcr, xs, ys1, th["ch1_halo"], th["ch1_core"], th["ch1_hot"])
+
+    def _draw_trigger_markers(self, cr: cairo.Context, sx: float, sy: float, sw: float, sh: float, th: dict):
+        dy = sh / 8.0
+        cy = sy + sh * 0.5 - self.y_pos_div * dy
+        # Trigger level Y on screen: eff_trig = (trig_level * 2.5) / gain -> y = cy - eff_trig * (2.5 * dy * gain) = cy - trig_level * 2.5 * dy
+        ty = max(sy + 6.0, min(sy + sh - 6.0, cy - self.trig_level * 2.5 * dy))
+
+        # Faint dashed horizontal trigger level guide when dragging or in DSO theme
+        cr.set_line_width(1.0)
+        cr.set_dash([3.0, 4.0])
+        cr.set_source_rgba(th["cursor_v"][0], th["cursor_v"][1], th["cursor_v"][2], 0.34)
+        cr.move_to(sx, ty)
+        cr.line_to(sx + sw, ty)
+        cr.stroke()
+        cr.set_dash([])
+
+        # Right-edge draggable Trigger Level arrow (◀ T)
+        rx = sx + sw
+        cr.set_source_rgb(*th["cursor_v"])
+        cr.move_to(rx - 12.0, ty)
+        cr.line_to(rx - 2.0, ty - 5.5)
+        cr.line_to(rx - 2.0, ty + 5.5)
+        cr.close_path()
+        cr.fill()
+
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(8.5)
+        cr.move_to(rx - 21.0, ty + 3.0)
+        cr.show_text("T")
+
+        # Top center X=50% Trigger Time marker (▼)
+        tx = sx + sw * 0.5
+        cr.move_to(tx, sy + 9.0)
+        cr.line_to(tx - 5.0, sy + 1.5)
+        cr.line_to(tx + 5.0, sy + 1.5)
+        cr.close_path()
+        cr.fill()
+
+    def _draw_fft_traces(self, pcr: cairo.Context, W: float, H: float, th: dict):
+        spec_db = self.telemetry["spec_db"]
+        n_pts = min(640, max(200, int(W)))
+        xs = np.linspace(0.0, W, n_pts)
+        u = np.linspace(0.0, 1.0, n_pts)
+        freqs = 20.0 * np.power(1000.0, u) if self.fft_log else (20.0 + u * (20000.0 - 20.0))
+
+        vals_db = np.interp(freqs, FFT_FREQS, spec_db)
+        # Map -96 dBFS .. +4 dBFS across H (100 dB total = 12.5 dB/div across 8 vertical divisions)
+        ys = H - np.clip((vals_db + 96.0) / 100.0, 0.0, 1.0) * H
+
+        # Subtle translucent phosphor fill under live FFT curve
+        pcr.save()
+        pcr.new_path()
+        pcr.move_to(0.0, H)
+        for i in range(n_pts):
+            pcr.line_to(float(xs[i]), float(ys[i]))
+        pcr.line_to(W, H)
+        pcr.close_path()
+        pcr.set_source_rgba(th["ch1_halo"][0], th["ch1_halo"][1], th["ch1_halo"][2], 0.14 * self.intensity)
+        pcr.fill()
+        pcr.restore()
+
+        # Peak-Hold trace
+        if self.fft_peak_hold:
+            pk_vals = np.interp(freqs, FFT_FREQS, self.peak_hold_db)
+            pk_ys = H - np.clip((pk_vals + 96.0) / 100.0, 0.0, 1.0) * H
+            pcr.new_path()
+            pcr.move_to(float(xs[0]), float(pk_ys[0]))
+            for i in range(1, n_pts):
+                pcr.line_to(float(xs[i]), float(pk_ys[i]))
+            pcr.set_line_width(1.3)
+            pcr.set_source_rgba(th["peak"][0], th["peak"][1], th["peak"][2], 0.72 * self.intensity)
+            pcr.stroke()
+
+        self._stroke_phosphor_beam(pcr, xs, ys, th["ch1_halo"], th["ch1_core"], th["ch1_hot"])
+
+    def _draw_fft_annotations(self, cr: cairo.Context, sx: float, sy: float, sw: float, sh: float, th: dict):
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(8.2)
+
+        # Frequency axis grid labels along bottom
+        if self.fft_log:
+            marks = [(20, "20"), (50, "50"), (100, "100"), (200, "200"), (500, "500"),
+                     (1000, "1k"), (2000, "2k"), (5000, "5k"), (10000, "10k"), (20000, "20k")]
+            for f, lbl in marks:
+                u = math.log10(f / 20.0) / 3.0
+                gx = sx + u * sw
+                cr.set_source_rgba(*th["grat_sub"])
+                cr.set_line_width(0.8)
+                cr.move_to(gx, sy + sh - 6)
+                cr.line_to(gx, sy + sh)
+                cr.stroke()
+                ext = cr.text_extents(lbl)
+                tx = max(sx + 3.0, min(sx + sw - ext.width - 3.0, gx - ext.width * 0.5))
+                cr.set_source_rgb(*th["hud"])
+                cr.move_to(tx, sy + sh - 9.0)
+                cr.show_text(lbl)
+        else:
+            for k in range(0, 21, 4):
+                f = max(20.0, k * 1000.0)
+                u = (f - 20.0) / (20000.0 - 20.0)
+                gx = sx + u * sw
+                lbl = f"{k}k" if k > 0 else "20Hz"
+                ext = cr.text_extents(lbl)
+                tx = max(sx + 3.0, min(sx + sw - ext.width - 3.0, gx - ext.width * 0.5))
+                cr.set_source_rgb(*th["hud"])
+                cr.move_to(tx, sy + sh - 9.0)
+                cr.show_text(lbl)
+
+        # Auto-annotated top harmonic peaks
+        for idx, (f_hz, db_val) in enumerate(self.telemetry["peaks"]):
+            if not (20.0 <= f_hz <= 20000.0):
+                continue
+            u = (math.log10(f_hz / 20.0) / 3.0) if self.fft_log else ((f_hz - 20.0) / (20000.0 - 20.0))
+            px = sx + u * sw
+            py = sy + sh - np.clip((db_val + 96.0) / 100.0, 0.0, 1.0) * sh
+
+            # Diamond marker + callout
+            cr.set_source_rgb(*(th["peak"] if idx > 0 else th["ch1_hot"]))
+            cr.move_to(px, py - 5.0)
+            cr.line_to(px + 4.0, py)
+            cr.line_to(px, py + 5.0)
+            cr.line_to(px - 4.0, py)
+            cr.close_path()
+            cr.fill()
+
+            tag = f"{f_hz / 1000.0:.2f}k" if f_hz >= 1000.0 else f"{f_hz:.0f}Hz"
+            ext = cr.text_extents(tag)
+            lx = max(sx + 4.0, min(sx + sw - ext.width - 4.0, px - ext.width * 0.5))
+            ly = max(sy + 26.0, py - 9.0)
+            cr.set_source_rgba(0.02, 0.04, 0.06, 0.72)
+            cr.rectangle(lx - 2, ly - 9, ext.width + 4, 11)
+            cr.fill()
+            cr.set_source_rgb(*th["peak"])
+            cr.move_to(lx, ly)
+            cr.show_text(tag)
+
+    def _draw_waterfall_mode(self, cr: cairo.Context, sx: float, sy: float, sw: float, sh: float, th: dict):
+        # Top 26% live spectrum trace + Bottom 74% high-res scrolling phosphor spectrogram
+        spec_h = sh * 0.27
+        wf_y = sy + spec_h
+        wf_h = sh - spec_h
+
+        # Blit NumPy ARGB32/RGB24 waterfall image scaled cleanly to CRT width
+        wf_surf = cairo.ImageSurface.create_for_data(
+            self._wf_buf, cairo.FORMAT_RGB24, WF_W, WF_H, WF_W * 4
+        )
+        cr.save()
+        cr.translate(sx, wf_y)
+        cr.scale(sw / float(WF_W), wf_h / float(WF_H))
+        cr.set_source_surface(wf_surf, 0.0, 0.0)
+        cr.paint()
+        cr.restore()
+
+        # Live mini FFT trace in top strip
+        spec_db = self.telemetry["spec_db"]
+        n_pts = min(520, max(160, int(sw)))
+        xs = sx + np.linspace(0.0, sw, n_pts)
+        u = np.linspace(0.0, 1.0, n_pts)
+        freqs = 20.0 * np.power(1000.0, u) if self.fft_log else (20.0 + u * (20000.0 - 20.0))
+        vals_db = np.interp(freqs, FFT_FREQS, spec_db)
+        ys = sy + spec_h - np.clip((vals_db + 96.0) / 100.0, 0.04, 0.94) * spec_h
+
+        self._stroke_phosphor_beam(cr, xs, ys, th["ch1_halo"], th["ch1_core"], th["ch1_hot"])
+
+        # Separator scale bar between live FFT and scrolling waterfall
+        cr.set_line_width(1.4)
+        cr.set_source_rgba(*th["grat_sub"])
+        cr.move_to(sx, wf_y)
+        cr.line_to(sx + sw, wf_y)
+        cr.stroke()
+
+        self._draw_graticule(cr, sx, sy, sw, sh, th)
+        self._draw_fft_annotations(cr, sx, sy, sw, spec_h + 14.0, th)
+
+    def _draw_xy_traces(self, pcr: cairo.Context, W: float, H: float, th: dict):
+        if self.held_xy1 is None or self.held_xy2 is None:
+            return
+        x_sig = self.held_xy1
+        y_sig = self.held_xy2
+        dy = H / 8.0
+        scale = 2.5 * dy * self.volts_gain
+        cx = W * 0.5
+        cy = H * 0.5 - self.y_pos_div * dy
+
+        # Subsample cleanly to 900 points for crisp high-speed vector drawing
+        step = max(1, len(x_sig) // 900)
+        xs = cx + x_sig[::step] * scale
+        ys = cy - y_sig[::step] * scale
+
+        self._stroke_phosphor_beam(pcr, xs, ys, th["ch1_halo"], th["ch1_core"], th["ch1_hot"])
+
+    def _draw_measurement_cursors(self, cr: cairo.Context, sx: float, sy: float, sw: float, sh: float, th: dict):
+        x1 = sx + self.cur_t1 * sw
+        x2 = sx + self.cur_t2 * sw
+        y1 = sy + self.cur_v1 * sh
+        y2 = sy + self.cur_v2 * sh
+
+        cr.set_line_width(1.2)
+        cr.set_dash([5.0, 3.0])
+
+        # Vertical T1 / T2 cursors
+        cr.set_source_rgba(th["cursor_t"][0], th["cursor_t"][1], th["cursor_t"][2], 0.88)
+        cr.move_to(x1, sy)
+        cr.line_to(x1, sy + sh)
+        cr.move_to(x2, sy)
+        cr.line_to(x2, sy + sh)
+        cr.stroke()
+
+        # Horizontal V1 / V2 cursors
+        cr.set_source_rgba(th["cursor_v"][0], th["cursor_v"][1], th["cursor_v"][2], 0.88)
+        cr.move_to(sx, y1)
+        cr.line_to(sx + sw, y1)
+        cr.move_to(sx, y2)
+        cr.line_to(sx + sw, y2)
+        cr.stroke()
+        cr.set_dash([])
+
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(8.5)
+        cr.set_source_rgb(*th["cursor_t"])
+        cr.move_to(x1 + 3, sy + sh - 22)
+        cr.show_text("T1")
+        cr.move_to(x2 + 3, sy + sh - 22)
+        cr.show_text("T2")
+
+        cr.set_source_rgb(*th["cursor_v"])
+        cr.move_to(sx + 24, y1 - 3)
+        cr.show_text("V1")
+        cr.move_to(sx + 24, y2 - 3)
+        cr.show_text("V2")
+
+        # Compute physical ΔT / ΔV or ΔF / ΔdB readout box at top-right of CRT
+        if self.display_mode in ("FFT", "WATERFALL"):
+            def u_to_f(u: float) -> float:
+                return 20.0 * math.pow(1000.0, u) if self.fft_log else (20.0 + u * (20000.0 - 20.0))
+            f1, f2 = u_to_f(self.cur_t1), u_to_f(self.cur_t2)
+            df = abs(f2 - f1)
+            db1 = 4.0 - self.cur_v1 * 100.0
+            db2 = 4.0 - self.cur_v2 * 100.0
+            line1 = f"F1:{f1:6.0f}Hz F2:{f2:6.0f}Hz ΔF:{df:6.0f}Hz"
+            line2 = f"L1:{db1:+5.1f}dB L2:{db2:+5.1f}dB ΔL:{db2-db1:+5.1f}dB"
+        else:
+            full_ms = 10.0 * self.time_div_ms
+            dt_ms = abs(self.cur_t2 - self.cur_t1) * full_ms
+            inv_hz = (1000.0 / dt_ms) if dt_ms > 1e-4 else 0.0
+            # Full vertical height is 8 divisions; 2.5 divs = 1.0 V @ gain=1.0 -> 1 div = 0.40 / gain V
+            v_per_div = 0.40 / max(0.2, self.volts_gain)
+            v1_val = ((0.5 - self.cur_v1) * 8.0 - self.y_pos_div) * v_per_div
+            v2_val = ((0.5 - self.cur_v2) * 8.0 - self.y_pos_div) * v_per_div
+            dv_val = abs(v2_val - v1_val)
+            line1 = f"ΔT:{dt_ms:6.2f}ms  1/ΔT:{inv_hz:6.1f}Hz"
+            line2 = f"V1:{v1_val:+5.2f}V  V2:{v2_val:+5.2f}V  ΔV:{dv_val:5.2f}V"
+
+        cr.set_font_size(8.4)
+        w_box = max(cr.text_extents(line1).width, cr.text_extents(line2).width) + 14.0
+        bx = sx + sw - w_box - 8.0
+        by = sy + 24.0
+        cr.set_source_rgba(0.02, 0.04, 0.07, 0.80)
+        cr.rectangle(bx, by, w_box, 30.0)
+        cr.fill()
+        cr.set_line_width(1.0)
+        cr.set_source_rgba(th["hud"][0], th["hud"][1], th["hud"][2], 0.45)
+        cr.rectangle(bx, by, w_box, 30.0)
+        cr.stroke()
+
+        cr.set_source_rgb(*th["cursor_t"])
+        cr.move_to(bx + 7.0, by + 12.0)
+        cr.show_text(line1)
+        cr.set_source_rgb(*th["cursor_v"])
+        cr.move_to(bx + 7.0, by + 24.5)
+        cr.show_text(line2)
+
+    def _draw_crt_readout_hud(self, cr: cairo.Context, sx: float, sy: float, sw: float, _sh: float, th: dict):
+        """Tektronix 2465B / HP 54600 top CRT character-generator scale readout."""
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(8.8)
+
+        v_div = 0.40 / max(0.2, self.volts_gain)
+        v_str = f"{v_div * 1000.0:.0f}mV/div" if v_div < 0.1 else f"{v_div:.2f}V/div"
+        t_str = f"{self.time_div_ms * 1000.0:.0f}us/div" if self.time_div_ms < 1.0 else f"{self.time_div_ms:.2f}ms/div"
+        slope = "↗" if self.trig_rising else "↘"
+
+        if self.display_mode in ("FFT", "WATERFALL"):
+            scale_txt = f"FFT 4096-PT HANNING  {'LOG' if self.fft_log else 'LIN'} 20Hz-20kHz  12.5dB/div"
+        elif self.display_mode == "XY":
+            corr = 0.0
+            if self.held_xy1 is not None and self.held_xy2 is not None:
+                n1 = float(np.linalg.norm(self.held_xy1))
+                n2 = float(np.linalg.norm(self.held_xy2))
+                if n1 > 1e-4 and n2 > 1e-4:
+                    cval = max(-1.0, min(1.0, float(np.dot(self.held_xy1, self.held_xy2)) / (n1 * n2)))
+                    corr = math.degrees(math.acos(cval))
+            scale_txt = f"X-Y LISSAJOUS   CH1/CH2: {v_str} ({self.volts_gain:.1f}x)   PHASE φ≈{corr:4.0f}°"
+        else:
+            ch2_lbl = f"  CH2:{v_str}" if self.display_mode == "DUAL" else ""
+            scale_txt = f"CH1:{v_str} ({self.volts_gain:.1f}x){ch2_lbl}   TB:{t_str}   TRIG:{slope}{self.trig_level:+.2f}"
+
+        cr.set_source_rgba(0.01, 0.03, 0.04, 0.65)
+        ext = cr.text_extents(scale_txt)
+        cr.rectangle(sx + 6, sy + 4, ext.width + 10, 15)
+        cr.fill()
+        cr.set_source_rgb(*th["hud"])
+        cr.move_to(sx + 11, sy + 15)
+        cr.show_text(scale_txt)
+
+        # Right-corner source / freeze badge
+        rt_txt = f"[FROZEN] {self.active_badge}" if self.frozen else self.active_badge
+        rext = cr.text_extents(rt_txt)
+        rx = sx + sw - rext.width - 14.0
+        cr.set_source_rgba(0.01, 0.03, 0.04, 0.65)
+        cr.rectangle(rx - 4, sy + 4, rext.width + 10, 15)
+        cr.fill()
+        cr.set_source_rgb(*( (1.0, 0.76, 0.28) if "STANDBY" in rt_txt or self.frozen else th["hud"] ))
+        cr.move_to(rx + 1, sy + 15)
+        cr.show_text(rt_txt)
+
+
+# ---------------------------------------------------------------------------
+# Main dtScope GTK Window (1100 x 650 CDE Bench Instrument)
+# ---------------------------------------------------------------------------
+class DtScopeWindow(Gtk.Window):
+    def __init__(self, self_test: bool = False):
+        super().__init__(title="dtScope — Audio Oscilloscope & Function Generator")
+        self.set_default_size(1100, 650)
+        self.set_resizable(True)
+        self._self_test = self_test
+        self._updating_gen_widgets = False
+        self._drag_target: str | None = None
+
+        for icon_cand in (
+            HOME / ".dt" / "icons" / "dtscope.pm",
+            Path(__file__).resolve().parent / "icons" / "dtscope.pm",
+        ):
+            if icon_cand.is_file():
+                try:
+                    self.set_icon_from_file(str(icon_cand))
+                    break
+                except Exception:
+                    pass
+
+        chrome, sel, well = load_cde_palette()
+        prov = Gtk.CssProvider()
+        prov.load_from_data(build_scope_css(chrome, sel, well))
+        scr = Gdk.Screen.get_default()
+        if scr is not None:
+            Gtk.StyleContext.add_provider_for_screen(
+                scr, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
+
+        self.engine = ScopeAudioAndGenEngine(on_status_cb=self._set_status)
+        self.ctrl = ScopeController(self.engine)
+
+        self._build_ui()
+        self._load_state()
+        self._sync_all_button_states()
+
+        self.engine.start(headless=self._self_test)
+        GLib.timeout_add(33, self._on_frame_tick)
+        self.connect("destroy", self._on_destroy)
+
+        if self._self_test:
+            GLib.timeout_add(120, self._run_gui_self_test, 0)
+
+    # ---- UI Construction ----
+    def _build_ui(self):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(outer)
+
+        cab = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        cab.get_style_context().add_class("rx-cabinet")
+        outer.pack_start(cab, True, True, 0)
+
+        # 1. Top Digital VFD Counter & Telemetry Bar
+        self.vfd_area = Gtk.DrawingArea()
+        self.vfd_area.set_size_request(-1, 56)
+        self.vfd_area.connect("draw", self._on_draw_vfd)
+        cab.pack_start(self.vfd_area, False, False, 0)
+
+        # 2. Main Split Bench Faceplate (Left: CRT + Mode/Trig Strips | Right: Knobs + Source + Generator)
+        split = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        cab.pack_start(split, True, True, 0)
+
+        # ==== LEFT COLUMN: Display Modes + Sunken CRT Bezel + Trigger/FFT Controls ====
+        left_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        split.pack_start(left_col, True, True, 0)
+
+        # Top Mode & Phosphor Theme Strip
+        mode_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        mode_bar.get_style_context().add_class("rx-strip")
+        left_col.pack_start(mode_bar, False, False, 0)
+
+        lbl_m = Gtk.Label(label="MODE")
+        lbl_m.get_style_context().add_class("rx-engraved")
+        mode_bar.pack_start(lbl_m, False, False, 2)
+
+        self.mode_btns: dict[str, Gtk.Button] = {}
+        for m_key, m_lbl, m_tip in [
+            ("SCOPE", "SCOPE Y-T", "Single-trace triggered time-domain oscilloscope"),
+            ("DUAL", "DUAL CH1+2", "Dual-trace overlay: CH1 Input vs Stereo R or Bench Generator"),
+            ("FFT", "FFT SPEC", "4096-pt Hanning Spectrum Analyzer (20 Hz - 20 kHz)"),
+            ("WATERFALL", "WATERFALL", "Scrolling high-resolution phosphor spectrogram"),
+            ("XY", "X-Y VECTOR", "X-Y Lissajous phase / stereo vectorscope"),
+        ]:
+            b = Gtk.Button(label=m_lbl)
+            b.set_tooltip_text(m_tip)
+            b.connect("clicked", self._on_mode_clicked, m_key)
+            self.mode_btns[m_key] = b
+            mode_bar.pack_start(b, False, False, 0)
+
+        # Spacer + 4 Phosphor / DSO Themes
+        self.theme_btns: dict[str, Gtk.Button] = {}
+        for t_key in ("DSO", "P4", "P7", "P31"):
+            t_lbl = {"P31": "P31 GRN", "P7": "P7 AMB", "P4": "P4 WHT", "DSO": "DSO DIG"}[t_key]
+            b = Gtk.Button(label=t_lbl)
+            b.set_tooltip_text(f"CRT Phosphor / DSO Theme: {PHOSPHOR_THEMES[t_key]['label']}")
+            b.connect("clicked", self._on_theme_clicked, t_key)
+            self.theme_btns[t_key] = b
+            mode_bar.pack_end(b, False, False, 0)
+
+        lbl_p = Gtk.Label(label="CRT")
+        lbl_p.get_style_context().add_class("rx-engraved")
+        mode_bar.pack_end(lbl_p, False, False, 2)
+
+        # Sunken CRT Bezel Frame
+        crt_frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        crt_frame.get_style_context().add_class("crt-frame")
+        left_col.pack_start(crt_frame, True, True, 0)
+
+        self.crt_area = Gtk.DrawingArea()
+        self.crt_area.set_size_request(620, 420)
+        self.crt_area.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+            | Gdk.EventMask.SCROLL_MASK
+        )
+        self.crt_area.connect("draw", self._on_draw_crt)
+        self.crt_area.connect("button-press-event", self._on_crt_press)
+        self.crt_area.connect("button-release-event", self._on_crt_release)
+        self.crt_area.connect("motion-notify-event", self._on_crt_motion)
+        self.crt_area.connect("scroll-event", self._on_crt_scroll)
+        crt_frame.pack_start(self.crt_area, True, True, 0)
+
+        # Bottom Trigger, Cursor & Spectrum Strip
+        trig_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        trig_bar.get_style_context().add_class("rx-strip")
+        left_col.pack_start(trig_bar, False, False, 0)
+
+        lbl_t = Gtk.Label(label="TRIG")
+        lbl_t.get_style_context().add_class("rx-engraved")
+        trig_bar.pack_start(lbl_t, False, False, 2)
+
+        self.btn_slope = Gtk.Button(label="SLOPE ↗")
+        self.btn_slope.set_tooltip_text("Toggle Rising (↗) / Falling (↘) trigger edge")
+        self.btn_slope.connect("clicked", self._on_slope_clicked)
+        trig_bar.pack_start(self.btn_slope, False, False, 0)
+
+        self.trig_mode_btns: dict[str, Gtk.Button] = {}
+        for tm in ("AUTO", "NORM", "SINGLE"):
+            b = Gtk.Button(label=tm)
+            b.set_tooltip_text(f"Trigger sweep mode: {tm}")
+            b.connect("clicked", self._on_trig_mode_clicked, tm)
+            self.trig_mode_btns[tm] = b
+            trig_bar.pack_start(b, False, False, 0)
+
+        self.btn_freeze = Gtk.Button(label="FREEZE")
+        self.btn_freeze.set_tooltip_text("Freeze / Hold current CRT acquisition")
+        self.btn_freeze.connect("clicked", self._on_freeze_clicked)
+        trig_bar.pack_start(self.btn_freeze, False, False, 2)
+
+        self.btn_cursors = Gtk.Button(label="ΔT/ΔV CUR")
+        self.btn_cursors.set_tooltip_text("Toggle movable ΔT / ΔV measurement cursors on CRT")
+        self.btn_cursors.connect("clicked", self._on_cursors_clicked)
+        trig_bar.pack_start(self.btn_cursors, False, False, 0)
+
+        # Right side of bottom strip: FFT Log/Lin + Peak Hold + CH2 Source
+        self.btn_ch2 = Gtk.Button(label="CH2: R/SYN")
+        self.btn_ch2.set_tooltip_text("Toggle CH2 trace between Stereo Right/Quadrature vs Bench Generator")
+        self.btn_ch2.connect("clicked", self._on_ch2_clicked)
+        trig_bar.pack_end(self.btn_ch2, False, False, 0)
+
+        self.btn_pk_hold = Gtk.Button(label="PK HOLD")
+        self.btn_pk_hold.set_tooltip_text("Toggle FFT live Peak-Hold trace (double-click or re-enable resets)")
+        self.btn_pk_hold.connect("clicked", self._on_pk_hold_clicked)
+        trig_bar.pack_end(self.btn_pk_hold, False, False, 0)
+
+        self.btn_fft_scale = Gtk.Button(label="FFT LOG")
+        self.btn_fft_scale.set_tooltip_text("Toggle Logarithmic vs Linear FFT / Waterfall frequency scale")
+        self.btn_fft_scale.connect("clicked", self._on_fft_scale_clicked)
+        trig_bar.pack_end(self.btn_fft_scale, False, False, 0)
+
+        # ==== RIGHT COLUMN: Input Source + 6 Scope Knobs + Bench Function/Radio Tone Deck ====
+        right_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        right_col.set_size_request(368, -1)
+        split.pack_start(right_col, False, False, 0)
+
+        # Section A: Audio Input Source & Calibrator Strip
+        src_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        src_box.get_style_context().add_class("rx-strip")
+        right_col.pack_start(src_box, False, False, 0)
+
+        src_hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        src_box.pack_start(src_hdr, False, False, 0)
+        lbl_in = Gtk.Label(label="INPUT SOURCE & CALIBRATOR")
+        lbl_in.get_style_context().add_class("rx-sec-hdr")
+        src_hdr.pack_start(lbl_in, False, False, 0)
+
+        self.btn_probe_cal = Gtk.Button(label="1kHz CAL")
+        self.btn_probe_cal.set_tooltip_text("1.000 kHz Square-Wave Probe Compensation Calibrator (1.00 Vpp)")
+        self.btn_probe_cal.connect("clicked", self._on_probe_cal_clicked)
+        src_hdr.pack_end(self.btn_probe_cal, False, False, 0)
+
+        self.btn_auto_cal = Gtk.Button(label="AUTO-SYN")
+        self.btn_auto_cal.set_tooltip_text("Auto-display Internal Synth whenever Desktop/Mic audio is silent")
+        self.btn_auto_cal.connect("clicked", self._on_auto_cal_clicked)
+        src_hdr.pack_end(self.btn_auto_cal, False, False, 0)
+
+        src_btns_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        src_box.pack_start(src_btns_row, False, False, 0)
+        self.src_btns: dict[str, Gtk.Button] = {}
+        for s_key, s_lbl, s_tip in [
+            ("monitor", "DESKTOP MON", "Capture system audio (.monitor) so dtRadio dances live on the scope"),
+            ("mic", "MIC / LINE", "Capture default microphone or line-in jack"),
+            ("synth", "SYNTH / GEN", "Internal loopback from the Bench Function & Radio Tone Generator"),
+        ]:
+            b = Gtk.Button(label=s_lbl)
+            b.set_tooltip_text(s_tip)
+            b.connect("clicked", self._on_source_clicked, s_key)
+            self.src_btns[s_key] = b
+            src_btns_row.pack_start(b, True, True, 0)
+
+        # Section B: Six Spun-Aluminum Scope Knobs (2x3 Grid)
+        knobs_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        knobs_box.get_style_context().add_class("rx-strip")
+        right_col.pack_start(knobs_box, False, False, 0)
+
+        k_row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        k_row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        knobs_box.pack_start(k_row1, False, False, 0)
+        knobs_box.pack_start(k_row2, False, False, 0)
+
+        # TIME/DIV: 0.2 ms .. 50 ms -> v = log(t / 0.2) / log(250) ; 0.5 ms -> v = 0.1659
+        self.knob_time = RotaryKnob(
+            "TIME / DIV",
+            0.1659,
+            0.1659,
+            self._on_knob_time,
+            lambda v: self._fmt_time_div(0.2 * math.pow(250.0, v)),
+        )
+        # VOLTS/DIV: 0.2x .. 25x -> v = log(g / 0.2) / log(125) ; 1.0x -> v = 0.3333
+        self.knob_volts = RotaryKnob(
+            "VOLTS / DIV",
+            0.3333,
+            0.3333,
+            self._on_knob_volts,
+            lambda v: f"{0.2 * math.pow(125.0, v):.1f}x",
+        )
+        self.knob_trig = RotaryKnob(
+            "TRIG LEVEL",
+            0.50,
+            0.50,
+            self._on_knob_trig,
+            lambda v: f"{(v - 0.5) * 2.0:+.2f}",
+        )
+        self.knob_ypos = RotaryKnob(
+            "Y-POS",
+            0.50,
+            0.50,
+            self._on_knob_ypos,
+            lambda v: f"{(v - 0.5) * 8.0:+.1f}d",
+        )
+        self.knob_inten = RotaryKnob(
+            "INTENSITY",
+            0.79,
+            0.79,
+            self._on_knob_inten,
+            lambda v: f"{int(round((0.15 + 0.85 * v) * 100.0))}%",
+        )
+        self.knob_persist = RotaryKnob(
+            "PERSIST",
+            0.40,
+            0.40,
+            self._on_knob_persist,
+            lambda v: f"{int(round(v * 95.0))}%",
+        )
+
+        for kn in (self.knob_time, self.knob_volts, self.knob_trig):
+            k_row1.pack_start(kn, True, True, 0)
+        for kn in (self.knob_ypos, self.knob_inten, self.knob_persist):
+            k_row2.pack_start(kn, True, True, 0)
+
+        # Section C: Bench Function & Radio Tone Generator Deck
+        gen_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        gen_box.get_style_context().add_class("rx-strip")
+        right_col.pack_start(gen_box, True, True, 0)
+
+        gen_hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        gen_box.pack_start(gen_hdr, False, False, 0)
+        lbl_g = Gtk.Label(label="BENCH FUNCTION & RADIO GEN")
+        lbl_g.get_style_context().add_class("rx-sec-hdr")
+        gen_hdr.pack_start(lbl_g, False, False, 0)
+
+        self.btn_gen_out = Gtk.Button(label="GEN OUT OFF")
+        self.btn_gen_out.set_tooltip_text("Toggle live speaker output via GStreamer (always feeds CH2 / Synth)")
+        self.btn_gen_out.connect("clicked", self._on_gen_out_clicked)
+        gen_hdr.pack_end(self.btn_gen_out, False, False, 0)
+
+        # 6 Waveform Buttons (2 rows x 3 cols)
+        wf_grid = Gtk.Grid(row_spacing=2, column_spacing=3, column_homogeneous=True)
+        gen_box.pack_start(wf_grid, False, False, 0)
+        self.wf_btns: dict[str, Gtk.Button] = {}
+        waveforms = [
+            ("SINE", "SINE"),
+            ("SQUARE", "SQUARE"),
+            ("TRIANGLE", "TRIANG"),
+            ("SAWTOOTH", "SAWTOOTH"),
+            ("NOISE", "W-NOISE"),
+            ("2-TONE", "2-TONE SSB"),
+        ]
+        for idx, (wk, wlbl) in enumerate(waveforms):
+            b = Gtk.Button(label=wlbl)
+            if wk == "2-TONE":
+                b.set_tooltip_text("ARRL Standard Two-Tone SSB Test (700 Hz + 1900 Hz)")
+            b.connect("clicked", self._on_waveform_clicked, wk)
+            self.wf_btns[wk] = b
+            wf_grid.attach(b, idx % 3, idx // 3, 1, 1)
+
+        # Generator Knobs (GEN FREQ, GEN LEVEL) + Exact Hz Entry & CTCSS PL Combo
+        gen_mid = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        gen_box.pack_start(gen_mid, False, False, 0)
+
+        # 1000 Hz on 20..15000 log scale -> log(1000/20)/log(750) = 0.5913
+        self.knob_gen_freq = RotaryKnob(
+            "GEN FREQ",
+            0.5913,
+            0.5913,
+            self._on_knob_gen_freq,
+            lambda v: self._fmt_hz_short(20.0 * math.pow(750.0, v)),
+            accent_rgb=(0.28, 0.96, 0.84),
+        )
+        self.knob_gen_lvl = RotaryKnob(
+            "GEN LEVEL",
+            0.65,
+            0.65,
+            self._on_knob_gen_lvl,
+            lambda v: f"{int(round(v * 100.0))}%",
+            accent_rgb=(0.28, 0.96, 0.84),
+        )
+        gen_mid.pack_start(self.knob_gen_freq, False, False, 0)
+        gen_mid.pack_start(self.knob_gen_lvl, False, False, 0)
+
+        gen_num_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        gen_mid.pack_start(gen_num_col, True, True, 0)
+
+        lbl_hz = Gtk.Label(label="EXACT FREQ (Hz)")
+        lbl_hz.set_xalign(0.0)
+        lbl_hz.get_style_context().add_class("rx-engraved")
+        gen_num_col.pack_start(lbl_hz, False, False, 0)
+
+        adj = Gtk.Adjustment(value=1000.0, lower=20.0, upper=15000.0, step_increment=10.0, page_increment=100.0)
+        self.freq_spin = Gtk.SpinButton(adjustment=adj, climb_rate=1.0, digits=1)
+        self.freq_spin.set_numeric(True)
+        self.freq_spin.connect("value-changed", self._on_freq_spin_changed)
+        gen_num_col.pack_start(self.freq_spin, False, False, 0)
+
+        lbl_pl = Gtk.Label(label="HAM CTCSS PL TONE")
+        lbl_pl.set_xalign(0.0)
+        lbl_pl.get_style_context().add_class("rx-engraved")
+        gen_num_col.pack_start(lbl_pl, False, False, 0)
+
+        self.ctcss_combo = Gtk.ComboBoxText()
+        self.ctcss_combo.append_text("PL OFF")
+        for hz in CTCSS_TONES:
+            self.ctcss_combo.append_text(f"{hz:5.1f} Hz PL")
+        self.ctcss_combo.set_active(0)
+        self.ctcss_combo.connect("changed", self._on_ctcss_changed)
+        gen_num_col.pack_start(self.ctcss_combo, False, False, 0)
+
+        # Interactive 4x4 DTMF Tone-Pad
+        dtmf_hdr = Gtk.Label(label="4x4 ITU DTMF ENCODER PAD")
+        dtmf_hdr.set_xalign(0.0)
+        dtmf_hdr.get_style_context().add_class("rx-engraved")
+        gen_box.pack_start(dtmf_hdr, False, False, 0)
+
+        dtmf_grid = Gtk.Grid(row_spacing=2, column_spacing=3, column_homogeneous=True)
+        gen_box.pack_start(dtmf_grid, True, True, 0)
+
+        for r in range(4):
+            for c in range(4):
+                k = DTMF_GRID[r][c]
+                flo, fhi = DTMF_FREQS[k]
+                db = Gtk.Button(label=k)
+                db.get_style_context().add_class("dtmf-btn")
+                if c == 3:
+                    db.get_style_context().add_class("dtmf-col-a")
+                db.set_tooltip_text(f"DTMF '{k}' ({int(flo)} Hz + {int(fhi)} Hz)")
+                db.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK)
+                db.connect("button-press-event", self._on_dtmf_press, k)
+                db.connect("button-release-event", self._on_dtmf_release, k)
+                db.connect("clicked", self._on_dtmf_clicked, k)
+                dtmf_grid.attach(db, c, r, 1, 1)
+
+        # 3. Bottom CDE Sunken Status Bar
+        st_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        st_bar.get_style_context().add_class("cde-status")
+        outer.pack_start(st_bar, False, False, 0)
+
+        self.status_lbl = Gtk.Label(label="READY — dtScope 48.0 kHz S16LE")
+        self.status_lbl.set_xalign(0.0)
+        st_bar.pack_start(self.status_lbl, True, True, 0)
+
+        self.gen_status_lbl = Gtk.Label(label="GEN: SINE 1000.0 Hz (SPKR OFF)")
+        self.gen_status_lbl.set_xalign(1.0)
+        st_bar.pack_end(self.gen_status_lbl, False, False, 0)
+
+    # ---- Formatting Helpers ----
+    @staticmethod
+    def _fmt_time_div(ms: float) -> str:
+        return f"{ms * 1000.0:.0f}us" if ms < 1.0 else f"{ms:.1f}ms"
+
+    @staticmethod
+    def _fmt_hz_short(hz: float) -> str:
+        return f"{hz / 1000.0:.2f}k" if hz >= 1000.0 else f"{hz:.0f}Hz"
+
+    def _set_btn_class(self, btn: Gtk.Button, cls_name: str, active: bool):
+        ctx = btn.get_style_context()
+        if active:
+            ctx.add_class(cls_name)
+        else:
+            ctx.remove_class(cls_name)
+
+    def _sync_all_button_states(self):
+        for k, b in self.mode_btns.items():
+            self._set_btn_class(b, "sw-active", k == self.ctrl.display_mode)
+        for k, b in self.theme_btns.items():
+            self._set_btn_class(b, "sw-active", k == self.ctrl.theme_key)
+        for k, b in self.trig_mode_btns.items():
+            self._set_btn_class(b, "sw-active", k == self.ctrl.trig_mode)
+        for k, b in self.src_btns.items():
+            self._set_btn_class(b, "sw-active", k == self.engine.input_source)
+        for k, b in self.wf_btns.items():
+            self._set_btn_class(b, "sw-active", k == self.engine.gen_waveform)
+
+        self.btn_slope.set_label("SLOPE ↗" if self.ctrl.trig_rising else "SLOPE ↘")
+        self._set_btn_class(self.btn_freeze, "sw-amber", self.ctrl.frozen)
+        self._set_btn_class(self.btn_cursors, "sw-active", self.ctrl.cursors_visible)
+        self.btn_fft_scale.set_label("FFT LOG" if self.ctrl.fft_log else "FFT LIN")
+        self._set_btn_class(self.btn_fft_scale, "sw-active", self.ctrl.fft_log)
+        self._set_btn_class(self.btn_pk_hold, "sw-active", self.ctrl.fft_peak_hold)
+        self.btn_ch2.set_label("CH2: GEN" if self.engine.ch2_mode == "gen" else "CH2: R/QUAD")
+        self._set_btn_class(self.btn_ch2, "sw-active", self.engine.ch2_mode == "gen")
+
+        self._set_btn_class(self.btn_auto_cal, "sw-active", self.engine.auto_cal_standby)
+        self._set_btn_class(self.btn_probe_cal, "sw-amber", self.engine.probe_cal_1khz)
+
+        self.btn_gen_out.set_label("● GEN OUT ON" if self.engine.gen_out_enabled else "GEN OUT OFF")
+        self._set_btn_class(self.btn_gen_out, "btn-gen-on", self.engine.gen_out_enabled)
+        self._update_gen_status_label()
+
+    def _update_gen_status_label(self):
+        pl = f" + PL {self.engine.ctcss_hz:.1f}Hz" if self.engine.ctcss_hz > 0 else ""
+        spkr = "SPKR ON" if self.engine.gen_out_enabled else "INT BUS"
+        if self.engine.probe_cal_1khz:
+            self.gen_status_lbl.set_text(f"CAL: 1000.0 Hz SQUARE ({spkr})")
+        elif self.engine.gen_waveform == "2-TONE":
+            self.gen_status_lbl.set_text(f"GEN: 2-TONE 700+1900 Hz{pl} ({spkr})")
+        else:
+            self.gen_status_lbl.set_text(
+                f"GEN: {self.engine.gen_waveform} {self.engine.gen_freq_hz:.1f} Hz{pl} ({spkr})"
+            )
+
+    def _set_status(self, txt: str):
+        self.status_lbl.set_text(txt)
+
+    # ---- Knob & Button Callbacks ----
+    def _on_mode_clicked(self, _b, mode_key: str):
+        self.ctrl.display_mode = mode_key
+        self.ctrl.clear_persistence()
+        self._sync_all_button_states()
+        self.crt_area.queue_draw()
+
+    def _on_theme_clicked(self, _b, theme_key: str):
+        self.ctrl.theme_key = theme_key
+        self.ctrl.clear_persistence()
+        self._sync_all_button_states()
+        self.crt_area.queue_draw()
+
+    def _on_slope_clicked(self, _b):
+        self.ctrl.trig_rising = not self.ctrl.trig_rising
+        self._sync_all_button_states()
+
+    def _on_trig_mode_clicked(self, _b, tm: str):
+        self.ctrl.trig_mode = tm
+        if tm == "SINGLE":
+            self.ctrl.single_armed = True
+            self.ctrl.frozen = False
+        self._sync_all_button_states()
+
+    def _on_freeze_clicked(self, _b):
+        self.ctrl.frozen = not self.ctrl.frozen
+        self._sync_all_button_states()
+
+    def _on_cursors_clicked(self, _b):
+        if self.ctrl.theme_key == "DSO":
+            # Switch manual flag and inform user or toggle even in DSO by switching manual override
+            self.ctrl.cursors_manual = not self.ctrl.cursors_manual
+        else:
+            self.ctrl.cursors_manual = not self.ctrl.cursors_manual
+        self._sync_all_button_states()
+        self.crt_area.queue_draw()
+
+    def _on_fft_scale_clicked(self, _b):
+        self.ctrl.fft_log = not self.ctrl.fft_log
+        self.ctrl.clear_persistence()
+        self._sync_all_button_states()
+
+    def _on_pk_hold_clicked(self, _b):
+        self.ctrl.fft_peak_hold = not self.ctrl.fft_peak_hold
+        if self.ctrl.fft_peak_hold:
+            self.ctrl.reset_peak_hold()
+        self._sync_all_button_states()
+
+    def _on_ch2_clicked(self, _b):
+        self.engine.ch2_mode = "auto" if self.engine.ch2_mode == "gen" else "gen"
+        self._sync_all_button_states()
+
+    def _on_source_clicked(self, _b, src_key: str):
+        self.engine.probe_cal_1khz = False
+        self.engine.set_input_source(src_key)
+        self.ctrl.clear_persistence()
+        self._sync_all_button_states()
+
+    def _on_auto_cal_clicked(self, _b):
+        self.engine.auto_cal_standby = not self.engine.auto_cal_standby
+        self._sync_all_button_states()
+
+    def _on_probe_cal_clicked(self, _b):
+        self.engine.probe_cal_1khz = not self.engine.probe_cal_1khz
+        self.ctrl.clear_persistence()
+        self._sync_all_button_states()
+
+    def _on_knob_time(self, v: float):
+        self.ctrl.time_div_ms = 0.2 * math.pow(250.0, v)
+        self.ctrl.clear_persistence()
+
+    def _on_knob_volts(self, v: float):
+        self.ctrl.volts_gain = 0.2 * math.pow(125.0, v)
+        self.ctrl.clear_persistence()
+
+    def _on_knob_trig(self, v: float):
+        self.ctrl.trig_level = (v - 0.5) * 2.0
+
+    def _on_knob_ypos(self, v: float):
+        self.ctrl.y_pos_div = (v - 0.5) * 8.0
+        self.ctrl.clear_persistence()
+
+    def _on_knob_inten(self, v: float):
+        self.ctrl.intensity = 0.15 + 0.85 * v
+
+    def _on_knob_persist(self, v: float):
+        self.ctrl.persistence = v * 0.95
+
+    def _on_gen_out_clicked(self, _b):
+        self.engine.set_gen_speaker_out(not self.engine.gen_out_enabled)
+        self._sync_all_button_states()
+
+    def _on_waveform_clicked(self, _b, wf_key: str):
+        self.engine.probe_cal_1khz = False
+        self.engine.gen_waveform = wf_key
+        self.ctrl.clear_persistence()
+        self._sync_all_button_states()
+
+    def _on_knob_gen_freq(self, v: float):
+        hz = 20.0 * math.pow(750.0, v)
+        self.engine.gen_freq_hz = hz
+        if not self._updating_gen_widgets:
+            self._updating_gen_widgets = True
+            self.freq_spin.set_value(hz)
+            self._updating_gen_widgets = False
+        self._update_gen_status_label()
+
+    def _on_freq_spin_changed(self, spin: Gtk.SpinButton):
+        hz = max(20.0, min(15000.0, float(spin.get_value())))
+        self.engine.gen_freq_hz = hz
+        if not self._updating_gen_widgets:
+            self._updating_gen_widgets = True
+            v = math.log(hz / 20.0) / math.log(750.0)
+            self.knob_gen_freq.set_value(v, notify=False)
+            self._updating_gen_widgets = False
+        self._update_gen_status_label()
+
+    def _on_knob_gen_lvl(self, v: float):
+        self.engine.gen_level = v
+
+    def _on_ctcss_changed(self, combo: Gtk.ComboBoxText):
+        idx = combo.get_active()
+        if idx is None or idx <= 0:
+            self.engine.ctcss_hz = 0.0
+        else:
+            self.engine.ctcss_hz = CTCSS_TONES[idx - 1]
+        self._update_gen_status_label()
+
+    def _on_dtmf_press(self, _b, ev, key: str):
+        if ev.button == 1:
+            self.engine.probe_cal_1khz = False
+            self.engine.dtmf_held_key = key
+            self.engine.trigger_dtmf_burst(key, 0.38)
+            self._sync_all_button_states()
+        return False
+
+    def _on_dtmf_release(self, _b, _ev, _key: str):
+        self.engine.dtmf_held_key = None
+        return False
+
+    def _on_dtmf_clicked(self, _b, key: str):
+        self.engine.probe_cal_1khz = False
+        self.engine.trigger_dtmf_burst(key, 0.38)
+        self._sync_all_button_states()
+
+    # ---- Interactive CRT Mouse Dragging (Trigger Level + ΔT/ΔV Cursors + Wheel Timebase) ----
+    def _on_crt_press(self, _w, ev):
+        if ev.button != 1:
+            return False
+        sx, sy, sw, sh = self.ctrl._crt_screen_rect
+        if not (sx <= ev.x <= sx + sw and sy <= ev.y <= sy + sh):
+            return False
+
+        # Hit-test movable cursors if active
+        if self.ctrl.cursors_visible:
+            x1 = sx + self.ctrl.cur_t1 * sw
+            x2 = sx + self.ctrl.cur_t2 * sw
+            y1 = sy + self.ctrl.cur_v1 * sh
+            y2 = sy + self.ctrl.cur_v2 * sh
+            cands = [
+                (abs(ev.x - x1), "t1"),
+                (abs(ev.x - x2), "t2"),
+                (abs(ev.y - y1), "v1"),
+                (abs(ev.y - y2), "v2"),
+            ]
+            best_d, best_name = min(cands, key=lambda t: t[0])
+            if best_d <= 11.0:
+                self._drag_target = best_name
+                return True
+
+        # Hit-test right-side Trigger Level handle in SCOPE / DUAL modes
+        if self.ctrl.display_mode in ("SCOPE", "DUAL") and ev.x >= sx + sw - 34.0:
+            self._drag_target = "trig"
+            self._update_crt_drag(ev.x, ev.y)
+            return True
+
+        return False
+
+    def _on_crt_release(self, _w, _ev):
+        self._drag_target = None
+        return True
+
+    def _on_crt_motion(self, _w, ev):
+        if self._drag_target is not None:
+            self._update_crt_drag(ev.x, ev.y)
+            return True
+        return False
+
+    def _update_crt_drag(self, mx: float, my: float):
+        sx, sy, sw, sh = self.ctrl._crt_screen_rect
+        ux = max(0.02, min(0.98, (mx - sx) / max(1.0, sw)))
+        uy = max(0.02, min(0.98, (my - sy) / max(1.0, sh)))
+
+        if self._drag_target == "t1":
+            self.ctrl.cur_t1 = ux
+        elif self._drag_target == "t2":
+            self.ctrl.cur_t2 = ux
+        elif self._drag_target == "v1":
+            self.ctrl.cur_v1 = uy
+        elif self._drag_target == "v2":
+            self.ctrl.cur_v2 = uy
+        elif self._drag_target == "trig":
+            dy = sh / 8.0
+            cy = sy + sh * 0.5 - self.ctrl.y_pos_div * dy
+            lvl = max(-1.0, min(1.0, (cy - my) / (2.5 * dy)))
+            self.knob_trig.set_value(0.5 + lvl * 0.5, notify=True)
+        self.crt_area.queue_draw()
+
+    def _on_crt_scroll(self, _w, ev):
+        # Scroll wheel over CRT zooms TIME / DIV smoothly
+        step = 0.035
+        if ev.direction == Gdk.ScrollDirection.UP:
+            self.knob_time.set_value(self.knob_time.value - step, notify=True)
+        elif ev.direction == Gdk.ScrollDirection.DOWN:
+            self.knob_time.set_value(self.knob_time.value + step, notify=True)
+        elif ev.direction == Gdk.ScrollDirection.SMOOTH:
+            _, _dx, dy = ev.get_scroll_deltas()
+            self.knob_time.set_value(self.knob_time.value + dy * 0.025, notify=True)
+        return True
+
+    # ---- Frame Render & Persistence ----
+    def _on_frame_tick(self) -> bool:
+        self.ctrl.step_dsp()
+        self.vfd_area.queue_draw()
+        self.crt_area.queue_draw()
+        return True
+
+    def _on_draw_vfd(self, w, cr: cairo.Context):
+        alloc = w.get_allocation()
+        self.ctrl.draw_vfd_bar(cr, float(alloc.width), float(alloc.height))
+        return False
+
+    def _on_draw_crt(self, w, cr: cairo.Context):
+        alloc = w.get_allocation()
+        self.ctrl.draw_crt(cr, float(alloc.width), float(alloc.height))
+        return False
+
+    def _load_state(self):
+        if not STATE_FILE.is_file():
+            return
+        try:
+            st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            if st.get("mode") in self.mode_btns:
+                self.ctrl.display_mode = st["mode"]
+            if st.get("theme") in self.theme_btns:
+                self.ctrl.theme_key = st["theme"]
+            if st.get("source") in self.src_btns:
+                self.engine.input_source = st["source"]
+            if st.get("waveform") in self.wf_btns:
+                self.engine.gen_waveform = st["waveform"]
+            self.knob_time.set_value(float(st.get("k_time", self.knob_time.value)), notify=True)
+            self.knob_volts.set_value(float(st.get("k_volts", self.knob_volts.value)), notify=True)
+            self.knob_trig.set_value(float(st.get("k_trig", self.knob_trig.value)), notify=True)
+            self.knob_inten.set_value(float(st.get("k_inten", self.knob_inten.value)), notify=True)
+            self.knob_persist.set_value(float(st.get("k_persist", self.knob_persist.value)), notify=True)
+            self.knob_gen_freq.set_value(float(st.get("k_gfreq", self.knob_gen_freq.value)), notify=True)
+            self.knob_gen_lvl.set_value(float(st.get("k_glvl", self.knob_gen_lvl.value)), notify=True)
+        except Exception:
+            pass
+
+    def _save_state(self):
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            st = {
+                "mode": self.ctrl.display_mode,
+                "theme": self.ctrl.theme_key,
+                "source": self.engine.input_source,
+                "waveform": self.engine.gen_waveform,
+                "k_time": self.knob_time.value,
+                "k_volts": self.knob_volts.value,
+                "k_trig": self.knob_trig.value,
+                "k_inten": self.knob_inten.value,
+                "k_persist": self.knob_persist.value,
+                "k_gfreq": self.knob_gen_freq.value,
+                "k_glvl": self.knob_gen_lvl.value,
+            }
+            STATE_FILE.write_text(json.dumps(st, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _run_gui_self_test(self, step: int) -> bool:
+        if step == 0:
+            self.engine.input_source = "synth"
+            self.engine.gen_waveform = "SINE"
+            self.engine.gen_freq_hz = 1000.0
+            self.engine.synthesize_block(12000)
+            self.ctrl.step_dsp()
+            # Offscreen verification render across modes & themes
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 700, 460)
+            cr = cairo.Context(surf)
+            self.ctrl.draw_vfd_bar(cr, 700.0, 56.0)
+            for m in ("SCOPE", "DUAL", "FFT", "WATERFALL", "XY"):
+                self.ctrl.display_mode = m
+                self.ctrl.draw_crt(cr, 700.0, 460.0)
+            self.ctrl.display_mode = "SCOPE"
+            GLib.timeout_add(120, self._run_gui_self_test, 1)
+        else:
+            print("DTSCOPE_SELF_TEST_OK")
+            sys.stdout.flush()
+            self.destroy()
+        return False
+
+    def _on_destroy(self, _w):
+        if not self._self_test:
+            self._save_state()
+        self.engine.stop()
+        if Gtk.main_level() > 0:
+            Gtk.main_quit()
+
+
+# ---------------------------------------------------------------------------
+# Headless / Display-Agnostic Self-Test Runner (--self-test)
+# ---------------------------------------------------------------------------
+def run_headless_self_test() -> int:
+    eng = ScopeAudioAndGenEngine()
+    eng.input_source = "synth"
+    eng.gen_waveform = "SINE"
+    eng.gen_freq_hz = 1000.0
+    eng.gen_level = 0.80
+    eng.synthesize_block(16384)
+
+    ctrl = ScopeController(eng)
+    ctrl.step_dsp()
+
+    f_est = ctrl.telemetry["freq_hz"]
+    dom_est = ctrl.telemetry["dom_fft_hz"]
+    assert 995.0 <= f_est <= 1005.0, f"Expected ~1000 Hz counter, got {f_est}"
+    assert 995.0 <= dom_est <= 1005.0, f"Expected ~1000 Hz FFT peak, got {dom_est}"
+
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 720, 480)
+    cr = cairo.Context(surf)
+    ctrl.draw_vfd_bar(cr, 1080.0, 56.0)
+
+    for theme in ("P31", "P7", "P4", "DSO"):
+        ctrl.theme_key = theme
+        for mode in ("SCOPE", "DUAL", "FFT", "WATERFALL", "XY"):
+            ctrl.display_mode = mode
+            ctrl.step_dsp()
+            ctrl.draw_crt(cr, 720.0, 480.0)
+
+    # Test 2-Tone SSB + CTCSS + DTMF synthesis & DSP pass
+    eng.gen_waveform = "2-TONE"
+    eng.ctcss_hz = 100.0
+    eng.synthesize_block(8192)
+    ctrl.step_dsp()
+
+    eng.trigger_dtmf_burst("5", 0.5)
+    eng.synthesize_block(8192)
+    ctrl.step_dsp()
+
+    eng.stop()
+    print("DTSCOPE_SELF_TEST_OK")
+    sys.stdout.flush()
+    return 0
+
+
+def main():
+    self_test = "--self-test" in sys.argv[1:]
+    gtk_ok, _ = Gtk.init_check(sys.argv)
+
+    if self_test and not gtk_ok:
+        sys.exit(run_headless_self_test())
+
+    if not gtk_ok:
+        sys.stderr.write("dtScope: cannot open X11 display.\n")
+        sys.exit(1)
+
+    win = DtScopeWindow(self_test=self_test)
+    win.show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

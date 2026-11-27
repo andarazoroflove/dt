@@ -1,0 +1,4159 @@
+#!/usr/bin/env python3
+"""
+dtRadar — Vintage NWS NEXRAD Doppler Radar, GOES Satellite & HF Solar Space-Weather Console for CDE
+
+Features:
+  - Authentic 1980s/1990s CDE / OSF-Motif 3D beveled meteorological & propagation workstation:
+      * CDE `xrdb` palette integration, glowing cyan-green Vacuum Fluorescent Displays (VFD),
+        warm incandescent analog dial backlighting, and sunken #FFF7E9 / Amber teletype strip.
+      * Pre-configured Home QTH: W1AW / FN31pr (41.7292° N, -72.7083° W, Newington, CT),
+        nearest NEXRAD station KBOX, nearest METAR KBDL, GOES-16 `ne` Northeast sector,
+        all user-configurable in the top bar and persisted in `~/.config/dtradar/config.json`.
+  - 4 Switchable Tactical CRT Views + Animated [▶ LOOP] / Frame Scrubber + PPI Sweep Arm:
+      1. NEXRAD DOPPLER MAP: Zoomable/pannable dark tactical map (OSM dark-LUT base tiles +
+         embedded vector world & US state outlines) overlaid with live 6-frame (30-min) Iowa
+         Environmental Mesonet NEXRAD Base Reflectivity (`N0Q`) tiles, standard dBZ color scale,
+         50/100/150/200 km range rings, optional rotating green phosphor PPI sweep arm, and
+         active NWS CAP warning polygons (`api.weather.gov/alerts/active`).
+      2. NWS STATION RIDGE RADAR: Direct NOAA RIDGE station still & multi-frame `_loop.gif`
+         viewer (`KBOX`, `KOKX`, `KLWX`, `KCBX`, `KMTX`, `CONUS`, or custom site)
+         with PIL multi-frame GIF unpacker, zoom/pan, and frame scrubber.
+      3. GOES-18 / 16 SATELLITE: Live NOAA NESDIS STAR imagery (`Northern Rockies GeoColor`,
+         `Band-13 Clean IR`, `Water Vapor Band-09`, `CONUS GeoColor`, `Full Disk Earth`) plus
+         SWPC `Aurora Oval North`, zoomable & pannable.
+      4. HF SOLAR & PROPAGATION DESK: Live NOAA SWPC 6-hour GOES X-Ray Flare Flux logarithmic
+         chart (`A/B/C/M/X`), Planetary `Kp` 3-hour bar graph, `10.7cm SFI` / Sunspot / Solar
+         Wind telemetry, and calculated HF Amateur Band Condition Matrix (`80m–6m` Day & Night
+         `GOOD / FAIR / POOR` + VHF Aurora/E-Skip indicators).
+  - Right Instrument Rack + Bottom METAR/TAF Teletype:
+      * 3 Backlit Analog Needle Dials: BAROMETER (28.5..31.0 inHg, STORM/CHANGE/FAIR),
+        WIND COMPASS & KT/MPH (360° compass rose + gust VFD), TEMP / DEWPOINT / RH% (-20..110°F).
+      * Sunken `#FFF7E9` / Amber Teletype Strip with live raw + decoded METAR/TAF & NWS Alerts.
+"""
+
+from __future__ import annotations
+
+import base64
+import collections
+import datetime
+import io
+import json
+import math
+import os
+import re
+import struct
+import subprocess
+import sys
+import threading
+import time
+import zlib
+from pathlib import Path
+from typing import Any
+
+import cairo
+import gi
+import numpy as np
+import requests
+from PIL import Image
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Pango", "1.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango
+
+HOME = Path.home()
+CONFIG_DIR = HOME / ".config" / "dtradar"
+CACHE_DIR = HOME / ".cache" / "dtradar"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+UA = "dtRadar/1.0 (CDE Weather & Propagation Desk; W1AW)"
+HTTP_HEADERS = {"User-Agent": UA, "Accept": "*/*"}
+
+DEFAULT_CALLSIGN = "W1AW"
+DEFAULT_GRID = "FN31pr"
+DEFAULT_LAT = 41.729167
+DEFAULT_LON = -72.708333
+DEFAULT_NEXRAD = "KBOX"
+DEFAULT_METAR = "KBDL"
+DEFAULT_GOES_KEY = "ne_geocolor"
+
+EARTH_RADIUS_KM = 6371.0088
+TILE_SIZE = 256
+MIN_ZOOM = 3
+MAX_ZOOM = 11
+
+# 6-frame 30-minute Iowa Environmental Mesonet NEXRAD Base Reflectivity loop
+NEXRAD_LAGS: list[tuple[str, str, str]] = [
+    ("m25m", "-25m", "nexrad-n0q-900913-m25m"),
+    ("m20m", "-20m", "nexrad-n0q-900913-m20m"),
+    ("m15m", "-15m", "nexrad-n0q-900913-m15m"),
+    ("m10m", "-10m", "nexrad-n0q-900913-m10m"),
+    ("m05m", "-05m", "nexrad-n0q-900913-m05m"),
+    ("live", "LIVE", "nexrad-n0q-900913"),
+]
+
+# Standard NWS NEXRAD Reflectivity dBZ Color Table
+DBZ_SCALE: list[tuple[int, tuple[float, float, float]]] = [
+    (-10, (0.22, 0.32, 0.38)),
+    (0,   (0.16, 0.56, 0.68)),
+    (10,  (0.12, 0.72, 0.92)),
+    (20,  (0.08, 0.82, 0.24)),
+    (30,  (0.06, 0.62, 0.14)),
+    (35,  (0.96, 0.90, 0.14)),
+    (40,  (0.94, 0.66, 0.10)),
+    (45,  (0.96, 0.36, 0.10)),
+    (50,  (0.88, 0.08, 0.10)),
+    (55,  (0.72, 0.04, 0.18)),
+    (60,  (0.92, 0.18, 0.86)),
+    (65,  (0.62, 0.24, 0.92)),
+    (70,  (0.92, 0.94, 0.98)),
+]
+
+# Regional & National NWS RIDGE Radar Stations (id, label, lat, lon)
+RIDGE_STATIONS: list[tuple[str, str, float, float]] = [
+    ("KBOX", "KBOX — Boston / Taunton, MA", 41.9558, -71.1369),
+    ("KOKX", "KOKX — New York / Upton, NY", 40.8656, -72.8639),
+    ("KLWX", "KLWX — Sterling / Washington, DC", 38.9753, -77.4778),
+    ("KCBX", "KCBX — Boise, ID", 43.4906, -116.2356),
+    ("KMTX", "KMTX — Salt Lake City, UT", 41.2628, -112.4478),
+    ("KMSX", "KMSX — Missoula, MT", 47.0411, -113.9864),
+    ("KOTX", "KOTX — Spokane, WA", 47.6806, -117.6267),
+    ("KRIW", "KRIW — Riverton, WY", 43.0661, -108.4772),
+    ("KPDT", "KPDT — Pendleton, OR", 45.6906, -118.8528),
+    ("KTFX", "KTFX — Great Falls, MT", 47.4597, -111.3853),
+    ("KLRX", "KLRX — Elko, NV", 40.7397, -116.8025),
+    ("KGJX", "KGJX — Grand Junction, CO", 39.0622, -108.2139),
+    ("KCYS", "KCYS — Cheyenne, WY", 41.1519, -104.8061),
+    ("CONUS", "CONUS — National NEXRAD Mosaic", 39.5000, -98.3500),
+]
+RIDGE_MAP: dict[str, tuple[str, float, float]] = {
+    s[0]: (s[1], s[2], s[3]) for s in RIDGE_STATIONS
+}
+
+# NOAA NESDIS STAR GOES-18 / GOES-16 & SWPC OVATION Feeds
+GOES_FEEDS: list[tuple[str, str, str]] = [
+    (
+        "ne_geocolor",
+        "GOES-16 Northeast GeoColor (ne)",
+        "https://cdn.star.nesdis.noaa.gov/GOES16/ABI/SECTOR/ne/GEOCOLOR/1200x1200.jpg",
+    ),
+    (
+        "nr_geocolor",
+        "GOES-18 Northern Rockies GeoColor (nr)",
+        "https://cdn.star.nesdis.noaa.gov/GOES18/ABI/SECTOR/nr/GEOCOLOR/1200x1200.jpg",
+    ),
+    (
+        "nr_ir13",
+        "GOES-18 Northern Rockies Band-13 Clean IR",
+        "https://cdn.star.nesdis.noaa.gov/GOES18/ABI/SECTOR/nr/13/1200x1200.jpg",
+    ),
+    (
+        "nr_wv09",
+        "GOES-18 Northern Rockies Band-09 Water Vapor",
+        "https://cdn.star.nesdis.noaa.gov/GOES18/ABI/SECTOR/nr/09/1200x1200.jpg",
+    ),
+    (
+        "pnw_geocolor",
+        "GOES-18 Pacific NW GeoColor (pnw)",
+        "https://cdn.star.nesdis.noaa.gov/GOES18/ABI/SECTOR/pnw/GEOCOLOR/1200x1200.jpg",
+    ),
+    (
+        "conus18_geocolor",
+        "GOES-18 CONUS GeoColor (West)",
+        "https://cdn.star.nesdis.noaa.gov/GOES18/ABI/CONUS/GEOCOLOR/1250x750.jpg",
+    ),
+    (
+        "conus16_geocolor",
+        "GOES-16 CONUS GeoColor (East)",
+        "https://cdn.star.nesdis.noaa.gov/GOES16/ABI/CONUS/GEOCOLOR/1250x750.jpg",
+    ),
+    (
+        "fd18_geocolor",
+        "GOES-18 Full Disk Earth GeoColor",
+        "https://cdn.star.nesdis.noaa.gov/GOES18/ABI/FD/GEOCOLOR/678x678.jpg",
+    ),
+    (
+        "aurora_north",
+        "SWPC OVATION Aurora Oval North",
+        "https://services.swpc.noaa.gov/images/animations/ovation/north/latest.jpg",
+    ),
+]
+GOES_MAP: dict[str, tuple[str, str]] = {g[0]: (g[1], g[2]) for g in GOES_FEEDS}
+
+
+# ---------------------------------------------------------------------------
+# Embedded Compact Vector World Geography + US State & Border Polylines
+# ---------------------------------------------------------------------------
+WORLD_VEC_B64 = (
+    "eNpVWm+IHNlxr5ZWu6vVSiumiXW68518JN3YwQmJHIeeD3EgkQ6yvQ45wVkiMAMBffH6Q2YgXIKjyZfZOOQIzIDx5N+Fg54LSPmQ"
+    "c2B7Q7IbB+4+TMcEyQQTQndiW8acHNs9d0G6P7ZP81L1q3q9Yy2op1/3e69evapf/apef5roL0/8849eOH+fahdR5eaucEMK+W7f"
+    "xST/Cle6yqXcIr9r/itcSDGVfJ87+ZNfxH0rvkbcVnFLbm3y9OWFtBRul8e8wjMQ9526jK9Tbi/dACO3MfrMJTxCSGPX4/4x/075"
+    "2qGEf8uvkP+X5zWPLCOI1G1+OuP+B9xecn+Rp+LrgO+lRwFZavf1Rch95bn0Tpv2Eb834NEK9K+xrsLkv0Mtvs65l4xUQiq5vwN9"
+    "1Kwjkah2Il+EZ6W9G1OC+xbt8PvbLCGRziqzFdCcaLPi9bf4/TlWP3IyeuUu87pGrkuX8U5M8k7JumtDwop1GfKIMx4ntnUkJlHl"
+    "xriWfJV9OOC7fciUsIb6pGuW+wnLI+toUcbjVk40lbC8tZtQlyWKsKI2P02xupotI+a/ro0xxNpL7ldhl0TixPQj1y7/xZhnl+dQ"
+    "e5J3O9jZAveyczVWM8fcCdoz2Nwu9q9F17G+HZZEJErZNgrTU+lm2OuYRraXfWhh7LyMPZ5RrKWGxkvYTIHfqoXKdJabziqMk7nr"
+    "+FW5AtYtPURPY1yldZ+vY5Yiphu8U/pOtSSPaENsmmgbGiogQUy3bLSBi8z2dL9LeIXMOYKHyLV26n8RScuMe9dm2WqXCfVZt2L/"
+    "BfyodlexD94uu9yuVnOVdS57HJPqXm00pR58KmXdxtD0jPUXQnJvJynfdTF/zTYsuhzZ3o4hT4dCvLdjK23DGsWOxM4zd99+3+V3"
+    "unzfh9bHTlYuXlbYldjSdQ1T1oJiTcZPpvxrl68zp14vWs9Ny5f4T2xdZFL95bxS0fOY+4aUkEcn3ZuMNaG7UuPt62xhBNvNWDZF"
+    "jct4MyLpP2XrKVli8YwWay4GAnRh1wX2L+G/LvxFcWACPArpDj/rseak9aWg4Bl2edUZrDKBRkQzei8+0oJ2aqf41oWHiaW3zUs7"
+    "2EW1HMW8KfxfMay2FVwFZvRJdHCZZc+xyjZsXHB1znKOuL2AX0XsVxN+pisn/MrMvkr4oNhZjd3xmKoeO+L5RM7KdlrmLzFmwutM"
+    "WTZdZ4aocWTrUksp3T32mG1ecZvfHcIaBdsUERLKbT0F0DKhNxeyDwnNzBuPMZuATeoZM5NTPD83HXmfjqDhEPIQEEhxV6yQbA8i"
+    "+IBGHJVF3rhk60t4niHaJS6FQMyQ26TnkHtuQrYIMuoeiW22+MkA1iOr3jcEGhvK7jb+fp//ZubjJTQcw0O9TiN43Vogs3ZpBy2l"
+    "WwsI9tVvcI6AxSlWWmFV8uu+aX9CZNGzBprfDDQ2JdZ6F7iewPcnQNsS+B4Z5qSGG5HtvOgjhGdo7OkhVsyBeLJStcja+TgtrbIG"
+    "QYoh7D0B6ojdR5g1RMzMXAv9M+xlSheDyHiAzjPhOVLoqXA9i7xz03sGDUa2Rwn0eGj4JLKEhn+ybhlHvDoGlqqO7kLT2zzqHFiU"
+    "GpKm5ONzYTEswjhyHVoEkbGHxhX6poMBnswQ50uOw2PYXQmvCI3PeLnlzdeDGh4ge7fHqxgCp6dOuZh6m/ITWb/IkzW66GC1Nawr"
+    "aqymhz0loJRyoSEQJQU7OYTNaDxvYQ9irCm1OJ2Q2rX46sB85skgAqORWWLGOcWOiK7w0wMgaw2kFsu6Q97f+PK5E5/94IXz3lx/"
+    "FIRw+G/Z/ZOBN89jeiL3b6zo1sxP6H18UlV8hHCTu2vWr2db2Lft/fOTIlTllt1Dnn880NDo51BCqKB8LSgRHm4GSjteD+ZODO/I"
+    "aIrSuzZUkgBSavd8oGAhWyOhXVykf1LD5WQpFMu7dxEUZLMPjJ78cCFQJVvuafBVDnjXnRK5wuDqklNiEjJoFE1orPn9Xai6dBNb"
+    "fYgg3ec/De/y5ymwAGIC+iF0Y98pQOZmej6sfGoxt6BcguZ4ipqC+moAjI3mRg3NLeEabWx0wQYvso7cFJRpLagg4z7o/tTlBoe5"
+    "kZ2xG4AQ7yJQy360jU614Bwjk3HO1xaALIcEKWXmEKVBRw0QrSB7gnHE3TVwVUbvZNYhjFWMvUTLFKtUMlJamBkthRo1/YG5b4Kg"
+    "T4AqH5BzNwGgzwwOB0h3xkYUS6cEqWjopoQiWcM+3pBEZQICOwaVrFgihd3cglNhwaKGDvtYqcLzhO/nrPErTnfmhu2jD/EakhQ8"
+    "dmGRiYF2ZNKmoAFKO2rMG7N99vjpAYfqDKH6EXmLHhg9IuojKOTokYJg7TqvYWINX3Ua+ErMXNveyntifftINL3n9U2mDtK4yq0G"
+    "OYAuxl6HoCpDnmfe2KmM8mAhSYUA2NQdU1rdSyUBQvkypkIHfL/P+6GwnlmCJzqSdHXHMKODVUbAkMSCsKaoM+57if17AEsZg3Tq"
+    "SpXwF9hH3adboLuylzJai+8lqdZwULJdjZwGs8/x/Qzvbbo3FzJW1tib4lNmNKYwyiDooSmF2E8HJECTtgnonQQ7CSoRfL5r0L1j"
+    "4VG8VGlmYemJpz6KT0fw6F2WNePdlxVe51+7eLdGOlQspdYZVjGBHAWStzsUwS+GsFyhmh3qw64S0hAufrNHEYLuHIlFyiGiD/uZ"
+    "Oo8oCWiPJs8T7MKngNl9nmebRtCN0rGwSUVbjKRkGJCSD2KFJdxKsSPaprBJfTSc7yOMtiwlEEK9bSWQLghrDyP2gPkJxuxCVxJ2"
+    "lSbOMILu+MzSyhz2KX6xx/SrRz1SfxNar/RM8WPHwu4RtBRxbAot5VLE/nigXvfQcFWCqqZiHYosVoaGvSqX0BHFex8XhyCrPhTP"
+    "OQaVRmK2Efrb/P82/EYs6YpT4luBQGlyL9psmV5j8mUQjYVKYVQzc6de06KHoI87JLH9CKWbwuJdCIrtKYb82rMdH5p8E9ISUmEl"
+    "JPHzyBAoNHrVs7h6XIYgi3jzpq2F9LdGCposcQpZw32jylLkyA0LM/hRSr+10D04azFnZNoQKTedpgADaEepqiaPxzFUnv/9QpAq"
+    "BP+oEYtiWHlo5bCRYfLAqe1msLjI7iOkG8ljiQ5lM+aLC8GdLnUe+1KWytey+z9d6Hu/8mNF2tcWmj7VIIm6phuGJxH0WCGezBA7"
+    "SysZtUEXMed92g9feajMUPM+qSTs8O/bVmfqNuzR53cqgt+CflN5yZ3PMroAIV8Zk6ymZdU0zWruGTUb2hgdu14L5gCfLly4akwg"
+    "xXwz9BfXvWfthwhWOSiOhPJLzrvJ3C3TS0/R9mze20uUjXgj//0Nou+8I23XAl/xS08q3fBU8xBZT0IvBkqI+ja2rimirgVddc0W"
+    "fbupG2j75RMKmOoSEaBAXUEraxNsVodl3QFjl/U+H6icvx8UTSYhBneIumibNIwlkHO7kUfm0Uqeum276Texat8RYFFcb46QeVx9"
+    "Ko0cHVgurgG0bzq52xAEXct9a79oMHQzEAIUMzS0EBA0m2xD/x3+ewRJYwPGqLGlXw2OYUN0t2cw8RLbTYs0wB6ZHfoM+KVA230Y"
+    "H5rbJw1shJYSHGd9Mqe/X4aqNjJbvb9na0rMJ7ydf+SEuvZDA0uCnSdNxj2Enbab1OZ4foVSD4WJ/R+bffRkfb9Brz/18HFCtbGG"
+    "HGUdxYsK6NYFGgtTVLzsA4+0pDJ3u5ZLZK74ieKabG6B0nCJBDVG0ShDHOyAdQluHYCV9CizQvqDRQ0GVRhLvmKGMGoMJWnYx4iN"
+    "IGQYGfLvR6TlcS1giEqGVnjUIwONiDsUmUr8diUoX3n11IjUlVNI6ZOW68HafpYGFwkWrnXH3CVNziua1rr5BMgyNtoZUdwInJj2"
+    "9TzCJwsDA9/Skq4JKYUcgdLuWdDPGDxbEHQMMO1gAQNQ9NiqBiFsQOpmdIkOLxydTJHzDbB7MZyqRjakBbApnK8yTK6sDF5i8tYS"
+    "O9W45Pmd5nrCScQ1fKmwB9Fi0zc9TS899ex6YtWE0FI5rW8PQFEJGKKtFcLczE5G8uaZJMYtq+63zGYVf0Joc0hxQy3FdOlJmn3o"
+    "ZqB7WTHLqp1nLr4AL2VFEWPucnd8CCNZdQR2mFvxsbDA04Ordq1AFVFsjIQu0L2T/7GVwHtLd7hUw5KzlNQq8WMQtDbSBVHrLRB0"
+    "qYBquhuZfQyBWGqm8NQL9Benv/RYzUUPKNQfMmQ2MskMOWtlsbtlkmuYlDCVgC3doaQxu9gsn+8+RO9tfmxraCcWr+HkrETqWaAq"
+    "Vpmt6fMSqTOhQqoUWwbZtvR/h9oWg1DSCOnJp/5q63YTnpdDrFZUhAE/YObwi2b4U8vbbtl9BmUlgGuJKP+7stVHHY6WaG2JMwGh"
+    "U9L9lpGjsV3zhjx5YhUpQQ7p3bf+ZqULDWmWEyJoli5sFqvd/dGdGOe+6XiAHCuCJgHMW/S1H3zxXGI7H1mJZtrAYWyVqxgWQDhF"
+    "UVve0+6dC7W7Z91nBgBtHFz4Q54UfG4fTp8iQ1N3YjM5R7MPNs76RF265nYup/AZUtYkslo9lCEuyi6dZa73vY2+lfLUZnK44AHm"
+    "VjghSpuDSQl+3O0/n/2FH3YhlpwB6GmintceNKA9t6qyREWkf5v05afeXo+sHrAHxlqY+2vNKTeByXJLOkPnHz19/tBUs+sUQeT3"
+    "1Aiyuq8lZ2foH55deb8L/i6eMXZ6HDECyciAVYmV33n0DfrkmY3zEah8ixI7u5CkTOz8Gau8S8pEp+lrp9/fav9EkVkihK8UtQm2"
+    "fpq++n+PTu41SY4/EVJ7vIXkFaO9/MSLi8Ryr11smNZ7tJRqAfw0Pffhlfe3zWn6SEPltHJukUHTCFqnX3v36fOxUYUDCyillWdB"
+    "Q9dpcuHmQkea2e4UZk4GZ+v0xx9pPU4MpPWww9tEjdFojRbvvnD+QUCkhZcWrmf5EQpPa/Sb7zx9vguErdzM/LjyzrdGf/C939vy"
+    "DG8AA6PjxHqN/nXru0FKWrvTWps/DOjK4+ef6BpbzXBa4lP3u9r7p376Bx+oT0xRk1Hw0gyeH3/+7OffTZryVGWD11pgWqV/+/6f"
+    "bB2aH1SoR9iBwypNv/uxrYktZeZ8iS6WR5/55isbXmN5s+aWPHot+O119fIacKHVeZJHty/8eEXBIuPdOuBmPe7jRw+e6BlPnoIZ"
+    "+y8g+NFzl55fpHaYWJndIQat0luXPvNB1xJ3fUHPkvjRJx+9906/EUPZk6ySTlHrzVc22s2XFlYEPcWCn1tPkbEVdoQQS/Nf3390"
+    "MrIzhLnNwc2/HhZ2DFPaITkG4QC8OJ62VGReoS9svr+VLBkhN736/ZWtxCjHgTatP/ONc4d22HZVZF2h//rv8+e6yycYK/SVt35n"
+    "MzGYt7H+8JtvnxH7kiJlqR1/+X9+fiMl/3kI3vqzjfGJ2DDL3vqleYiqe2m1NW56/YkBkNzTBm76uWceLFKD8X1t+vIzL2NTBOUP"
+    "WFHBDv3RiVfXtbY0db5qkpia5+Y06u/KL8dOP3z4EjC2TZc4xEnN3vuBfoyROc3cNfofE8eqYd1HdkC4tnRKoR+yjLCqllUF+ngv"
+    "c2kDUp3mwEZranmT8t5pUlchMxN4Yr70gYsPKgW/mVmdMjZUG2F9ERx85PQY7xbeT8xA23DA4KP08oMvntMjGqGlM5cZwo+aIiVZ"
+    "YVA59nQJlC47jQ0TiF/aQcjcaYFZmeLRUpZMOHXTbekbZ78ZCKZ0rHQ8dzes0ByR4jUn2899+J/Otej4PEcOV5Nmd2M7zp01mrsW"
+    "6MdDrwVqe3EjToIE+I5ViaQ+9nWrp4yMHOSGnDdsmb/7OLTjYF9t2kHOFfwMvbHylU39ToIsXdHjmtz583gpOc7c1BWNn4cWbjML"
+    "FAfQqhBlBbI9Y9pd02SHtMClWY6yUz0GkVPtNmi/z4CCi/Tt1bfXQ2CU0oB93grN/Y5T+xLOMkPpxR8sJ6iszdxtKF3PZeQTin2r"
+    "SMeWrN7i3sEF+pfVT5wKDRESfL00hfXoN09jczl1veWzY6nfFDjh3Cb9jmNCB5iu13ytwQn/6Y0Tp7X6qjILFMudVKsrq7wqoTz+"
+    "VGvOqtOcqdt8fhFs0RdOv3qqh1L9cTjsW96tIdsX7/0XaJFJyM5xhv5u9b3NuOH2tdXRNWGQLbhun+uIrgMO4qv50lrV+HTXtRQb"
+    "rNGr80+f9seusdWFK8v5g1X66FtfXW/ZMV5tvoieq7T+9j+uh/bBgh6i57DqYIU+cepvz3SJmvPz/wf5JELD"
+)
+
+US_BORDER_POLYLINES: list[list[tuple[float, float]]] = [
+    # US-Canada & US-Mexico borders
+    [(-123.2, 49.0), (-95.15, 49.0), (-89.5, 48.0), (-84.5, 46.5), (-82.4, 43.0),
+     (-79.0, 43.2), (-76.3, 44.2), (-74.7, 45.0), (-71.5, 45.0), (-69.2, 47.4), (-67.8, 47.1), (-67.0, 45.2)],
+    [(-117.1, 32.55), (-114.8, 32.7), (-111.1, 31.33), (-108.2, 31.33), (-106.5, 31.78),
+     (-104.0, 29.5), (-103.0, 29.0), (-101.4, 29.8), (-99.5, 27.5), (-97.15, 25.95)],
+    # Detailed Idaho outline + Snake River Plain reference
+    [(-117.0, 49.0), (-116.05, 49.0), (-116.05, 47.98), (-115.7, 47.45), (-114.9, 46.8),
+     (-114.3, 46.6), (-114.5, 45.8), (-113.8, 45.6), (-113.0, 44.45), (-111.4, 44.5),
+     (-111.05, 44.65), (-111.05, 42.0), (-117.02, 42.0), (-117.02, 43.8), (-117.2, 44.3),
+     (-116.45, 45.6), (-116.92, 46.0), (-117.0, 46.4), (-117.0, 49.0)],
+    # Western, Mountain & Plains States
+    [(-124.2, 42.0), (-111.05, 42.0)],
+    [(-124.0, 46.2), (-119.0, 46.0), (-117.0, 46.0)],
+    [(-120.0, 42.0), (-120.0, 39.0), (-114.6, 35.0)],
+    [(-114.05, 42.0), (-114.05, 36.0)],
+    [(-111.05, 45.0), (-104.05, 45.0)],
+    [(-111.05, 41.0), (-102.05, 41.0)],
+    [(-109.05, 41.0), (-109.05, 31.33)],
+    [(-114.8, 37.0), (-94.6, 37.0)],
+    [(-104.05, 49.0), (-104.05, 41.0)],
+    [(-102.05, 41.0), (-102.05, 36.5)],
+    [(-103.0, 37.0), (-103.0, 32.0), (-106.6, 32.0)],
+    [(-100.0, 36.5), (-100.0, 34.5), (-94.5, 33.6)],
+    [(-96.6, 49.0), (-96.4, 43.5), (-95.8, 40.0), (-94.6, 37.0), (-94.0, 29.7)],
+    [(-104.05, 45.94), (-96.6, 45.94)],
+    [(-104.05, 43.0), (-96.5, 43.0)],
+    [(-102.05, 40.0), (-95.3, 40.0)],
+    # Midwest, South & East Coast States
+    [(-90.6, 42.5), (-87.5, 42.5)],
+    [(-91.5, 43.5), (-96.4, 43.5)],
+    [(-91.4, 40.6), (-95.8, 40.6)],
+    [(-87.5, 41.7), (-80.5, 41.7)],
+    [(-87.5, 41.7), (-87.5, 38.0)],
+    [(-84.8, 39.1), (-84.8, 41.7)],
+    [(-80.52, 42.2), (-80.52, 39.7), (-75.0, 39.7)],
+    [(-79.76, 42.25), (-79.76, 42.0), (-75.3, 42.0)],
+    [(-73.35, 45.0), (-73.5, 41.1)],
+    [(-94.6, 36.5), (-75.9, 36.5)],
+    [(-89.5, 36.5), (-90.1, 35.0), (-91.2, 33.0), (-91.6, 31.0), (-89.7, 30.2)],
+    [(-94.0, 33.0), (-91.2, 33.0)],
+    [(-88.5, 35.0), (-81.0, 35.0)],
+    [(-88.4, 35.0), (-88.1, 30.2)],
+    [(-85.6, 35.0), (-85.0, 31.0), (-87.5, 31.0)],
+    [(-85.0, 31.0), (-82.0, 30.4), (-81.4, 30.7)],
+    [(-83.1, 35.0), (-78.5, 33.85)],
+    [(-82.6, 35.2), (-81.0, 36.5)],
+    [(-82.0, 37.5), (-79.5, 39.5), (-77.7, 39.3), (-77.0, 38.9)],
+]
+
+# Regional Geographic Hydrography Reference Polylines
+IDAHO_HYDRO_LINES: list[list[tuple[float, float]]] = [
+    # Major Western River Reference Polyline
+    [(-110.7, 43.8), (-111.4, 43.55), (-112.04, 43.49), (-112.56, 42.92), (-113.0, 42.68),
+     (-114.46, 42.59), (-115.3, 42.92), (-116.4, 43.45), (-117.0, 44.05)],
+    # Bear Lake / Utah Lake / Great Salt Lake shore accent
+    [(-112.9, 41.65), (-112.2, 41.55), (-112.05, 41.0), (-112.5, 40.7), (-112.9, 41.2), (-112.9, 41.65)],
+]
+
+REGIONAL_CITIES: list[tuple[str, float, float]] = [
+    ("Hartford", 41.7658, -72.6734),
+    ("Boston", 42.3601, -71.0589),
+    ("New York", 40.7128, -74.0060),
+    ("Idaho Falls", 43.4917, -112.0340),
+    ("Twin Falls", 42.5558, -114.4701),
+    ("Boise", 43.6150, -116.2023),
+    ("Salt Lake City", 40.7608, -111.8910),
+    ("Jackson", 43.4799, -110.7624),
+    ("Helena", 46.5891, -112.0391),
+    ("Missoula", 46.8721, -113.9940),
+    ("Spokane", 47.6588, -117.4260),
+    ("Casper", 42.8501, -106.3252),
+    ("Elko", 40.8324, -115.7631),
+]
+
+
+def decode_embedded_world_polygons() -> list[tuple[bool, list[tuple[float, float]]]]:
+    try:
+        raw = zlib.decompress(base64.b64decode(WORLD_VEC_B64))
+        off = 0
+        (npolys,) = struct.unpack_from("<H", raw, off)
+        off += 2
+        out: list[tuple[bool, list[tuple[float, float]]]] = []
+        for _ in range(npolys):
+            is_hole, npts = struct.unpack_from("<BH", raw, off)
+            off += 3
+            px, py = 0, 0
+            pts: list[tuple[float, float]] = []
+            for _ in range(npts):
+                dx, dy = struct.unpack_from("<hh", raw, off)
+                off += 4
+                px += dx
+                py += dy
+                pts.append((px / 50.0, py / 50.0))
+            out.append((bool(is_hole), pts))
+        return out
+    except Exception:
+        return []
+
+
+WORLD_POLYGONS = decode_embedded_world_polygons()
+
+
+# ---------------------------------------------------------------------------
+# CDE Palette Loader & Vintage Motif Tactical CSS
+# ---------------------------------------------------------------------------
+def load_cde_palette() -> tuple[str, str, str]:
+    chrome, sel, well = "#aeb2c3", "#2c567e", "#fff7e9"
+    try:
+        out = subprocess.check_output(["xrdb", "-query"], text=True, stderr=subprocess.DEVNULL)
+        pal_name = "Crimson.dp"
+        for ln in out.splitlines():
+            if "ColorPalette:" in ln:
+                pal_name = ln.split(":", 1)[1].strip()
+                break
+        for pdir in (HOME / ".dt/palettes", Path("/usr/dt/palettes")):
+            pf = pdir / pal_name
+            if pf.is_file():
+                hexes = [l.strip() for l in pf.read_text().splitlines() if l.strip().startswith("#")]
+                if len(hexes) >= 4:
+                    def norm16(h: str) -> str:
+                        h = h.lstrip("#")
+                        return f"#{h[0:2]}{h[4:6]}{h[8:10]}" if len(h) == 12 else "#" + h[:6]
+                    chrome, sel, well = norm16(hexes[1]), norm16(hexes[2]), norm16(hexes[3])
+                break
+    except Exception:
+        pass
+    return chrome, sel, well
+
+
+def build_radar_css(chrome: str, sel: str, well: str) -> bytes:
+    css = f"""
+    window, dialog, .background {{
+        background-color: {chrome};
+        color: #101216;
+        font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+        font-size: 8.5pt;
+    }}
+    .radar-cabinet {{
+        background-color: #2c313b;
+        border-top: 2px solid #5d6679;
+        border-left: 2px solid #5d6679;
+        border-right: 2px solid #15181e;
+        border-bottom: 2px solid #15181e;
+        padding: 4px 5px;
+    }}
+    .radar-strip {{
+        background-color: #373d4a;
+        border-top: 2px solid #586073;
+        border-left: 2px solid #586073;
+        border-right: 2px solid #1a1e26;
+        border-bottom: 2px solid #1a1e26;
+        padding: 2px 5px;
+    }}
+    .crt-bezel {{
+        background-color: #10151c;
+        border-top: 2px solid #0b0e13;
+        border-left: 2px solid #0b0e13;
+        border-right: 2px solid #5b6477;
+        border-bottom: 2px solid #5b6477;
+    }}
+    .rx-engraved {{
+        color: #d7deeb;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 7.8pt;
+    }}
+    .vfd-clock {{
+        background-color: #071615;
+        color: #54fad8;
+        border-top: 2px solid #040b0b;
+        border-left: 2px solid #040b0b;
+        border-right: 2px solid #486363;
+        border-bottom: 2px solid #486363;
+        padding: 2px 7px;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8.2pt;
+    }}
+    entry.qth-entry {{
+        background-color: #091716;
+        color: #5efce0;
+        caret-color: #5efce0;
+        border-top: 2px solid #040b0b;
+        border-left: 2px solid #040b0b;
+        border-right: 2px solid #496666;
+        border-bottom: 2px solid #496666;
+        border-radius: 0px;
+        padding: 1px 4px;
+        min-height: 20px;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8pt;
+    }}
+    button {{
+        background-image: none;
+        background-color: #464d5c;
+        color: #edf2f7;
+        border-top: 2px solid #768096;
+        border-left: 2px solid #768096;
+        border-right: 2px solid #1b1f27;
+        border-bottom: 2px solid #1b1f27;
+        border-radius: 0px;
+        padding: 2px 6px;
+        min-height: 20px;
+        box-shadow: none;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 7.8pt;
+    }}
+    button label {{
+        color: #edf2f7;
+    }}
+    button:hover {{
+        background-color: #535c6e;
+    }}
+    button:active, button:checked {{
+        background-color: #252a34;
+        border-top: 2px solid #15181f;
+        border-left: 2px solid #15181f;
+        border-right: 2px solid #6d768a;
+        border-bottom: 2px solid #6d768a;
+    }}
+    button.view-tab {{
+        padding: 3px 8px;
+        font-size: 8pt;
+    }}
+    button.sw-active {{
+        background-color: #1c4a3b;
+        color: #64fadb;
+        border-top: 2px solid #0e2820;
+        border-left: 2px solid #0e2820;
+        border-right: 2px solid #4eb596;
+        border-bottom: 2px solid #4eb596;
+    }}
+    button.sw-active label {{
+        color: #64fadb;
+    }}
+    button.sw-amber {{
+        background-color: #634616;
+        color: #ffdc85;
+        border-top: 2px solid #2b1e08;
+        border-left: 2px solid #2b1e08;
+        border-right: 2px solid #e6a943;
+        border-bottom: 2px solid #e6a943;
+    }}
+    button.sw-amber label {{
+        color: #ffdc85;
+    }}
+    button.btn-sync {{
+        background-color: #1c5375;
+        border-top: 2px solid #63b5e3;
+        border-left: 2px solid #63b5e3;
+        border-right: 2px solid #0b2434;
+        border-bottom: 2px solid #0b2434;
+    }}
+    button.btn-sync label {{
+        color: #e3f7ff;
+    }}
+    button.btn-home {{
+        background-color: #704c16;
+        border-top: 2px solid #cca054;
+        border-left: 2px solid #cca054;
+        border-right: 2px solid #332106;
+        border-bottom: 2px solid #332106;
+    }}
+    button.btn-home label {{
+        color: #ffebb5;
+    }}
+    combobox button.combo {{
+        background-color: #1d222b;
+        color: #64fadb;
+        border-top: 2px solid #101319;
+        border-left: 2px solid #101319;
+        border-right: 2px solid #60697d;
+        border-bottom: 2px solid #60697d;
+        padding: 1px 5px;
+        min-height: 20px;
+    }}
+    combobox button.combo label, combobox cellview {{
+        color: #64fadb;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 7.8pt;
+    }}
+    menu {{
+        background-color: #2b303b;
+        color: #edf2f7;
+        border: 1px solid #6c758a;
+    }}
+    menuitem {{
+        color: #edf2f7;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8pt;
+        padding: 3px 8px;
+    }}
+    menuitem:hover {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    scale trough {{
+        background-color: #161b22;
+        border: 1px solid #4e5769;
+        min-height: 6px;
+    }}
+    scale highlight {{
+        background-color: #36d6a8;
+    }}
+    scale slider {{
+        background-color: #b4bdd0;
+        border-top: 2px solid #e6ecf7;
+        border-left: 2px solid #e6ecf7;
+        border-right: 2px solid #1c2028;
+        border-bottom: 2px solid #1c2028;
+        border-radius: 0px;
+        min-width: 12px;
+        min-height: 12px;
+    }}
+    scrolledwindow.tty-well {{
+        border-top: 2px solid #1b1e24;
+        border-left: 2px solid #1b1e24;
+        border-right: 2px solid #8c94a6;
+        border-bottom: 2px solid #8c94a6;
+    }}
+    textview.tty-paper, textview.tty-paper text {{
+        background-color: {well};
+        color: #181510;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8.2pt;
+    }}
+    textview.tty-amber, textview.tty-amber text {{
+        background-color: #130d03;
+        color: #ffb838;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8.2pt;
+    }}
+    .cde-status {{
+        background-color: {chrome};
+        color: #101216;
+        padding: 1px 7px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 7.8pt;
+    }}
+    """
+    return css.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Geodesy, Maidenhead Grid & Web Mercator Tile Math
+# ---------------------------------------------------------------------------
+def grid_to_latlon(grid: str) -> tuple[float, float] | None:
+    g = grid.strip()
+    if len(g) < 4:
+        return None
+    g_up = g[:2].upper()
+    if not ("A" <= g_up[0] <= "R" and "A" <= g_up[1] <= "R"):
+        return None
+    if not (g[2:4].isdigit()):
+        return None
+    lon = -180.0 + (ord(g_up[0]) - ord("A")) * 20.0 + int(g[2]) * 2.0
+    lat = -90.0 + (ord(g_up[1]) - ord("A")) * 10.0 + int(g[3]) * 1.0
+    if len(g) >= 6 and g[4:6].isalpha():
+        sub_x = ord(g[4].lower()) - ord("a")
+        sub_y = ord(g[5].lower()) - ord("a")
+        if 0 <= sub_x < 24 and 0 <= sub_y < 24:
+            lon += (sub_x + 0.5) * (2.0 / 24.0)
+            lat += (sub_y + 0.5) * (1.0 / 24.0)
+            return (lat, lon)
+    return (lat + 0.5, lon + 1.0)
+
+
+def latlon_to_grid(lat: float, lon: float) -> str:
+    lon_n = ((lon + 180.0) % 360.0)
+    lat_n = max(0.0, min(179.9999, lat + 90.0))
+    f_lon = int(lon_n // 20.0)
+    f_lat = int(lat_n // 10.0)
+    rem_lon = lon_n - f_lon * 20.0
+    rem_lat = lat_n - f_lat * 10.0
+    s_lon = int(rem_lon // 2.0)
+    s_lat = int(rem_lat // 1.0)
+    sub_lon = int((rem_lon - s_lon * 2.0) * 12.0)
+    sub_lat = int((rem_lat - s_lat * 1.0) * 24.0)
+    return (
+        f"{chr(ord('A') + f_lon)}{chr(ord('A') + f_lat)}"
+        f"{s_lon}{s_lat}"
+        f"{chr(ord('a') + max(0, min(23, sub_lon)))}"
+        f"{chr(ord('a') + max(0, min(23, sub_lat)))}"
+    )
+
+
+def latlon_to_world_px(lat: float, lon: float, zoom: float) -> tuple[float, float]:
+    scale = TILE_SIZE * (2.0 ** zoom)
+    x = ((lon + 180.0) / 360.0) * scale
+    lat_c = max(-85.05112878, min(85.05112878, lat))
+    sin_lat = math.sin(math.radians(lat_c))
+    y = (0.5 - math.log((1.0 + sin_lat) / (1.0 - sin_lat)) / (4.0 * math.pi)) * scale
+    return (x, y)
+
+
+def world_px_to_latlon(wx: float, wy: float, zoom: float) -> tuple[float, float]:
+    scale = TILE_SIZE * (2.0 ** zoom)
+    lon = ((wx / scale) * 360.0 - 180.0 + 180.0) % 360.0 - 180.0
+    n = math.pi - 2.0 * math.pi * max(0.0, min(1.0, wy / scale))
+    lat = math.degrees(math.atan(math.sinh(n)))
+    return (lat, lon)
+
+
+def latlon_to_tile_xy(lat: float, lon: float, z: int) -> tuple[int, int]:
+    wx, wy = latlon_to_world_px(lat, lon, float(z))
+    n = 1 << z
+    tx = int(wx // TILE_SIZE) % n
+    ty = max(0, min(n - 1, int(wy // TILE_SIZE)))
+    return (tx, ty)
+
+
+def dest_latlon_km(lat: float, lon: float, bearing_deg: float, dist_km: float) -> tuple[float, float]:
+    ang_d = dist_km / EARTH_RADIUS_KM
+    brg = math.radians(bearing_deg)
+    lat1 = math.radians(lat)
+    lon1 = math.radians(lon)
+    sin_lat2 = math.sin(lat1) * math.cos(ang_d) + math.cos(lat1) * math.sin(ang_d) * math.cos(brg)
+    lat2 = math.asin(max(-1.0, min(1.0, sin_lat2)))
+    y = math.sin(brg) * math.sin(ang_d) * math.cos(lat1)
+    x = math.cos(ang_d) - math.sin(lat1) * math.sin(lat2)
+    lon2 = lon1 + math.atan2(y, x)
+    lon_deg = ((math.degrees(lon2) + 180.0) % 360.0) - 180.0
+    return (math.degrees(lat2), lon_deg)
+
+
+def haversine_bearing_km(lat1: float, lon1: float, lat2: float, lon2: float) -> tuple[float, float]:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp * 0.5) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl * 0.5) ** 2
+    dist_km = 2.0 * EARTH_RADIUS_KM * math.asin(min(1.0, math.sqrt(a)))
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    brg = (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+    return (dist_km, brg)
+
+
+# ---------------------------------------------------------------------------
+# Cairo Surface Conversion & Dark Tactical Map LUT
+# ---------------------------------------------------------------------------
+def apply_dark_tactical_lut(rgb_arr: np.ndarray) -> np.ndarray:
+    f = rgb_arr.astype(np.float32)
+    r, g, b = f[:, :, 0], f[:, :, 1], f[:, :, 2]
+    lum = 0.299 * r + 0.587 * g + 0.114 * b
+    is_water = (b > r + 14.0) & (b > g - 6.0) & (b > 110.0)
+    inv = 255.0 - lum
+    nr = np.clip(18.0 + inv * 0.24, 12.0, 86.0)
+    ng = np.clip(26.0 + inv * 0.32, 18.0, 112.0)
+    nb = np.clip(37.0 + inv * 0.43, 25.0, 146.0)
+    nr = np.where(is_water, 9.0 + (255.0 - b) * 0.04, nr)
+    ng = np.where(is_water, 18.0 + (255.0 - b) * 0.06, ng)
+    nb = np.where(is_water, 31.0 + (255.0 - b) * 0.10, nb)
+    return np.stack([nr, ng, nb], axis=-1).astype(np.uint8)
+
+
+def rgb_to_cairo_surface(rgb_arr: np.ndarray) -> cairo.ImageSurface:
+    h, w, _ = rgb_arr.shape
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+    bgra = np.empty((h, w, 4), dtype=np.uint8)
+    bgra[:, :, 0] = rgb_arr[:, :, 2]
+    bgra[:, :, 1] = rgb_arr[:, :, 1]
+    bgra[:, :, 2] = rgb_arr[:, :, 0]
+    bgra[:, :, 3] = 255
+    buf = surf.get_data()
+    raw = bgra.tobytes()
+    buf[: len(raw)] = raw
+    surf.mark_dirty()
+    return surf
+
+
+def rgba_to_cairo_surface(rgba_arr: np.ndarray, alpha_scale: float = 1.0) -> cairo.ImageSurface:
+    h, w, _ = rgba_arr.shape
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+    a_norm = (rgba_arr[:, :, 3:4].astype(np.float32) * alpha_scale) / 255.0
+    a_u8 = np.clip(rgba_arr[:, :, 3].astype(np.float32) * alpha_scale, 0.0, 255.0).astype(np.uint8)
+    bgra = np.empty((h, w, 4), dtype=np.uint8)
+    bgra[:, :, 0] = np.clip(rgba_arr[:, :, 2] * a_norm[:, :, 0], 0.0, 255.0).astype(np.uint8)
+    bgra[:, :, 1] = np.clip(rgba_arr[:, :, 1] * a_norm[:, :, 0], 0.0, 255.0).astype(np.uint8)
+    bgra[:, :, 2] = np.clip(rgba_arr[:, :, 0] * a_norm[:, :, 0], 0.0, 255.0).astype(np.uint8)
+    bgra[:, :, 3] = a_u8
+    buf = surf.get_data()
+    raw = bgra.tobytes()
+    buf[: len(raw)] = raw
+    surf.mark_dirty()
+    return surf
+
+
+# ---------------------------------------------------------------------------
+# METAR / TAF Aviation Weather Parser & Decoder
+# ---------------------------------------------------------------------------
+WX_CODES_MAP = {
+    "-RA": "Light Rain",
+    "RA": "Moderate Rain",
+    "+RA": "Heavy Rain",
+    "-SN": "Light Snow",
+    "SN": "Snow",
+    "+SN": "Heavy Snow",
+    "-SHRA": "Light Rain Showers",
+    "SHRA": "Rain Showers",
+    "+SHRA": "Heavy Showers",
+    "-SHSN": "Snow Showers",
+    "SHSN": "Snow Showers",
+    "TSRA": "Thunderstorm & Rain",
+    "+TSRA": "Heavy T-Storm & Rain",
+    "-TSRA": "Light T-Storm & Rain",
+    "TS": "Thunderstorm",
+    "VCTS": "Thunderstorm in Vicinity",
+    "VCSH": "Showers in Vicinity",
+    "FZRA": "Freezing Rain",
+    "-FZRA": "Light Freezing Rain",
+    "FZDZ": "Freezing Drizzle",
+    "-DZ": "Light Drizzle",
+    "DZ": "Drizzle",
+    "BR": "Mist",
+    "FG": "Fog",
+    "FZFG": "Freezing Fog",
+    "HZ": "Haze",
+    "FU": "Smoke",
+    "BLSN": "Blowing Snow",
+    "BLDU": "Blowing Dust",
+    "GR": "Hail",
+    "GS": "Small Hail / Graupel",
+    "SQ": "Squalls",
+}
+
+
+def compute_relative_humidity(temp_c: float, dew_c: float) -> float:
+    try:
+        es = math.exp((17.625 * temp_c) / (243.04 + temp_c))
+        ed = math.exp((17.625 * dew_c) / (243.04 + dew_c))
+        return max(2.0, min(100.0, 100.0 * (ed / es)))
+    except Exception:
+        return 50.0
+
+
+def cardinal_from_deg(deg: float | None) -> str:
+    if deg is None:
+        return "VRB"
+    dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+            "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+    return dirs[int(((deg % 360.0) + 11.25) // 22.5) % 16]
+
+
+def parse_metar_raw(raw_metar: str, fallback_station: str = DEFAULT_METAR) -> dict[str, Any]:
+    """Parse raw ICAO/ASOS METAR string into complete numeric + decoded weather dictionary."""
+    txt = (raw_metar or "").strip()
+    tokens = txt.split()
+    station = fallback_station.upper()
+    obs_time = "--:--Z"
+    idx = 0
+    if tokens and tokens[0] in ("METAR", "SPECI"):
+        idx = 1
+    if idx < len(tokens) and re.match(r"^[A-Z0-9]{4}$", tokens[idx]):
+        station = tokens[idx]
+        idx += 1
+    if idx < len(tokens) and re.match(r"^\d{6}Z$", tokens[idx]):
+        obs_time = tokens[idx]
+        idx += 1
+
+    # Wind
+    wind_dir: float | None = 0.0
+    wind_vrb = False
+    wind_kt = 0.0
+    gust_kt = 0.0
+    m_wind = re.search(r"\b(VRB|\d{3})(\d{2,3})(?:G(\d{2,3}))?(KT|MPS)\b", txt)
+    if m_wind:
+        d_s, spd_s, gst_s, unit = m_wind.groups()
+        factor = 1.94384 if unit == "MPS" else 1.0
+        wind_kt = float(spd_s) * factor
+        gust_kt = float(gst_s) * factor if gst_s else 0.0
+        if d_s == "VRB":
+            wind_dir = None
+            wind_vrb = True
+        else:
+            wind_dir = float(d_s)
+
+    # Visibility (statute miles)
+    vis_sm = 10.0
+    m_vis_frac = re.search(r"\b(\d+)\s+(\d+)/(\d+)SM\b", txt)
+    m_vis_only_frac = re.search(r"(?<!\d\s)\b(\d+)/(\d+)SM\b", txt)
+    m_vis_whole = re.search(r"\b(P?)(\d+)SM\b", txt)
+    if m_vis_frac:
+        vis_sm = float(m_vis_frac.group(1)) + float(m_vis_frac.group(2)) / max(1.0, float(m_vis_frac.group(3)))
+    elif m_vis_only_frac:
+        vis_sm = float(m_vis_only_frac.group(1)) / max(1.0, float(m_vis_only_frac.group(2)))
+    elif m_vis_whole:
+        vis_sm = float(m_vis_whole.group(2))
+    elif re.search(r"\b9999\b", txt) or "CAVOK" in tokens:
+        vis_sm = 10.0
+
+    # Sky clouds & ceiling
+    clouds: list[str] = []
+    ceiling_ft: int | None = None
+    for tok in tokens:
+        if tok == "RMK":
+            break
+        if tok in ("CLR", "SKC", "CAVOK", "NCD"):
+            clouds.append(tok)
+        else:
+            mc = re.match(r"^(FEW|SCT|BKN|OVC|VV)(\d{3})(CB|TCU)?$", tok)
+            if mc:
+                cov, h_s, cb = mc.groups()
+                ft = int(h_s) * 100
+                clouds.append(f"{cov} {ft:,}ft{(' ' + cb) if cb else ''}")
+                if cov in ("BKN", "OVC", "VV") and (ceiling_ft is None or ft < ceiling_ft):
+                    ceiling_ft = ft
+            elif tok in WX_CODES_MAP:
+                pass
+
+    wx_list: list[str] = []
+    for tok in tokens:
+        if tok == "RMK":
+            break
+        if tok in WX_CODES_MAP:
+            wx_list.append(WX_CODES_MAP[tok])
+
+    # Temperature & Dewpoint (check T-group tenths in RMK first, then standard 09/M02)
+    temp_c = 8.9
+    dew_c = -2.2
+    m_td = re.search(r"\b(M?\d{2})/(M?\d{2})\b", txt)
+    if m_td:
+        ts, ds = m_td.groups()
+        temp_c = -float(ts[1:]) if ts.startswith("M") else float(ts)
+        dew_c = -float(ds[1:]) if ds.startswith("M") else float(ds)
+    m_rmk_t = re.search(r"\bT([01])(\d{3})([01])(\d{3})\b", txt)
+    if m_rmk_t:
+        s1, v1, s2, v2 = m_rmk_t.groups()
+        temp_c = (-1.0 if s1 == "1" else 1.0) * (int(v1) / 10.0)
+        dew_c = (-1.0 if s2 == "1" else 1.0) * (int(v2) / 10.0)
+
+    # Altimeter (inHg & hPa)
+    altim_inhg = 29.92
+    altim_hpa = 1013.25
+    m_alt_a = re.search(r"\bA(\d{4})\b", txt)
+    m_alt_q = re.search(r"\bQ(\d{4})\b", txt)
+    if m_alt_a:
+        altim_inhg = int(m_alt_a.group(1)) / 100.0
+        altim_hpa = altim_inhg * 33.8638866667
+    elif m_alt_q:
+        altim_hpa = float(m_alt_q.group(1))
+        altim_inhg = altim_hpa / 33.8638866667
+
+    # 3-hour pressure tendency 5aPPP
+    tendency = "STEADY"
+    m_tend = re.search(r"\b5([0-8])(\d{3})\b", txt)
+    if m_tend:
+        code = int(m_tend.group(1))
+        chg_hpa = int(m_tend.group(2)) / 10.0
+        if code in (0, 1, 2, 3) and chg_hpa >= 0.3:
+            tendency = f"▲ +{chg_hpa:.1f} hPa"
+        elif code in (5, 6, 7, 8) and chg_hpa >= 0.3:
+            tendency = f"▼ -{chg_hpa:.1f} hPa"
+
+    # FAA Flight Category
+    c_chk = ceiling_ft if ceiling_ft is not None else 99999
+    if c_chk < 500 or vis_sm < 1.0:
+        flt_cat = "LIFR"
+    elif c_chk < 1000 or vis_sm < 3.0:
+        flt_cat = "IFR"
+    elif c_chk <= 3000 or vis_sm <= 5.0:
+        flt_cat = "MVFR"
+    else:
+        flt_cat = "VFR"
+
+    temp_f = temp_c * 9.0 / 5.0 + 32.0
+    dew_f = dew_c * 9.0 / 5.0 + 32.0
+    rh_pct = compute_relative_humidity(temp_c, dew_c)
+    wind_mph = wind_kt * 1.15078
+    gust_mph = gust_kt * 1.15078
+
+    return {
+        "station": station,
+        "obs_time": obs_time,
+        "raw_metar": txt,
+        "raw_taf": "",
+        "temp_c": round(temp_c, 1),
+        "temp_f": round(temp_f, 1),
+        "dew_c": round(dew_c, 1),
+        "dew_f": round(dew_f, 1),
+        "rh_pct": round(rh_pct, 1),
+        "wind_dir": wind_dir,
+        "wind_vrb": wind_vrb,
+        "wind_card": "CALM" if wind_kt < 0.5 else cardinal_from_deg(wind_dir),
+        "wind_kt": round(wind_kt, 1),
+        "gust_kt": round(gust_kt, 1),
+        "wind_mph": round(wind_mph, 1),
+        "gust_mph": round(gust_mph, 1),
+        "vis_sm": round(vis_sm, 2),
+        "clouds": clouds if clouds else ["CLR"],
+        "ceiling_ft": ceiling_ft,
+        "wx_summary": ", ".join(wx_list) if wx_list else ("Clear / Fair" if not clouds or clouds == ["CLR"] else "Fair"),
+        "altim_inhg": round(altim_inhg, 2),
+        "altim_hpa": round(altim_hpa, 1),
+        "tendency": tendency,
+        "flight_cat": flt_cat,
+        "source": "PARSED",
+    }
+
+
+# ---------------------------------------------------------------------------
+# NOAA SWPC HF Amateur Band Condition Physics Calculator
+# ---------------------------------------------------------------------------
+KP_TO_AP_TABLE = [
+    (0.0, 0), (0.33, 2), (0.67, 3), (1.0, 4), (1.33, 5), (1.67, 6),
+    (2.0, 7), (2.33, 9), (2.67, 12), (3.0, 15), (3.33, 18), (3.67, 22),
+    (4.0, 27), (4.33, 32), (4.67, 39), (5.0, 48), (5.33, 56), (5.67, 67),
+    (6.0, 80), (6.33, 94), (6.67, 111), (7.0, 132), (7.33, 154), (7.67, 179),
+    (8.0, 207), (8.33, 236), (8.67, 300), (9.0, 400),
+]
+
+
+def kp_to_ap(kp: float) -> int:
+    best = 4
+    best_d = 99.0
+    for kv, av in KP_TO_AP_TABLE:
+        d = abs(kp - kv)
+        if d < best_d:
+            best_d = d
+            best = av
+    return best
+
+
+def format_xray_class(flux_wm2: float) -> str:
+    f = max(1e-9, float(flux_wm2))
+    if f < 1e-7:
+        return f"A{min(9.9, f / 1e-8):.1f}"
+    if f < 1e-6:
+        return f"B{min(9.9, f / 1e-7):.1f}"
+    if f < 1e-5:
+        return f"C{min(9.9, f / 1e-6):.1f}"
+    if f < 1e-4:
+        return f"M{min(9.9, f / 1e-5):.1f}"
+    return f"X{min(99.0, f / 1e-4):.1f}"
+
+
+def calculate_hf_band_conditions(
+    sfi: float, kp: float, a_idx: float, xray_flux: float, bz_nt: float = 0.0
+) -> dict[str, Any]:
+    """
+    Calculate Day & Night Amateur HF Band Conditions (80m..6m) + VHF propagation
+    from Solar Flux Index (10.7cm SFI), Planetary Kp, A-index, GOES X-ray Flux (W/m²), and IMF Bz.
+    """
+    # NOAA R-Scale (Radio Blackout on sunlit hemisphere)
+    if xray_flux >= 2e-3:
+        r_scale = ("R5", "EXTREME")
+    elif xray_flux >= 1e-3:
+        r_scale = ("R4", "SEVERE")
+    elif xray_flux >= 1e-4:
+        r_scale = ("R3", "STRONG")
+    elif xray_flux >= 5e-5:
+        r_scale = ("R2", "MODERATE")
+    elif xray_flux >= 1e-5:
+        r_scale = ("R1", "MINOR")
+    else:
+        r_scale = ("R0", "NONE")
+
+    # NOAA G-Scale (Geomagnetic Storm)
+    if kp >= 9.0:
+        g_scale = ("G5", "EXTREME")
+    elif kp >= 8.0:
+        g_scale = ("G4", "SEVERE")
+    elif kp >= 7.0:
+        g_scale = ("G3", "STRONG")
+    elif kp >= 6.0:
+        g_scale = ("G2", "MODERATE")
+    elif kp >= 5.0:
+        g_scale = ("G1", "MINOR")
+    else:
+        g_scale = ("G0", "QUIET" if kp < 4.0 else "UNSETTLED")
+
+    eff_storm = kp + (0.5 if a_idx >= 35 else 0.0) + (0.4 if bz_nt <= -7.0 else 0.0)
+    r_lvl = int(r_scale[0][1])
+
+    def degrade(cond: str, steps: int) -> str:
+        order = ["GOOD", "FAIR", "POOR"]
+        i = order.index(cond)
+        return order[min(2, i + max(0, steps))]
+
+    bands_out: list[dict[str, str]] = []
+
+    # 80m (3.5 MHz): Heavy D-layer absorption by day; premier regional/DX by night
+    d_80 = "POOR" if sfi >= 85 or r_lvl >= 1 else "FAIR"
+    n_80 = "GOOD" if eff_storm < 5.0 else ("FAIR" if eff_storm < 6.5 else "POOR")
+    bands_out.append({"band": "80m", "day": d_80, "night": n_80, "freq": "3.5 MHz"})
+
+    # 40m (7.0 MHz): NVIS/regional by day, worldwide DX by night
+    d_40 = "FAIR" if eff_storm < 6.0 else "POOR"
+    if r_lvl >= 1:
+        d_40 = degrade(d_40, r_lvl)
+    n_40 = "GOOD" if eff_storm < 5.3 else ("FAIR" if eff_storm < 6.8 else "POOR")
+    bands_out.append({"band": "40m", "day": d_40, "night": n_40, "freq": "7.0 MHz"})
+
+    # 30m (10.1 MHz): Transition greyline/digital workhorse
+    d_30 = "GOOD" if (eff_storm < 4.8 and r_lvl == 0) else ("FAIR" if eff_storm < 6.2 and r_lvl <= 1 else "POOR")
+    n_30 = "GOOD" if (sfi >= 90 and eff_storm < 5.0) else ("FAIR" if eff_storm < 6.5 else "POOR")
+    bands_out.append({"band": "30m", "day": d_30, "night": n_30, "freq": "10.1 MHz"})
+
+    # 20m (14.0 MHz): Primary daytime DX band, stays open well into night at high SFI
+    d_20 = "GOOD" if (sfi >= 82 and eff_storm < 5.0) else ("FAIR" if eff_storm < 6.5 else "POOR")
+    if r_lvl >= 2:
+        d_20 = degrade(d_20, r_lvl - 1)
+    n_20 = "GOOD" if (sfi >= 125 and eff_storm < 4.5) else ("FAIR" if sfi >= 85 and eff_storm < 6.0 else "POOR")
+    bands_out.append({"band": "20m", "day": d_20, "night": n_20, "freq": "14.0 MHz"})
+
+    # 17m (18.1 MHz)
+    d_17 = "GOOD" if (sfi >= 105 and eff_storm < 4.6) else ("FAIR" if sfi >= 80 and eff_storm < 6.0 else "POOR")
+    if r_lvl >= 2:
+        d_17 = degrade(d_17, r_lvl - 1)
+    n_17 = "FAIR" if (sfi >= 140 and eff_storm < 4.5) else "POOR"
+    bands_out.append({"band": "17m", "day": d_17, "night": n_17, "freq": "18.1 MHz"})
+
+    # 15m (21.0 MHz)
+    d_15 = "GOOD" if (sfi >= 120 and eff_storm < 4.5) else ("FAIR" if sfi >= 90 and eff_storm < 5.8 else "POOR")
+    if r_lvl >= 3:
+        d_15 = degrade(d_15, r_lvl - 2)
+    n_15 = "FAIR" if (sfi >= 165 and eff_storm < 4.2) else "POOR"
+    bands_out.append({"band": "15m", "day": d_15, "night": n_15, "freq": "21.0 MHz"})
+
+    # 12m (24.9 MHz)
+    d_12 = "GOOD" if (sfi >= 138 and eff_storm < 4.4) else ("FAIR" if sfi >= 105 and eff_storm < 5.5 else "POOR")
+    if r_lvl >= 3:
+        d_12 = degrade(d_12, 1)
+    n_12 = "FAIR" if (sfi >= 190 and eff_storm < 3.8) else "POOR"
+    bands_out.append({"band": "12m", "day": d_12, "night": n_12, "freq": "24.9 MHz"})
+
+    # 10m (28.0 MHz)
+    d_10 = "GOOD" if (sfi >= 150 and eff_storm < 4.2) else ("FAIR" if sfi >= 112 and eff_storm < 5.2 else "POOR")
+    if r_lvl >= 3:
+        d_10 = degrade(d_10, 1)
+    n_10 = "FAIR" if (sfi >= 205 and eff_storm < 3.5) else "POOR"
+    bands_out.append({"band": "10m", "day": d_10, "night": n_10, "freq": "28.0 MHz"})
+
+    # 6m (50.1 MHz Magic Band: F2 at extreme SFI, Sporadic-E, or Auroral E)
+    d_6 = "GOOD" if (sfi >= 220 and eff_storm < 4.0) else ("FAIR" if sfi >= 160 or kp >= 5.0 else "POOR")
+    n_6 = "FAIR" if kp >= 5.0 else "POOR"
+    bands_out.append({"band": "6m", "day": d_6, "night": n_6, "freq": "50.1 MHz"})
+
+    # VHF Indicators
+    if kp >= 6.0 or (kp >= 5.0 and bz_nt <= -5.0):
+        aurora_st = "STRONG AU (6m/2m)"
+    elif kp >= 4.67:
+        aurora_st = "ACTIVE NORTH AU"
+    elif kp >= 4.0:
+        aurora_st = "HIGH-LAT WATCH"
+    else:
+        aurora_st = "QUIET"
+
+    now_m = datetime.datetime.now(datetime.timezone.utc).month
+    if now_m in (5, 6, 7, 8):
+        eskip_st = "HIGH (SUMMER Es)"
+    elif now_m in (12, 1):
+        eskip_st = "MOD (WINTER Es)"
+    elif sfi >= 155:
+        eskip_st = "FAIR / TEP"
+    else:
+        eskip_st = "LOW / SPORADIC"
+
+    return {
+        "xray_class": format_xray_class(xray_flux),
+        "r_scale": r_scale,
+        "g_scale": g_scale,
+        "bands": bands_out,
+        "vhf_aurora": aurora_st,
+        "vhf_eskip": eskip_st,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Offline Synthetic Doppler Storm Echo & Baseline Telemetry Generators
+# ---------------------------------------------------------------------------
+def build_default_metar_data(metar_id: str) -> dict[str, Any]:
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    stamp = now_utc.strftime("%d%H53Z")
+    raw = (
+        f"{metar_id.upper()} {stamp} 23012G19KT 10SM FEW065 SCT120 08/M03 A3004 "
+        f"RMK AO2 SLP176 T00831028 52008"
+    )
+    d = parse_metar_raw(raw, metar_id)
+    h0 = now_utc.strftime("%d%H")
+    h1 = (now_utc + datetime.timedelta(hours=24)).strftime("%d%H")
+    d["raw_taf"] = (
+        f"TAF {metar_id.upper()} {now_utc.strftime('%d%H30Z')} {h0}/{h1} "
+        f"23013G21KT P6SM SCT070 BKN130 FM{now_utc.strftime('%d')}1800 25016G25KT P6SM -SHRA BKN055"
+    )
+    d["source"] = "OFFLINE BASELINE"
+    return d
+
+
+def build_default_solar_data() -> dict[str, Any]:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    # 6h synthetic GOES X-ray curve (realistic C-class background + minor C4.8 flare peak)
+    xr_long: list[tuple[float, float]] = []
+    xr_short: list[tuple[float, float]] = []
+    for i in range(180):
+        t_min = -360.0 + i * 2.0
+        ts = (now + datetime.timedelta(minutes=t_min)).timestamp()
+        base = 1.1e-6 + 0.35e-6 * math.sin(i * 0.09)
+        flare1 = 3.8e-6 * math.exp(-((i - 118.0) / 14.0) ** 2)
+        flare2 = 1.2e-6 * math.exp(-((i - 48.0) / 10.0) ** 2)
+        fl_l = max(1.5e-8, base + flare1 + flare2)
+        fl_s = max(2.0e-9, fl_l * 0.14 + flare1 * 0.12)
+        xr_long.append((ts, fl_l))
+        xr_short.append((ts, fl_s))
+
+    kp_bars: list[tuple[str, float]] = []
+    sample_kps = [2.0, 2.33, 3.0, 3.67, 4.33, 3.33, 2.67, 2.33]
+    for idx, kv in enumerate(sample_kps):
+        bt = now - datetime.timedelta(hours=(7 - idx) * 3)
+        kp_bars.append((bt.strftime("%H:%MZ"), kv))
+
+    sfi = 158.0
+    kp = sample_kps[-1]
+    a_idx = float(round(sum(kp_to_ap(k) for k in sample_kps) / len(sample_kps)))
+    latest_xray = xr_long[-1][1]
+    bz = -2.4
+    cond = calculate_hf_band_conditions(sfi, kp, a_idx, latest_xray, bz)
+    return {
+        "sfi": sfi,
+        "ssn": 114,
+        "kp": kp,
+        "a_index": a_idx,
+        "solar_wind_kms": 428.0,
+        "bt_nt": 6.2,
+        "bz_nt": bz,
+        "xray_flux": latest_xray,
+        "xray_peak": max(v for _, v in xr_long),
+        "xray_long": xr_long,
+        "xray_short": xr_short,
+        "kp_bars": kp_bars,
+        "cond": cond,
+        "source": "OFFLINE BASELINE",
+        "updated_utc": now.strftime("%H:%M:%S UTC"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Async Disk-Cached Network & Tile Engine
+# ---------------------------------------------------------------------------
+class RadarDataEngine:
+    """Thread-safe HTTP tile & NOAA/NWS/SWPC telemetry downloader with ~/.cache/dtradar/ persistence."""
+
+    def __init__(self, on_update_cb=None):
+        self.on_update_cb = on_update_cb
+        for sub in ("osm", "nexrad", "ridge", "sat", "swpc", "metar"):
+            (CACHE_DIR / sub).mkdir(parents=True, exist_ok=True)
+
+        self._lock = threading.Lock()
+        self._osm_surfs: collections.OrderedDict[tuple[int, int, int], cairo.ImageSurface] = collections.OrderedDict()
+        self._nex_surfs: collections.OrderedDict[tuple[str, int, int, int], cairo.ImageSurface] = collections.OrderedDict()
+        self._inflight: set[tuple] = set()
+        self._failed_until: dict[tuple, float] = {}
+        self._tile_queue: collections.deque[tuple] = collections.deque()
+        self._cond = threading.Condition()
+        self._stop = False
+
+        self.online_osm = False
+        self.online_nexrad = False
+        self.online_metar = False
+        self.online_swpc = False
+
+        # RIDGE unpacked frames: key = (site, is_loop) -> list[cairo.ImageSurface]
+        self.ridge_frames: dict[tuple[str, bool], list[cairo.ImageSurface]] = {}
+        self.ridge_status: str = "AWAITING RIDGE FETCH"
+
+        # GOES / SWPC Satellite images: key = goes_key -> cairo.ImageSurface
+        self.sat_surfaces: dict[str, cairo.ImageSurface] = {}
+        self.sat_timestamps: dict[str, str] = {}
+
+        # Weather & Solar state
+        self.metar_data: dict[str, Any] = build_default_metar_data(DEFAULT_METAR)
+        self.alerts: list[dict[str, Any]] = []
+        self.solar_data: dict[str, Any] = build_default_solar_data()
+
+        for i in range(3):
+            t = threading.Thread(target=self._tile_worker, name=f"dtradar-tile-{i}", daemon=True)
+            t.start()
+
+    def shutdown(self):
+        self._stop = True
+        with self._cond:
+            self._cond.notify_all()
+
+    def _notify_ui(self):
+        if self.on_update_cb is not None:
+            GLib.idle_add(self.on_update_cb)
+
+    # ---- Slippy OSM Dark-LUT + IEM NEXRAD Tiles ----
+    def get_osm_tile(self, z: int, x: int, y: int) -> cairo.ImageSurface | None:
+        key = (z, x, y)
+        with self._lock:
+            if key in self._osm_surfs:
+                self._osm_surfs.move_to_end(key)
+                return self._osm_surfs[key]
+        # Check disk cache synchronously if fast, else queue
+        disk_p = CACHE_DIR / "osm" / f"{z}_{x}_{y}.png"
+        if disk_p.is_file():
+            try:
+                im = Image.open(disk_p).convert("RGB")
+                surf = rgb_to_cairo_surface(apply_dark_tactical_lut(np.asarray(im, dtype=np.uint8)))
+                with self._lock:
+                    self._osm_surfs[key] = surf
+                    while len(self._osm_surfs) > 280:
+                        self._osm_surfs.popitem(last=False)
+                return surf
+            except Exception:
+                pass
+        self._enqueue_tile(("osm", z, x, y))
+        return None
+
+    def get_nexrad_tile(self, lag_id: str, z: int, x: int, y: int) -> cairo.ImageSurface | None:
+        key = (lag_id, z, x, y)
+        with self._lock:
+            if key in self._nex_surfs:
+                self._nex_surfs.move_to_end(key)
+                return self._nex_surfs[key]
+        disk_p = CACHE_DIR / "nexrad" / f"{lag_id}_{z}_{x}_{y}.png"
+        now = time.time()
+        if disk_p.is_file() and (now - disk_p.stat().st_mtime) < 240.0:
+            try:
+                im = Image.open(disk_p).convert("RGBA")
+                arr = np.asarray(im, dtype=np.uint8)
+                surf = rgba_to_cairo_surface(arr, alpha_scale=0.84)
+                with self._lock:
+                    self._nex_surfs[key] = surf
+                    self.online_nexrad = True
+                    while len(self._nex_surfs) > 420:
+                        self._nex_surfs.popitem(last=False)
+                return surf
+            except Exception:
+                pass
+        self._enqueue_tile(("nexrad", lag_id, z, x, y))
+        return None
+
+    def _enqueue_tile(self, job: tuple):
+        now = time.time()
+        with self._cond:
+            if job in self._inflight:
+                return
+            if self._failed_until.get(job, 0.0) > now:
+                return
+            self._inflight.add(job)
+            self._tile_queue.append(job)
+            while len(self._tile_queue) > 96:
+                dropped = self._tile_queue.popleft()
+                self._inflight.discard(dropped)
+            self._cond.notify()
+
+    def _tile_worker(self):
+        sess = requests.Session()
+        sess.headers.update(HTTP_HEADERS)
+        while not self._stop:
+            with self._cond:
+                while not self._tile_queue and not self._stop:
+                    self._cond.wait(timeout=2.0)
+                if self._stop:
+                    return
+                job = self._tile_queue.pop()
+            try:
+                kind = job[0]
+                if kind == "osm":
+                    _, z, x, y = job
+                    url = f"https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+                    r = sess.get(url, timeout=6.0)
+                    r.raise_for_status()
+                    disk_p = CACHE_DIR / "osm" / f"{z}_{x}_{y}.png"
+                    disk_p.write_bytes(r.content)
+                    im = Image.open(io.BytesIO(r.content)).convert("RGB")
+                    surf = rgb_to_cairo_surface(apply_dark_tactical_lut(np.asarray(im, dtype=np.uint8)))
+                    with self._lock:
+                        self._osm_surfs[(z, x, y)] = surf
+                        self.online_osm = True
+                        while len(self._osm_surfs) > 280:
+                            self._osm_surfs.popitem(last=False)
+                    self._notify_ui()
+                elif kind == "nexrad":
+                    _, lag_id, z, x, y = job
+                    layer = "nexrad-n0q-900913" if lag_id == "live" else f"nexrad-n0q-900913-{lag_id}"
+                    url = f"https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/{layer}/{z}/{x}/{y}.png"
+                    r = sess.get(url, timeout=6.5)
+                    r.raise_for_status()
+                    disk_p = CACHE_DIR / "nexrad" / f"{lag_id}_{z}_{x}_{y}.png"
+                    disk_p.write_bytes(r.content)
+                    im = Image.open(io.BytesIO(r.content)).convert("RGBA")
+                    surf = rgba_to_cairo_surface(np.asarray(im, dtype=np.uint8), alpha_scale=0.84)
+                    with self._lock:
+                        self._nex_surfs[(lag_id, z, x, y)] = surf
+                        self.online_nexrad = True
+                        while len(self._nex_surfs) > 420:
+                            self._nex_surfs.popitem(last=False)
+                    self._notify_ui()
+            except Exception:
+                with self._cond:
+                    self._failed_until[job] = time.time() + 45.0
+            finally:
+                with self._cond:
+                    self._inflight.discard(job)
+
+    def clear_nexrad_cache_for_refresh(self):
+        with self._lock:
+            self._nex_surfs.clear()
+        with self._cond:
+            self._failed_until.clear()
+
+    # ---- NWS Station RIDGE Multi-Frame GIF Unpacker ----
+    def fetch_ridge_async(self, site: str, is_loop: bool, force: bool = False):
+        site_u = site.strip().upper() or DEFAULT_NEXRAD
+        key = (site_u, bool(is_loop))
+        if not force and key in self.ridge_frames and self.ridge_frames[key]:
+            return
+        threading.Thread(
+            target=self._bg_fetch_ridge, args=(site_u, bool(is_loop), force), daemon=True
+        ).start()
+
+    def _unpack_gif_bytes(self, raw_bytes: bytes) -> list[cairo.ImageSurface]:
+        im = Image.open(io.BytesIO(raw_bytes))
+        n_frames = max(1, int(getattr(im, "n_frames", 1)))
+        frames: list[cairo.ImageSurface] = []
+        canvas = Image.new("RGBA", im.size, (0, 0, 0, 255))
+        for idx in range(min(24, n_frames)):
+            im.seek(idx)
+            frame_rgba = im.convert("RGBA")
+            canvas = Image.alpha_composite(canvas, frame_rgba)
+            arr = np.asarray(canvas, dtype=np.uint8)
+            frames.append(rgba_to_cairo_surface(arr, alpha_scale=1.0))
+        return frames
+
+    def _bg_fetch_ridge(self, site: str, is_loop: bool, force: bool):
+        suffix = "loop" if is_loop else "0"
+        disk_p = CACHE_DIR / "ridge" / f"{site}_{suffix}.gif"
+        raw_bytes: bytes | None = None
+        now = time.time()
+
+        if not force and disk_p.is_file() and (now - disk_p.stat().st_mtime) < 240.0:
+            try:
+                raw_bytes = disk_p.read_bytes()
+            except Exception:
+                raw_bytes = None
+
+        if raw_bytes is None:
+            url = f"https://radar.weather.gov/ridge/standard/{site}_{suffix}.gif"
+            try:
+                r = requests.get(url, headers=HTTP_HEADERS, timeout=10.0)
+                r.raise_for_status()
+                raw_bytes = r.content
+                disk_p.write_bytes(raw_bytes)
+                self.ridge_status = f"LIVE NOAA RIDGE {site} ({suffix.upper()})"
+            except Exception:
+                if disk_p.is_file():
+                    try:
+                        raw_bytes = disk_p.read_bytes()
+                        self.ridge_status = f"CACHED NOAA RIDGE {site}"
+                    except Exception:
+                        raw_bytes = None
+                if raw_bytes is None:
+                    self.ridge_status = f"OFFLINE SYNTHETIC PPI — {site}"
+
+        if raw_bytes:
+            try:
+                surfs = self._unpack_gif_bytes(raw_bytes)
+                if surfs:
+                    with self._lock:
+                        self.ridge_frames[(site, is_loop)] = surfs
+                    self._notify_ui()
+            except Exception:
+                pass
+
+    # ---- GOES-18 / 16 & SWPC OVATION Satellite Fetcher ----
+    def fetch_satellite_async(self, goes_key: str, force: bool = False):
+        if goes_key not in GOES_MAP:
+            goes_key = DEFAULT_GOES_KEY
+        if not force and goes_key in self.sat_surfaces:
+            return
+        threading.Thread(
+            target=self._bg_fetch_satellite, args=(goes_key, force), daemon=True
+        ).start()
+
+    def _bg_fetch_satellite(self, goes_key: str, force: bool):
+        _lbl, url = GOES_MAP[goes_key]
+        disk_p = CACHE_DIR / "sat" / f"{goes_key}.jpg"
+        raw_bytes: bytes | None = None
+        now = time.time()
+
+        if not force and disk_p.is_file() and (now - disk_p.stat().st_mtime) < 300.0:
+            try:
+                raw_bytes = disk_p.read_bytes()
+            except Exception:
+                raw_bytes = None
+
+        status_stamp = ""
+        if raw_bytes is None:
+            try:
+                r = requests.get(url, headers=HTTP_HEADERS, timeout=12.0)
+                r.raise_for_status()
+                raw_bytes = r.content
+                disk_p.write_bytes(raw_bytes)
+                status_stamp = datetime.datetime.now(datetime.timezone.utc).strftime("LIVE %H:%MZ")
+            except Exception:
+                if disk_p.is_file():
+                    try:
+                        raw_bytes = disk_p.read_bytes()
+                        status_stamp = "DISK CACHE"
+                    except Exception:
+                        raw_bytes = None
+
+        if raw_bytes:
+            try:
+                im = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+                # Cap max texture dimension to 1280px for snappy Cairo pan/zoom
+                if max(im.size) > 1280:
+                    im.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+                surf = rgb_to_cairo_surface(np.asarray(im, dtype=np.uint8))
+                with self._lock:
+                    self.sat_surfaces[goes_key] = surf
+                    self.sat_timestamps[goes_key] = status_stamp or "CACHED"
+                self._notify_ui()
+            except Exception:
+                pass
+
+    # ---- METAR / TAF + NWS Station Obs + Active CAP Alerts ----
+    def fetch_all_telemetry_async(self, metar_id: str, lat: float, lon: float):
+        threading.Thread(
+            target=self._bg_fetch_weather_and_solar,
+            args=(metar_id.strip().upper() or DEFAULT_METAR, float(lat), float(lon)),
+            daemon=True,
+        ).start()
+
+    def _bg_fetch_weather_and_solar(self, metar_id: str, lat: float, lon: float):
+        sess = requests.Session()
+        sess.headers.update(HTTP_HEADERS)
+
+        # 1. AviationWeather.gov METAR + TAF + NWS Station Fallback
+        metar_cache_p = CACHE_DIR / "metar" / f"{metar_id}.json"
+        parsed: dict[str, Any] | None = None
+        try:
+            url_aw = f"https://aviationweather.gov/api/data/metar?ids={metar_id}&format=json&taf=true"
+            r = sess.get(url_aw, timeout=7.0)
+            if r.status_code == 200:
+                arr = r.json()
+                if isinstance(arr, list) and arr:
+                    item = arr[0]
+                    raw_ob = str(item.get("rawOb") or "")
+                    parsed = parse_metar_raw(raw_ob, metar_id)
+                    parsed["raw_taf"] = str(item.get("rawTaf") or "")
+                    if item.get("temp") is not None:
+                        tc = float(item["temp"])
+                        parsed["temp_c"] = round(tc, 1)
+                        parsed["temp_f"] = round(tc * 9.0 / 5.0 + 32.0, 1)
+                    if item.get("dewp") is not None:
+                        dc = float(item["dewp"])
+                        parsed["dew_c"] = round(dc, 1)
+                        parsed["dew_f"] = round(dc * 9.0 / 5.0 + 32.0, 1)
+                        parsed["rh_pct"] = round(compute_relative_humidity(parsed["temp_c"], dc), 1)
+                    if item.get("wspd") is not None:
+                        wk = float(item["wspd"])
+                        parsed["wind_kt"] = round(wk, 1)
+                        parsed["wind_mph"] = round(wk * 1.15078, 1)
+                    if item.get("wgst") is not None:
+                        gk = float(item["wgst"])
+                        parsed["gust_kt"] = round(gk, 1)
+                        parsed["gust_mph"] = round(gk * 1.15078, 1)
+                    if item.get("wdir") is not None:
+                        wd = item["wdir"]
+                        if str(wd).upper() == "VRB":
+                            parsed["wind_dir"] = None
+                            parsed["wind_vrb"] = True
+                        else:
+                            try:
+                                parsed["wind_dir"] = float(wd)
+                                parsed["wind_card"] = cardinal_from_deg(parsed["wind_dir"])
+                            except Exception:
+                                pass
+                    if item.get("altim") is not None:
+                        av = float(item["altim"])
+                        if av > 800.0:
+                            parsed["altim_hpa"] = round(av, 1)
+                            parsed["altim_inhg"] = round(av / 33.8638866667, 2)
+                        elif 25.0 <= av <= 33.0:
+                            parsed["altim_inhg"] = round(av, 2)
+                            parsed["altim_hpa"] = round(av * 33.8638866667, 1)
+                    if item.get("fltCat"):
+                        parsed["flight_cat"] = str(item["fltCat"]).upper()
+                    parsed["source"] = "LIVE AVIATIONWEATHER.GOV"
+                    self.online_metar = True
+        except Exception:
+            pass
+
+        # Supplement or fallback with NWS api.weather.gov/stations/{ID}/observations/latest
+        try:
+            url_nws = f"https://api.weather.gov/stations/{metar_id}/observations/latest"
+            rn = sess.get(url_nws, headers={"User-Agent": UA, "Accept": "application/geo+json"}, timeout=7.0)
+            if rn.status_code == 200:
+                props = rn.json().get("properties", {})
+                raw_msg = str(props.get("rawMessage") or "").strip()
+                if parsed is None:
+                    parsed = parse_metar_raw(raw_msg, metar_id) if raw_msg else build_default_metar_data(metar_id)
+                    if not raw_msg:
+                        parsed["raw_metar"] = f"{metar_id} AUTO NWS ASOS OBSERVATION"
+                    parsed["source"] = "LIVE API.WEATHER.GOV"
+                t_val = (props.get("temperature") or {}).get("value")
+                d_val = (props.get("dewpoint") or {}).get("value")
+                rh_val = (props.get("relativeHumidity") or {}).get("value")
+                bp_val = (props.get("barometricPressure") or {}).get("value")
+                ws_obj = props.get("windSpeed") or {}
+                wg_obj = props.get("windGust") or {}
+                wd_val = (props.get("windDirection") or {}).get("value")
+                desc = str(props.get("textDescription") or "").strip()
+                if t_val is not None:
+                    tc = float(t_val)
+                    parsed["temp_c"] = round(tc, 1)
+                    parsed["temp_f"] = round(tc * 9.0 / 5.0 + 32.0, 1)
+                if d_val is not None:
+                    dc = float(d_val)
+                    parsed["dew_c"] = round(dc, 1)
+                    parsed["dew_f"] = round(dc * 9.0 / 5.0 + 32.0, 1)
+                if rh_val is not None:
+                    parsed["rh_pct"] = round(float(rh_val), 1)
+                if bp_val is not None and float(bp_val) > 50000.0 and parsed.get("altim_inhg", 29.92) == 29.92:
+                    hpa = float(bp_val) / 100.0
+                    parsed["altim_hpa"] = round(hpa, 1)
+                    parsed["altim_inhg"] = round(hpa / 33.8638866667, 2)
+                if wd_val is not None and parsed.get("wind_dir") is None:
+                    parsed["wind_dir"] = float(wd_val)
+                    parsed["wind_card"] = cardinal_from_deg(float(wd_val))
+                if ws_obj.get("value") is not None and parsed.get("wind_kt", 0.0) == 0.0:
+                    wv = float(ws_obj["value"])
+                    ucode = str(ws_obj.get("unitCode") or "")
+                    wk = wv / 1.852 if "km_h" in ucode else (wv * 1.94384 if "m_s" in ucode else wv)
+                    parsed["wind_kt"] = round(wk, 1)
+                    parsed["wind_mph"] = round(wk * 1.15078, 1)
+                if wg_obj.get("value") is not None and parsed.get("gust_kt", 0.0) == 0.0:
+                    gv = float(wg_obj["value"])
+                    ucode = str(wg_obj.get("unitCode") or "")
+                    gk = gv / 1.852 if "km_h" in ucode else (gv * 1.94384 if "m_s" in ucode else gv)
+                    parsed["gust_kt"] = round(gk, 1)
+                    parsed["gust_mph"] = round(gk * 1.15078, 1)
+                if desc:
+                    parsed["wx_summary"] = desc
+                self.online_metar = True
+        except Exception:
+            pass
+
+        if parsed is not None:
+            try:
+                metar_cache_p.write_text(json.dumps(parsed, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+        elif metar_cache_p.is_file():
+            try:
+                parsed = json.loads(metar_cache_p.read_text(encoding="utf-8"))
+                parsed["source"] = "DISK CACHE"
+            except Exception:
+                parsed = build_default_metar_data(metar_id)
+        else:
+            parsed = build_default_metar_data(metar_id)
+
+        with self._lock:
+            self.metar_data = parsed
+        self._notify_ui()
+
+        # 2. Active NWS CAP Alerts + Warning Polygons
+        alerts_cache_p = CACHE_DIR / "metar" / "alerts.json"
+        new_alerts: list[dict[str, Any]] | None = None
+        try:
+            url_al = f"https://api.weather.gov/alerts/active?point={lat:.4f},{lon:.4f}"
+            ra = sess.get(url_al, headers={"User-Agent": UA, "Accept": "application/geo+json"}, timeout=7.5)
+            if ra.status_code == 200:
+                feats = list(ra.json().get("features") or [])
+                # Also pull nearby regional polygon warnings within 220 km if inside CONUS
+                if 24.0 <= lat <= 50.0 and -125.0 <= lon <= -66.0:
+                    state_guess = "ID" if (41.9 <= lat <= 49.0 and -117.2 <= lon <= -111.0) else ""
+                    if state_guess:
+                        try:
+                            rs = sess.get(
+                                f"https://api.weather.gov/alerts/active?area={state_guess}",
+                                headers={"User-Agent": UA, "Accept": "application/geo+json"},
+                                timeout=6.5,
+                            )
+                            if rs.status_code == 200:
+                                seen_ids = {f.get("id") for f in feats}
+                                for sf in (rs.json().get("features") or []):
+                                    if sf.get("id") not in seen_ids and sf.get("geometry"):
+                                        feats.append(sf)
+                        except Exception:
+                            pass
+                new_alerts = []
+                for f in feats[:18]:
+                    pr = f.get("properties") or {}
+                    geom = f.get("geometry") or {}
+                    polys: list[list[tuple[float, float]]] = []
+                    gtype = geom.get("type")
+                    coords = geom.get("coordinates") or []
+                    if gtype == "Polygon":
+                        for ring in coords[:1]:
+                            polys.append([(float(pt[1]), float(pt[0])) for pt in ring if len(pt) >= 2])
+                    elif gtype == "MultiPolygon":
+                        for poly in coords:
+                            for ring in poly[:1]:
+                                polys.append([(float(pt[1]), float(pt[0])) for pt in ring if len(pt) >= 2])
+                    new_alerts.append({
+                        "event": str(pr.get("event") or "Weather Alert"),
+                        "severity": str(pr.get("severity") or "Moderate"),
+                        "headline": str(pr.get("headline") or pr.get("event") or ""),
+                        "areaDesc": str(pr.get("areaDesc") or ""),
+                        "expires": str(pr.get("expires") or ""),
+                        "polygons": polys,
+                    })
+                alerts_cache_p.write_text(json.dumps(new_alerts, indent=2), encoding="utf-8")
+        except Exception:
+            if alerts_cache_p.is_file():
+                try:
+                    new_alerts = json.loads(alerts_cache_p.read_text(encoding="utf-8"))
+                except Exception:
+                    new_alerts = []
+
+        if new_alerts is not None:
+            with self._lock:
+                self.alerts = new_alerts
+            self._notify_ui()
+
+        # 3. NOAA SWPC Space Weather (X-Ray 6h, Planetary Kp, 10.7cm SFI, Solar Wind & Bz)
+        swpc_cache_p = CACHE_DIR / "swpc" / "solar_state.json"
+        swpc_ok = False
+        sol = build_default_solar_data()
+        try:
+            rx = sess.get("https://services.swpc.noaa.gov/json/goes/primary/xrays-6-hour.json", timeout=8.0)
+            if rx.status_code == 200:
+                xarr = rx.json()
+                xr_l: list[tuple[float, float]] = []
+                xr_s: list[tuple[float, float]] = []
+                for row in xarr:
+                    fl = float(row.get("flux") or 0.0)
+                    if fl <= 0.0:
+                        continue
+                    t_str = str(row.get("time_tag") or "").replace("Z", "+00:00")
+                    try:
+                        ts = datetime.datetime.fromisoformat(t_str).timestamp()
+                    except Exception:
+                        continue
+                    en = str(row.get("energy") or "")
+                    if "0.1-0.8" in en:
+                        xr_l.append((ts, fl))
+                    elif "0.05-0.4" in en:
+                        xr_s.append((ts, fl))
+                if len(xr_l) >= 8:
+                    sol["xray_long"] = xr_l[-240:]
+                    sol["xray_short"] = xr_s[-240:] if xr_s else []
+                    sol["xray_flux"] = xr_l[-1][1]
+                    sol["xray_peak"] = max(v for _, v in xr_l)
+                    swpc_ok = True
+        except Exception:
+            pass
+
+        try:
+            rk = sess.get("https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json", timeout=7.5)
+            if rk.status_code == 200:
+                karr = rk.json()
+                bars: list[tuple[str, float]] = []
+                for row in karr[-12:]:
+                    if isinstance(row, list) and len(row) >= 2:
+                        if str(row[0]).lower().startswith("time"):
+                            continue
+                        try:
+                            kv = float(row[1])
+                            lbl = str(row[0])[11:16] + "Z"
+                            bars.append((lbl, kv))
+                        except Exception:
+                            pass
+                    elif isinstance(row, dict):
+                        try:
+                            kv = float(row.get("Kp") or row.get("kp_index") or 0.0)
+                            lbl = str(row.get("time_tag") or "")[11:16] + "Z"
+                            bars.append((lbl, kv))
+                        except Exception:
+                            pass
+                if bars:
+                    sol["kp_bars"] = bars[-8:]
+                    sol["kp"] = bars[-1][1]
+                    sol["a_index"] = float(round(sum(kp_to_ap(v) for _, v in bars[-8:]) / len(bars[-8:])))
+                    swpc_ok = True
+        except Exception:
+            pass
+
+        try:
+            rf = sess.get("https://services.swpc.noaa.gov/products/summary/10cm-flux.json", timeout=6.5)
+            if rf.status_code == 200:
+                fobj = rf.json()
+                fv = fobj.get("Flux") or fobj.get("flux")
+                if fv is not None:
+                    sol["sfi"] = float(fv)
+                    sol["ssn"] = max(0, int(round((sol["sfi"] - 67.0) * 1.18)))
+                    swpc_ok = True
+        except Exception:
+            pass
+
+        try:
+            rw = sess.get("https://services.swpc.noaa.gov/products/summary/solar-wind-speed.json", timeout=6.0)
+            if rw.status_code == 200:
+                wv = rw.json().get("WindSpeed")
+                if wv is not None:
+                    sol["solar_wind_kms"] = float(wv)
+        except Exception:
+            pass
+
+        try:
+            rb = sess.get("https://services.swpc.noaa.gov/products/summary/solar-wind-mag-field.json", timeout=6.0)
+            if rb.status_code == 200:
+                bobj = rb.json()
+                if bobj.get("Bt") is not None:
+                    sol["bt_nt"] = float(bobj["Bt"])
+                if bobj.get("Bz") is not None:
+                    sol["bz_nt"] = float(bobj["Bz"])
+        except Exception:
+            pass
+
+        if swpc_ok:
+            sol["cond"] = calculate_hf_band_conditions(
+                sol["sfi"], sol["kp"], sol["a_index"], sol["xray_flux"], sol["bz_nt"]
+            )
+            sol["source"] = "LIVE NOAA SWPC"
+            sol["updated_utc"] = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S UTC")
+            self.online_swpc = True
+            try:
+                swpc_cache_p.write_text(json.dumps(sol), encoding="utf-8")
+            except Exception:
+                pass
+        elif swpc_cache_p.is_file():
+            try:
+                sol = json.loads(swpc_cache_p.read_text(encoding="utf-8"))
+                sol["source"] = "DISK CACHE"
+            except Exception:
+                pass
+
+        with self._lock:
+            self.solar_data = sol
+        self._notify_ui()
+
+
+# ---------------------------------------------------------------------------
+# Pure Cairo Renderers for the 4 CRT Views & 3 Backlit Analog Weather Dials
+# (Decoupled from GTK widget allocation so `--self-test` verifies rendering!)
+# ---------------------------------------------------------------------------
+def draw_crt_bezel_frame(cr: cairo.Context, w: float, h: float):
+    cr.rectangle(0, 0, w, h)
+    cr.set_source_rgb(0.035, 0.065, 0.095)
+    cr.fill()
+
+
+def render_synthetic_nexrad_echoes(
+    cr: cairo.Context,
+    cx_px: float,
+    cy_px: float,
+    px_per_km: float,
+    frame_idx: int,
+    n_frames: int,
+):
+    """
+    Offline tactical Doppler reflectivity echo cells (light green -> yellow -> orange -> red/magenta)
+    drifting ENE across the Snake River Plain / Teton Valley across animation frames 0..5.
+    """
+    t = frame_idx / max(1, n_frames - 1)
+    cells = [
+        # (dx_km_start, dy_km_start, vx_km, vy_km, rx_km, ry_km, rot_deg, peak_tier)
+        (-42.0, 18.0, 28.0, -14.0, 38.0, 22.0, -24.0, 4),   # Primary convective squall SW -> NE
+        (24.0, -34.0, 24.0, -12.0, 48.0, 28.0, -32.0, 3),   # Upper Snake / Teton precipitation band
+        (-95.0, 56.0, 26.0, -10.0, 30.0, 18.0, -18.0, 2),   # Trailing shower cell
+        (78.0, 42.0, 20.0, -11.0, 26.0, 16.0, -15.0, 2),    # Bear River / Wyoming border showers
+    ]
+    tiers = [
+        (1.00, (0.08, 0.72, 0.24, 0.44)),  # 20 dBZ green
+        (0.72, (0.06, 0.88, 0.20, 0.56)),  # 30 dBZ bright green
+        (0.50, (0.96, 0.86, 0.12, 0.68)),  # 38 dBZ yellow
+        (0.32, (0.96, 0.42, 0.10, 0.78)),  # 46 dBZ orange-red
+        (0.16, (0.88, 0.12, 0.62, 0.85)),  # 54 dBZ severe crimson-magenta
+    ]
+    for dx0, dy0, vx, vy, rx_km, ry_km, rot_d, max_tier in cells:
+        x_km = dx0 + vx * t
+        y_km = dy0 + vy * t
+        px = cx_px + x_km * px_per_km
+        py = cy_px + y_km * px_per_km
+        rx = max(3.0, rx_km * px_per_km)
+        ry = max(2.5, ry_km * px_per_km)
+        for ti in range(max_tier + 1):
+            scale_f, rgba = tiers[ti]
+            cr.save()
+            cr.translate(px + ti * 1.5, py - ti * 0.8)
+            cr.rotate(math.radians(rot_d))
+            cr.scale(rx * scale_f, ry * scale_f)
+            cr.arc(0.0, 0.0, 1.0, 0.0, 2.0 * math.pi)
+            cr.restore()
+            cr.set_source_rgba(*rgba)
+            cr.fill()
+
+
+def render_ppi_sweep_overlay(
+    cr: cairo.Context, cx: float, cy: float, radius_px: float, sweep_deg: float
+):
+    """Render glowing P1/P7 phosphor rotating radar beam + persistence wedge."""
+    cr.save()
+    cr.arc(cx, cy, radius_px, 0.0, 2.0 * math.pi)
+    cr.clip()
+
+    trail_deg = 48.0
+    steps = 18
+    for i in range(steps):
+        f0 = i / steps
+        f1 = (i + 1) / steps
+        a0 = math.radians(sweep_deg - trail_deg * (1.0 - f0))
+        a1 = math.radians(sweep_deg - trail_deg * (1.0 - f1))
+        alpha = 0.015 + 0.19 * (f1 ** 2.1)
+        cr.move_to(cx, cy)
+        cr.arc(cx, cy, radius_px, a0, a1)
+        cr.close_path()
+        cr.set_source_rgba(0.18, 0.98, 0.48, alpha)
+        cr.fill()
+
+    rad = math.radians(sweep_deg)
+    ex = cx + radius_px * math.cos(rad)
+    ey = cy + radius_px * math.sin(rad)
+    cr.set_line_width(3.4)
+    cr.set_source_rgba(0.25, 1.0, 0.56, 0.35)
+    cr.move_to(cx, cy)
+    cr.line_to(ex, ey)
+    cr.stroke()
+
+    cr.set_line_width(1.6)
+    cr.set_source_rgba(0.68, 1.0, 0.80, 0.92)
+    cr.move_to(cx, cy)
+    cr.line_to(ex, ey)
+    cr.stroke()
+    cr.restore()
+
+
+def draw_dbz_legend_bar(cr: cairo.Context, x: float, y: float, w: float, h: float):
+    cr.save()
+    cr.rectangle(x - 4, y - 14, w + 8, h + 18)
+    cr.set_source_rgba(0.03, 0.06, 0.09, 0.84)
+    cr.fill()
+    cr.set_line_width(1.0)
+    cr.set_source_rgba(0.32, 0.52, 0.62, 0.7)
+    cr.rectangle(x - 4, y - 14, w + 8, h + 18)
+    cr.stroke()
+
+    cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    cr.set_font_size(8.0)
+    cr.set_source_rgb(0.68, 0.96, 0.88)
+    cr.move_to(x, y - 4)
+    cr.show_text("NEXRAD REFLECTIVITY (dBZ):")
+
+    seg_w = w / len(DBZ_SCALE)
+    for i, (dbz_v, col) in enumerate(DBZ_SCALE):
+        sx = x + i * seg_w
+        cr.rectangle(sx, y, seg_w - 1.0, h)
+        cr.set_source_rgb(*col)
+        cr.fill()
+        if i % 2 == 0 or i == len(DBZ_SCALE) - 1:
+            cr.set_source_rgb(0.92, 0.96, 0.98)
+            cr.set_font_size(7.5)
+            cr.move_to(sx + 1.0, y + h - 2.0)
+            cr.show_text(f"{dbz_v}")
+    cr.restore()
+
+
+def render_view_nexrad_map(
+    cr: cairo.Context,
+    W: float,
+    H: float,
+    engine: RadarDataEngine,
+    cfg: dict[str, Any],
+    center_lat: float,
+    center_lon: float,
+    zoom: int,
+    frame_idx: int,
+    sweep_deg: float,
+    hover_latlon: tuple[float, float] | None = None,
+):
+    draw_crt_bezel_frame(cr, W, H)
+    z = max(MIN_ZOOM, min(MAX_ZOOM, int(zoom)))
+    c_wx, c_wy = latlon_to_world_px(center_lat, center_lon, float(z))
+    world_px_span = TILE_SIZE * (2 ** z)
+
+    def ll_to_screen(lat: float, lon: float) -> tuple[float, float]:
+        wx, wy = latlon_to_world_px(lat, lon, float(z))
+        dx = wx - c_wx
+        if dx > world_px_span * 0.5:
+            dx -= world_px_span
+        elif dx < -world_px_span * 0.5:
+            dx += world_px_span
+        return (W * 0.5 + dx, H * 0.5 + (wy - c_wy))
+
+    # 1. Embedded Vector Landmass Fallback (always drawn cleanly beneath tiles)
+    for is_hole, pts in WORLD_POLYGONS:
+        if len(pts) < 3:
+            continue
+        cr.new_path()
+        started = False
+        prev_sx = 0.0
+        for lon_p, lat_p in pts:
+            sx, sy = ll_to_screen(lat_p, lon_p)
+            if not started:
+                cr.move_to(sx, sy)
+                started = True
+            else:
+                if abs(sx - prev_sx) > W * 0.7:
+                    cr.move_to(sx, sy)
+                else:
+                    cr.line_to(sx, sy)
+            prev_sx = sx
+        cr.close_path()
+        if is_hole:
+            cr.set_source_rgb(0.04, 0.08, 0.13)
+        else:
+            cr.set_source_rgb(0.10, 0.14, 0.20)
+        cr.fill_preserve()
+        cr.set_line_width(0.8)
+        cr.set_source_rgba(0.24, 0.36, 0.48, 0.7)
+        cr.stroke()
+
+    # 2. Slippy OSM Dark-LUT Base Tiles (when cached or online)
+    x0_tile = int(math.floor((c_wx - W * 0.5) / TILE_SIZE))
+    x1_tile = int(math.floor((c_wx + W * 0.5) / TILE_SIZE))
+    y0_tile = int(math.floor((c_wy - H * 0.5) / TILE_SIZE))
+    y1_tile = int(math.floor((c_wy + H * 0.5) / TILE_SIZE))
+    n_tiles = 1 << z
+
+    osm_drawn = 0
+    for ty in range(max(0, y0_tile), min(n_tiles - 1, y1_tile) + 1):
+        for tx_raw in range(x0_tile, x1_tile + 1):
+            tx = tx_raw % n_tiles
+            surf = engine.get_osm_tile(z, tx, ty)
+            if surf is not None:
+                sx = W * 0.5 + (tx_raw * TILE_SIZE - c_wx)
+                sy = H * 0.5 + (ty * TILE_SIZE - c_wy)
+                cr.set_source_surface(surf, sx, sy)
+                cr.paint()
+                osm_drawn += 1
+
+    # 3. Crisp Geopolitical US State Borders, Rivers & Lat/Lon Tactical Graticule
+    if osm_drawn == 0:
+        cr.set_line_width(0.7)
+        cr.set_source_rgba(0.16, 0.30, 0.38, 0.45)
+        step_deg = 2 if z >= 6 else (5 if z >= 5 else 10)
+        for lat_g in range(-60, 75, step_deg):
+            _, sy = ll_to_screen(float(lat_g), center_lon)
+            if 0 <= sy <= H:
+                cr.move_to(0, sy)
+                cr.line_to(W, sy)
+                cr.stroke()
+        for lon_g in range(-170, 175, step_deg):
+            sx, _ = ll_to_screen(center_lat, float(lon_g))
+            if 0 <= sx <= W:
+                cr.move_to(sx, 0)
+                cr.line_to(sx, H)
+                cr.stroke()
+
+        # Snake River & Great Salt Lake regional hydrography
+        cr.set_line_width(1.4)
+        cr.set_source_rgba(0.12, 0.34, 0.52, 0.72)
+        for hline in IDAHO_HYDRO_LINES:
+            for i, (lo, la) in enumerate(hline):
+                sx, sy = ll_to_screen(la, lo)
+                if i == 0:
+                    cr.move_to(sx, sy)
+                else:
+                    cr.line_to(sx, sy)
+            cr.stroke()
+
+    # Always draw crisp US state boundaries so NEXRAD echoes have sharp geographical context
+    cr.set_line_width(1.25)
+    cr.set_source_rgba(0.38, 0.56, 0.72, 0.72 if osm_drawn == 0 else 0.42)
+    for poly in US_BORDER_POLYLINES:
+        for i, (lo, la) in enumerate(poly):
+            sx, sy = ll_to_screen(la, lo)
+            if i == 0:
+                cr.move_to(sx, sy)
+            else:
+                cr.line_to(sx, sy)
+        cr.stroke()
+
+    qth_lat = float(cfg.get("lat", DEFAULT_LAT))
+    qth_lon = float(cfg.get("lon", DEFAULT_LON))
+    qth_sx, qth_sy = ll_to_screen(qth_lat, qth_lon)
+
+    if osm_drawn == 0 and z >= 5:
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(8.2)
+        for cname, clat, clon in REGIONAL_CITIES:
+            sx, sy = ll_to_screen(clat, clon)
+            if math.hypot(sx - qth_sx, sy - qth_sy) < 18.0:
+                continue
+            if 10 <= sx <= W - 40 and 15 <= sy <= H - 20:
+                cr.set_source_rgba(0.55, 0.74, 0.86, 0.78)
+                cr.new_sub_path()
+                cr.arc(sx, sy, 2.0, 0, 2 * math.pi)
+                cr.fill()
+                cr.move_to(sx + 4.5, sy + 3.0)
+                cr.show_text(cname)
+
+    # 4. Live Multi-Frame Iowa Mesonet NEXRAD N0Q Reflectivity Tiles
+    lag_idx = max(0, min(len(NEXRAD_LAGS) - 1, frame_idx))
+    lag_id, lag_lbl, _ = NEXRAD_LAGS[lag_idx]
+    nex_drawn = 0
+    for ty in range(max(0, y0_tile), min(n_tiles - 1, y1_tile) + 1):
+        for tx_raw in range(x0_tile, x1_tile + 1):
+            tx = tx_raw % n_tiles
+            nsurf = engine.get_nexrad_tile(lag_id, z, tx, ty)
+            if nsurf is not None:
+                sx = W * 0.5 + (tx_raw * TILE_SIZE - c_wx)
+                sy = H * 0.5 + (ty * TILE_SIZE - c_wy)
+                cr.set_source_surface(nsurf, sx, sy)
+                cr.paint()
+                nex_drawn += 1
+
+    # Determine radar PPI center (selected NEXRAD station if in region, else QTH)
+    qth_lat = float(cfg.get("lat", DEFAULT_LAT))
+    qth_lon = float(cfg.get("lon", DEFAULT_LON))
+    nex_site = str(cfg.get("nexrad_site", DEFAULT_NEXRAD)).upper()
+    if nex_site in RIDGE_MAP and nex_site != "CONUS":
+        _, r_lat, r_lon = RIDGE_MAP[nex_site]
+    else:
+        r_lat, r_lon = qth_lat, qth_lon
+
+    qth_sx, qth_sy = ll_to_screen(qth_lat, qth_lon)
+    rad_sx, rad_sy = ll_to_screen(r_lat, r_lon)
+    p100_lat, p100_lon = dest_latlon_km(qth_lat, qth_lon, 90.0, 100.0)
+    p100_sx, _ = ll_to_screen(p100_lat, p100_lon)
+    px_per_km = max(0.05, abs(p100_sx - qth_sx) / 100.0)
+
+    # Offline Synthetic Doppler Storm Echoes when live IEM NEXRAD tiles aren't yet available
+    if nex_drawn == 0 and not engine.online_nexrad:
+        render_synthetic_nexrad_echoes(cr, rad_sx, rad_sy, px_per_km, lag_idx, len(NEXRAD_LAGS))
+
+    # 5. Active NWS CAP Warning Polygons
+    if cfg.get("show_alerts", True):
+        for al in engine.alerts:
+            ev = al.get("event", "").upper()
+            if "TORNADO" in ev:
+                col = (1.0, 0.16, 0.16)
+            elif "SEVERE THUNDERSTORM" in ev:
+                col = (1.0, 0.68, 0.08)
+            elif "FLOOD" in ev:
+                col = (0.18, 0.96, 0.38)
+            elif "WINTER" in ev or "BLIZZARD" in ev or "SNOW" in ev:
+                col = (1.0, 0.42, 0.78)
+            else:
+                col = (1.0, 0.86, 0.22)
+            for ring in al.get("polygons", []):
+                if len(ring) < 3:
+                    continue
+                for i, (plat, plon) in enumerate(ring):
+                    sx, sy = ll_to_screen(plat, plon)
+                    if i == 0:
+                        cr.move_to(sx, sy)
+                    else:
+                        cr.line_to(sx, sy)
+                cr.close_path()
+                cr.set_source_rgba(col[0], col[1], col[2], 0.22)
+                cr.fill_preserve()
+                cr.set_line_width(2.2)
+                cr.set_source_rgba(col[0], col[1], col[2], 0.95)
+                cr.stroke()
+
+    # 6. Geodesic Range Rings (50 / 100 / 150 / 200 km) & Azimuth Crosshairs around QTH
+    if cfg.get("show_rings", True):
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(8.2)
+        for rk in (50, 100, 150, 200):
+            cr.new_path()
+            for b_deg in range(0, 364, 6):
+                dlat, dlon = dest_latlon_km(qth_lat, qth_lon, float(b_deg), float(rk))
+                sx, sy = ll_to_screen(dlat, dlon)
+                if b_deg == 0:
+                    cr.move_to(sx, sy)
+                else:
+                    cr.line_to(sx, sy)
+            cr.set_line_width(1.1 if rk != 200 else 1.5)
+            cr.set_source_rgba(0.22, 0.88, 0.56, 0.48 if rk != 200 else 0.70)
+            cr.stroke()
+
+            n_lat, n_lon = dest_latlon_km(qth_lat, qth_lon, 0.0, float(rk))
+            nsx, nsy = ll_to_screen(n_lat, n_lon)
+            if 18 <= nsy <= H - 28:
+                cr.set_source_rgba(0.46, 0.98, 0.72, 0.86)
+                cr.move_to(nsx + 4, nsy - 2)
+                cr.show_text(f"{rk}km")
+
+        # 30-degree radials out to 200 km
+        cr.set_line_width(0.8)
+        cr.set_source_rgba(0.20, 0.78, 0.50, 0.26)
+        for b_deg in range(0, 360, 30):
+            elat, elon = dest_latlon_km(qth_lat, qth_lon, float(b_deg), 200.0)
+            esx, esy = ll_to_screen(elat, elon)
+            cr.move_to(qth_sx, qth_sy)
+            cr.line_to(esx, esy)
+            cr.stroke()
+
+    # 7. Optional Rotating Green Phosphor PPI Radar Sweep Arm
+    if cfg.get("ppi_sweep", True):
+        sweep_r_px = max(85.0, min(max(W, H) * 0.72, 200.0 * px_per_km))
+        render_ppi_sweep_overlay(cr, qth_sx, qth_sy, sweep_r_px, sweep_deg)
+
+    # 8. Regional NEXRAD WSR-88D Site Markers + Home QTH Reticle
+    cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    cr.set_font_size(8.2)
+    for sid, _slbl, slat, slon in RIDGE_STATIONS:
+        if sid == "CONUS":
+            continue
+        sx, sy = ll_to_screen(slat, slon)
+        if 8 <= sx <= W - 30 and 12 <= sy <= H - 24:
+            is_sel = sid == nex_site
+            cr.set_source_rgb(0.36, 0.98, 0.88) if is_sel else cr.set_source_rgba(0.45, 0.82, 0.95, 0.75)
+            cr.set_line_width(1.4 if is_sel else 1.0)
+            cr.new_sub_path()
+            cr.arc(sx, sy, 4.0 if is_sel else 2.8, 0, 2 * math.pi)
+            cr.stroke()
+            cr.move_to(sx + 6.0, sy - 3.0)
+            cr.show_text(sid)
+
+    # Home QTH W1AW / FN31pr amber-cyan diamond reticle
+    if -20 <= qth_sx <= W + 20 and -20 <= qth_sy <= H + 20:
+        cr.set_line_width(1.8)
+        cr.set_source_rgb(1.0, 0.76, 0.22)
+        cr.move_to(qth_sx, qth_sy - 7)
+        cr.line_to(qth_sx + 7, qth_sy)
+        cr.line_to(qth_sx, qth_sy + 7)
+        cr.line_to(qth_sx - 7, qth_sy)
+        cr.close_path()
+        cr.stroke()
+        cr.set_font_size(9.0)
+        cr.move_to(qth_sx + 9, qth_sy + 3)
+        cr.show_text(f"{cfg.get('callsign', DEFAULT_CALLSIGN)} ({cfg.get('grid', DEFAULT_GRID)})")
+
+    # 9. Top CRT VFD Telemetry HUD + Bottom dBZ Legend Bar
+    cr.rectangle(8, 8, W - 16, 24)
+    cr.set_source_rgba(0.02, 0.07, 0.08, 0.84)
+    cr.fill()
+    cr.set_line_width(1.0)
+    cr.set_source_rgba(0.25, 0.62, 0.58, 0.75)
+    cr.rectangle(8, 8, W - 16, 24)
+    cr.stroke()
+
+    cr.set_font_size(9.2)
+    cr.set_source_rgb(0.32, 0.98, 0.84)
+    src_str = "LIVE IEM NEXRAD N0Q" if engine.online_nexrad else "OFFLINE DOPPLER SIMULATOR"
+    hud_left = f"NEXRAD DOPPLER  |  Z={z}  |  FRAME [{lag_idx+1}/6: {lag_lbl}]  |  {src_str}"
+    cr.move_to(15, 23)
+    cr.show_text(hud_left)
+
+    if hover_latlon is not None:
+        hlat, hlon = hover_latlon
+        dkm, brg = haversine_bearing_km(qth_lat, qth_lon, hlat, hlon)
+        hgrid = latlon_to_grid(hlat, hlon)
+        hud_r = f"{hlat:+.3f},{hlon:+.3f} [{hgrid}] {dkm:.0f}km @{brg:03.0f}°"
+        ext = cr.text_extents(hud_r)
+        cr.set_source_rgb(1.0, 0.78, 0.28)
+        cr.move_to(W - ext.width - 15, 23)
+        cr.show_text(hud_r)
+
+    draw_dbz_legend_bar(cr, 14, H - 22, min(330.0, W - 28.0), 13.0)
+
+
+def render_view_nws_ridge(
+    cr: cairo.Context,
+    W: float,
+    H: float,
+    engine: RadarDataEngine,
+    site: str,
+    is_loop: bool,
+    frame_idx: int,
+    zoom_f: float,
+    pan_xy: tuple[float, float],
+    sweep_deg: float,
+    ppi_on: bool,
+):
+    draw_crt_bezel_frame(cr, W, H)
+    site_u = site.strip().upper() or DEFAULT_NEXRAD
+    frames = engine.ridge_frames.get((site_u, is_loop), [])
+
+    if frames:
+        idx = frame_idx % len(frames)
+        surf = frames[idx]
+        sw, sh = float(surf.get_width()), float(surf.get_height())
+        fit_s = min((W - 20.0) / max(1.0, sw), (H - 48.0) / max(1.0, sh)) * zoom_f
+        tx = W * 0.5 - (sw * fit_s) * 0.5 + pan_xy[0]
+        ty = (H + 26.0) * 0.5 - (sh * fit_s) * 0.5 + pan_xy[1]
+
+        cr.save()
+        cr.rectangle(4, 34, W - 8, H - 38)
+        cr.clip()
+        cr.translate(tx, ty)
+        cr.scale(fit_s, fit_s)
+        cr.set_source_surface(surf, 0, 0)
+        cr.paint()
+        cr.restore()
+
+        if ppi_on:
+            render_ppi_sweep_overlay(cr, W * 0.5 + pan_xy[0], (H + 26.0) * 0.5 + pan_xy[1], min(W, H) * 0.39 * zoom_f, sweep_deg)
+        frame_txt = f"FRAME {idx + 1}/{len(frames)}"
+    else:
+        # Crisp Offline NWS WSR-88D Station PPI Scope Fallback
+        cx, cy = W * 0.5 + pan_xy[0], (H + 24.0) * 0.5 + pan_xy[1]
+        r_max = min(W - 40.0, H - 68.0) * 0.46 * zoom_f
+
+        cr.save()
+        cr.arc(cx, cy, r_max, 0, 2 * math.pi)
+        cr.set_source_rgb(0.02, 0.08, 0.05)
+        cr.fill_preserve()
+        cr.clip()
+
+        # Range rings & radials
+        for rf, km_lbl in ((0.25, "60km"), (0.50, "120km"), (0.75, "180km"), (1.0, "240km")):
+            cr.new_sub_path()
+            cr.arc(cx, cy, r_max * rf, 0, 2 * math.pi)
+            cr.set_line_width(1.1)
+            cr.set_source_rgba(0.20, 0.78, 0.42, 0.52)
+            cr.stroke()
+            cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            cr.set_font_size(8.0)
+            cr.set_source_rgba(0.45, 0.95, 0.65, 0.8)
+            cr.move_to(cx + 4, cy - r_max * rf + 10)
+            cr.show_text(km_lbl)
+
+        for ang_d in range(0, 360, 30):
+            ra = math.radians(ang_d)
+            cr.move_to(cx, cy)
+            cr.line_to(cx + r_max * math.cos(ra), cy + r_max * math.sin(ra))
+            cr.set_line_width(0.8)
+            cr.set_source_rgba(0.18, 0.66, 0.38, 0.34)
+            cr.stroke()
+
+        render_synthetic_nexrad_echoes(cr, cx, cy, r_max / 180.0, frame_idx % 6, 6)
+        if ppi_on:
+            render_ppi_sweep_overlay(cr, cx, cy, r_max, sweep_deg)
+        cr.restore()
+
+        cr.arc(cx, cy, r_max, 0, 2 * math.pi)
+        cr.set_line_width(2.2)
+        cr.set_source_rgb(0.32, 0.78, 0.52)
+        cr.stroke()
+        draw_dbz_legend_bar(cr, 14, H - 22, min(330.0, W - 28.0), 13.0)
+        frame_txt = f"SIM FRAME {(frame_idx % 6) + 1}/6"
+
+    # Top VFD Header
+    cr.rectangle(8, 8, W - 16, 24)
+    cr.set_source_rgba(0.02, 0.07, 0.08, 0.88)
+    cr.fill()
+    cr.set_line_width(1.0)
+    cr.set_source_rgba(0.26, 0.64, 0.58, 0.75)
+    cr.rectangle(8, 8, W - 16, 24)
+    cr.stroke()
+
+    site_desc = RIDGE_MAP.get(site_u, (site_u, 0.0, 0.0))[0]
+    cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    cr.set_font_size(9.2)
+    cr.set_source_rgb(0.32, 0.98, 0.84)
+    cr.move_to(15, 23)
+    cr.show_text(f"NWS RIDGE II  |  {site_desc}  |  {frame_txt}")
+
+    ext = cr.text_extents(engine.ridge_status)
+    cr.set_source_rgb(1.0, 0.76, 0.26)
+    cr.move_to(W - ext.width - 15, 23)
+    cr.show_text(engine.ridge_status)
+
+
+def render_view_goes_satellite(
+    cr: cairo.Context,
+    W: float,
+    H: float,
+    engine: RadarDataEngine,
+    goes_key: str,
+    zoom_f: float,
+    pan_xy: tuple[float, float],
+    cfg: dict[str, Any],
+):
+    draw_crt_bezel_frame(cr, W, H)
+    lbl, _url = GOES_MAP.get(goes_key, GOES_MAP[DEFAULT_GOES_KEY])
+    surf = engine.sat_surfaces.get(goes_key)
+
+    if surf is not None:
+        sw, sh = float(surf.get_width()), float(surf.get_height())
+        fit_s = min((W - 16.0) / max(1.0, sw), (H - 44.0) / max(1.0, sh)) * zoom_f
+        tx = W * 0.5 - (sw * fit_s) * 0.5 + pan_xy[0]
+        ty = (H + 28.0) * 0.5 - (sh * fit_s) * 0.5 + pan_xy[1]
+
+        cr.save()
+        cr.rectangle(4, 34, W - 8, H - 38)
+        cr.clip()
+        cr.translate(tx, ty)
+        cr.scale(fit_s, fit_s)
+        cr.set_source_surface(surf, 0, 0)
+        cr.paint()
+        cr.restore()
+        src_badge = engine.sat_timestamps.get(goes_key, "LIVE NESDIS STAR")
+    else:
+        # Procedural Geostationary / Polar Satellite Offline Visualization
+        cx, cy = W * 0.5 + pan_xy[0], (H + 26.0) * 0.5 + pan_xy[1]
+        cr.save()
+        cr.rectangle(4, 34, W - 8, H - 38)
+        cr.clip()
+
+        # Deep space backdrop
+        cr.rectangle(4, 34, W - 8, H - 38)
+        cr.set_source_rgb(0.02, 0.03, 0.06)
+        cr.fill()
+
+        if "aurora" in goes_key or "fd" in goes_key:
+            rad = min(W, H - 44.0) * 0.43 * zoom_f
+            globe = cairo.RadialGradient(cx - rad * 0.25, cy - rad * 0.25, rad * 0.1, cx, cy, rad)
+            if "aurora" in goes_key:
+                globe.add_color_stop_rgb(0.0, 0.08, 0.14, 0.24)
+                globe.add_color_stop_rgb(1.0, 0.03, 0.06, 0.12)
+            else:
+                globe.add_color_stop_rgb(0.0, 0.10, 0.26, 0.46)
+                globe.add_color_stop_rgb(0.85, 0.05, 0.14, 0.28)
+                globe.add_color_stop_rgb(1.0, 0.18, 0.48, 0.78)
+            cr.arc(cx, cy, rad, 0, 2 * math.pi)
+            cr.set_source(globe)
+            cr.fill()
+
+            # Orthographic continents
+            c_lat0 = 72.0 if "aurora" in goes_key else 22.0
+            c_lon0 = -105.0 if "aurora" in goes_key else -135.0
+            lat0_r, lon0_r = math.radians(c_lat0), math.radians(c_lon0)
+            for is_hole, pts in WORLD_POLYGONS:
+                if is_hole:
+                    continue
+                started = False
+                cr.new_path()
+                for lo, la in pts[::2]:
+                    la_r, lo_r = math.radians(la), math.radians(lo)
+                    cos_c = math.sin(lat0_r) * math.sin(la_r) + math.cos(lat0_r) * math.cos(la_r) * math.cos(lo_r - lon0_r)
+                    if cos_c <= 0.0:
+                        started = False
+                        continue
+                    px = cx + rad * math.cos(la_r) * math.sin(lo_r - lon0_r)
+                    py = cy - rad * (math.cos(lat0_r) * math.sin(la_r) - math.sin(lat0_r) * math.cos(la_r) * math.cos(lo_r - lon0_r))
+                    if not started:
+                        cr.move_to(px, py)
+                        started = True
+                    else:
+                        cr.line_to(px, py)
+                cr.set_source_rgba(0.18, 0.34, 0.24, 0.85)
+                cr.fill()
+
+            if "aurora" in goes_key:
+                # Glowing green/red geomagnetic auroral oval around ~66°N magnetic pole
+                ax, ay = cx, cy + rad * 0.08
+                for rw_f, al_f, col in (
+                    (0.46, 0.22, (0.12, 0.95, 0.46)),
+                    (0.39, 0.48, (0.24, 1.00, 0.52)),
+                    (0.34, 0.30, (0.85, 0.98, 0.26)),
+                ):
+                    cr.set_line_width(rad * 0.11)
+                    cr.set_source_rgba(col[0], col[1], col[2], al_f)
+                    cr.arc(ax, ay, rad * rw_f, 0, 2 * math.pi)
+                    cr.stroke()
+            else:
+                # Frontal cloud swirl bands
+                for dy_f, rot_f in ((-0.35, -0.2), (0.08, 0.12), (0.38, 0.25)):
+                    cr.save()
+                    cr.translate(cx, cy + rad * dy_f)
+                    cr.rotate(rot_f)
+                    cr.scale(rad * 0.78, rad * 0.14)
+                    cr.arc(0, 0, 1.0, 0, 2 * math.pi)
+                    cr.restore()
+                    cr.set_source_rgba(0.92, 0.96, 1.0, 0.34)
+                    cr.fill()
+        else:
+            # Regional Northern Rockies / CONUS Sector Synthetic IR / WV / GeoColor
+            lat_span = 16.0 if "nr" in goes_key or "pnw" in goes_key else 28.0
+            lon_span = 24.0 if "nr" in goes_key or "pnw" in goes_key else 56.0
+            lat_mid = 44.0 if "nr" in goes_key else (46.0 if "pnw" in goes_key else 38.5)
+            lon_mid = -112.5 if "nr" in goes_key else (-120.5 if "pnw" in goes_key else -97.0)
+
+            def sec_xy(la: float, lo: float) -> tuple[float, float]:
+                sx = cx + ((lo - lon_mid) / lon_span) * (W * 0.88 * zoom_f)
+                sy = cy - ((la - lat_mid) / lat_span) * ((H - 54.0) * 0.88 * zoom_f)
+                return sx, sy
+
+            # Base terrain / radiative background
+            cr.rectangle(10, 38, W - 20, H - 46)
+            if "ir13" in goes_key:
+                cr.set_source_rgb(0.14, 0.15, 0.17)
+            elif "wv09" in goes_key:
+                cr.set_source_rgb(0.06, 0.14, 0.24)
+            else:
+                cr.set_source_rgb(0.11, 0.18, 0.15)
+            cr.fill()
+
+            # Synthetic comma-head frontal cloud deck
+            for i_c in range(6):
+                clat = lat_mid - 2.5 + i_c * 1.3
+                clon = lon_mid - 6.0 + i_c * 2.1
+                csx, csy = sec_xy(clat, clon)
+                cr.save()
+                cr.translate(csx, csy)
+                cr.rotate(-0.42)
+                cr.scale(95.0 * zoom_f, 34.0 * zoom_f)
+                cr.arc(0, 0, 1.0, 0, 2 * math.pi)
+                cr.restore()
+                if "ir13" in goes_key:
+                    cr.set_source_rgba(0.22, 0.82, 0.96, 0.30)
+                elif "wv09" in goes_key:
+                    cr.set_source_rgba(0.36, 0.96, 0.82, 0.28)
+                else:
+                    cr.set_source_rgba(0.90, 0.95, 1.0, 0.32)
+                cr.fill()
+
+            # Crisp NOAA Cyan/Gold Geopolitical State Outlines (classic NESDIS sector map overlay)
+            cr.set_line_width(1.3)
+            cr.set_source_rgba(0.96, 0.82, 0.34, 0.80)
+            for poly in US_BORDER_POLYLINES:
+                for i, (lo, la) in enumerate(poly):
+                    sx, sy = sec_xy(la, lo)
+                    if i == 0:
+                        cr.move_to(sx, sy)
+                    else:
+                        cr.line_to(sx, sy)
+                cr.stroke()
+
+            qx, qy = sec_xy(float(cfg.get("lat", DEFAULT_LAT)), float(cfg.get("lon", DEFAULT_LON)))
+            cr.set_source_rgb(0.32, 0.98, 0.84)
+            cr.arc(qx, qy, 4.0, 0, 2 * math.pi)
+            cr.fill()
+            cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            cr.set_font_size(8.8)
+            cr.move_to(qx + 7, qy + 3)
+            cr.show_text(f"{cfg.get('callsign', DEFAULT_CALLSIGN)} ({cfg.get('grid', DEFAULT_GRID)})")
+
+        cr.restore()
+        src_badge = "OFFLINE SECTOR SYNTHESIS"
+
+    # Top VFD Header
+    cr.rectangle(8, 8, W - 16, 24)
+    cr.set_source_rgba(0.02, 0.07, 0.08, 0.88)
+    cr.fill()
+    cr.set_line_width(1.0)
+    cr.set_source_rgba(0.26, 0.64, 0.58, 0.75)
+    cr.rectangle(8, 8, W - 16, 24)
+    cr.stroke()
+
+    cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    cr.set_font_size(9.0)
+    cr.set_source_rgb(0.32, 0.98, 0.84)
+    cr.move_to(15, 23)
+    cr.show_text(f"{lbl}  |  ZOOM {zoom_f:.1f}x")
+
+    ext = cr.text_extents(src_badge)
+    cr.set_source_rgb(1.0, 0.76, 0.26)
+    cr.move_to(W - ext.width - 15, 23)
+    cr.show_text(src_badge)
+
+
+def render_view_hf_solar_desk(
+    cr: cairo.Context, W: float, H: float, solar: dict[str, Any]
+):
+    """Render NOAA SWPC 6h GOES X-Ray Flux chart, Planetary Kp bars, Telemetry & HF Band Matrix."""
+    cr.rectangle(0, 0, W, H)
+    cr.set_source_rgb(0.03, 0.06, 0.08)
+    cr.fill()
+
+    cond = solar["cond"]
+    cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+
+    # 1. Top VFD Telemetry Strip
+    cr.rectangle(8, 7, W - 16, 42)
+    cr.set_source_rgb(0.02, 0.08, 0.08)
+    cr.fill()
+    cr.set_line_width(1.2)
+    cr.set_source_rgb(0.24, 0.58, 0.54)
+    cr.rectangle(8, 7, W - 16, 42)
+    cr.stroke()
+
+    metrics = [
+        ("10.7cm SFI", f"{solar['sfi']:.0f}", (0.34, 0.99, 0.84)),
+        ("SUNSPOTS", f"{int(solar['ssn'])}", (0.52, 0.96, 0.74)),
+        ("A-INDEX", f"{solar['a_index']:.0f}", (0.98, 0.84, 0.32)),
+        ("PLANETARY Kp", f"{solar['kp']:.2f}", (0.36, 0.96, 0.52) if solar["kp"] < 4.0 else (1.0, 0.52, 0.24)),
+        ("GOES X-RAY", f"{cond['xray_class']}", (1.0, 0.76, 0.24)),
+        ("SOLAR WIND", f"{solar['solar_wind_kms']:.0f} km/s", (0.56, 0.88, 0.98)),
+        ("IMF Bz", f"{solar['bz_nt']:+.1f} nT", (1.0, 0.42, 0.42) if solar["bz_nt"] <= -5.0 else (0.48, 0.96, 0.78)),
+    ]
+    cell_w = (W - 28.0) / len(metrics)
+    for i, (mlbl, mval, mcol) in enumerate(metrics):
+        mx = 16.0 + i * cell_w
+        cr.set_font_size(7.6)
+        cr.set_source_rgb(0.46, 0.74, 0.70)
+        cr.move_to(mx, 20)
+        cr.show_text(mlbl)
+        cr.set_font_size(12.0)
+        cr.set_source_rgb(*mcol)
+        cr.move_to(mx, 39)
+        cr.show_text(mval)
+
+    # Split main area: Left 54% = X-Ray Log Chart (top) + Kp Bar Graph (bottom); Right 46% = HF Matrix
+    top_y = 56.0
+    avail_h = H - top_y - 8.0
+    left_w = max(310.0, (W - 24.0) * 0.54)
+    right_x = 16.0 + left_w
+    right_w = W - right_x - 8.0
+
+    xr_h = avail_h * 0.56
+    kp_y = top_y + xr_h + 7.0
+    kp_h = avail_h - xr_h - 7.0
+
+    # ---- 2. 6-Hour GOES X-Ray Flare Flux Logarithmic Chart (A / B / C / M / X) ----
+    cr.rectangle(8, top_y, left_w, xr_h)
+    cr.set_source_rgb(0.02, 0.05, 0.07)
+    cr.fill()
+    cr.set_source_rgb(0.22, 0.46, 0.52)
+    cr.set_line_width(1.0)
+    cr.rectangle(8, top_y, left_w, xr_h)
+    cr.stroke()
+
+    cr.set_font_size(8.6)
+    cr.set_source_rgb(0.45, 0.96, 0.86)
+    cr.move_to(15, top_y + 14)
+    cr.show_text("GOES PRIMARY X-RAY FLUX (6-HR LOG W/m²)")
+    r_code, r_txt = cond["r_scale"]
+    r_badge = f"{r_code} {r_txt}  PEAK {format_xray_class(solar['xray_peak'])}"
+    rext = cr.text_extents(r_badge)
+    cr.set_source_rgb(1.0, 0.45, 0.35) if r_code != "R0" else cr.set_source_rgb(0.42, 0.88, 0.68)
+    cr.move_to(8 + left_w - rext.width - 8, top_y + 14)
+    cr.show_text(r_badge)
+
+    gx0, gy0 = 42.0, top_y + 22.0
+    gw, gh = left_w - 58.0, xr_h - 36.0
+    log_min, log_max = -9.0, -3.0  # 10^-9 to 10^-3 W/m^2
+
+    def flux_to_y(fl: float) -> float:
+        lv = max(log_min, min(log_max, math.log10(max(1e-9, fl))))
+        return gy0 + gh * (1.0 - (lv - log_min) / (log_max - log_min))
+
+    flare_classes = [
+        (-8.0, "A", (0.28, 0.68, 0.52)),
+        (-7.0, "B", (0.34, 0.82, 0.58)),
+        (-6.0, "C", (0.94, 0.84, 0.26)),
+        (-5.0, "M", (0.98, 0.52, 0.18)),
+        (-4.0, "X", (0.98, 0.22, 0.24)),
+    ]
+    cr.set_font_size(7.8)
+    for exp_v, cls_lbl, ccol in flare_classes:
+        yy = gy0 + gh * (1.0 - (exp_v - log_min) / (log_max - log_min))
+        cr.set_line_width(0.8)
+        cr.set_source_rgba(ccol[0], ccol[1], ccol[2], 0.34)
+        cr.move_to(gx0, yy)
+        cr.line_to(gx0 + gw, yy)
+        cr.stroke()
+        cr.set_source_rgb(0.56, 0.72, 0.78)
+        cr.move_to(12, yy + 3)
+        cr.show_text(f"1e{int(exp_v)}")
+        cr.set_source_rgb(*ccol)
+        cr.move_to(gx0 + gw + 4, yy + 3)
+        cr.show_text(cls_lbl)
+
+    xr_long = solar.get("xray_long") or []
+    xr_short = solar.get("xray_short") or []
+    if len(xr_long) >= 2:
+        t0, t1 = xr_long[0][0], max(xr_long[0][0] + 1.0, xr_long[-1][0])
+        if len(xr_short) >= 2:
+            cr.set_line_width(1.2)
+            cr.set_source_rgba(0.42, 0.64, 1.0, 0.78)
+            for i, (ts, fv) in enumerate(xr_short):
+                px = gx0 + ((ts - t0) / (t1 - t0)) * gw
+                py = flux_to_y(fv)
+                if i == 0:
+                    cr.move_to(px, py)
+                else:
+                    cr.line_to(px, py)
+            cr.stroke()
+
+        # Glowing primary 0.1-0.8nm curve
+        cr.set_line_width(2.0)
+        cr.set_source_rgb(1.0, 0.66, 0.20)
+        for i, (ts, fv) in enumerate(xr_long):
+            px = gx0 + ((ts - t0) / (t1 - t0)) * gw
+            py = flux_to_y(fv)
+            if i == 0:
+                cr.move_to(px, py)
+            else:
+                cr.line_to(px, py)
+        cr.stroke()
+
+        # Time axis ticks (-6h .. NOW)
+        cr.set_font_size(7.4)
+        cr.set_source_rgb(0.52, 0.72, 0.76)
+        for frac in (0.0, 0.33, 0.67, 1.0):
+            ts_tick = t0 + frac * (t1 - t0)
+            lbl_t = datetime.datetime.fromtimestamp(ts_tick, tz=datetime.timezone.utc).strftime("%H:%MZ")
+            tx = gx0 + frac * gw
+            cr.move_to(max(gx0, min(gx0 + gw - 34, tx - 14)), gy0 + gh + 11)
+            cr.show_text(lbl_t)
+
+    # ---- 3. Planetary Kp 3-Hour Geomagnetic Bar Graph ----
+    cr.rectangle(8, kp_y, left_w, kp_h)
+    cr.set_source_rgb(0.02, 0.05, 0.07)
+    cr.fill()
+    cr.set_source_rgb(0.22, 0.46, 0.52)
+    cr.set_line_width(1.0)
+    cr.rectangle(8, kp_y, left_w, kp_h)
+    cr.stroke()
+
+    cr.set_font_size(8.6)
+    cr.set_source_rgb(0.45, 0.96, 0.86)
+    cr.move_to(15, kp_y + 14)
+    cr.show_text("PLANETARY Kp 3-HR GEOMAGNETIC INDEX")
+    g_code, g_txt = cond["g_scale"]
+    g_badge = f"{g_code} {g_txt}"
+    gext = cr.text_extents(g_badge)
+    cr.set_source_rgb(0.38, 0.95, 0.58) if g_code == "G0" else cr.set_source_rgb(1.0, 0.48, 0.24)
+    cr.move_to(8 + left_w - gext.width - 8, kp_y + 14)
+    cr.show_text(g_badge)
+
+    bx0, by0 = 32.0, kp_y + 22.0
+    bw_tot, bh_tot = left_w - 42.0, kp_h - 36.0
+    for kv_ref in (3, 5, 7, 9):
+        yy = by0 + bh_tot * (1.0 - kv_ref / 9.0)
+        cr.set_line_width(0.7)
+        cr.set_source_rgba(0.35, 0.55, 0.62, 0.35)
+        cr.move_to(bx0, yy)
+        cr.line_to(bx0 + bw_tot, yy)
+        cr.stroke()
+        cr.set_font_size(7.4)
+        cr.set_source_rgb(0.58, 0.74, 0.80)
+        cr.move_to(14, yy + 3)
+        cr.show_text(f"K{kv_ref}")
+
+    kp_bars = solar.get("kp_bars") or []
+    if kp_bars:
+        slot_w = bw_tot / len(kp_bars)
+        for i, (klbl, kval) in enumerate(kp_bars):
+            kv_c = max(0.2, min(9.0, float(kval)))
+            bh = (kv_c / 9.0) * bh_tot
+            sx = bx0 + i * slot_w + 4.0
+            sw = max(8.0, slot_w - 8.0)
+            sy = by0 + bh_tot - bh
+            if kv_c < 4.0:
+                bcol = (0.18, 0.86, 0.44)
+            elif kv_c < 5.0:
+                bcol = (0.96, 0.84, 0.20)
+            elif kv_c < 6.0:
+                bcol = (0.98, 0.52, 0.16)
+            else:
+                bcol = (0.96, 0.20, 0.24)
+            cr.rectangle(sx, sy, sw, bh)
+            cr.set_source_rgb(*bcol)
+            cr.fill()
+
+            cr.set_font_size(7.5)
+            cr.set_source_rgb(0.90, 0.96, 0.98)
+            cr.move_to(sx + 1, max(by0 + 8, sy - 3))
+            cr.show_text(f"{kval:.1f}")
+            if i % 2 == 0 or i == len(kp_bars) - 1:
+                cr.set_font_size(7.0)
+                cr.set_source_rgb(0.55, 0.74, 0.78)
+                cr.move_to(sx - 2, by0 + bh_tot + 10)
+                cr.show_text(klbl[:5])
+
+    # ---- 4. Right Pane: HF Amateur Band Condition Matrix (80m..6m) + VHF ----
+    cr.rectangle(right_x, top_y, right_w, avail_h)
+    cr.set_source_rgb(0.02, 0.05, 0.07)
+    cr.fill()
+    cr.set_source_rgb(0.22, 0.46, 0.52)
+    cr.set_line_width(1.0)
+    cr.rectangle(right_x, top_y, right_w, avail_h)
+    cr.stroke()
+
+    cr.set_font_size(8.8)
+    cr.set_source_rgb(0.45, 0.96, 0.86)
+    cr.move_to(right_x + 10, top_y + 15)
+    cr.show_text("HF AMATEUR BAND CONDITIONS")
+
+    # Column Headers
+    hdr_y = top_y + 31.0
+    col_day_x = right_x + right_w * 0.46
+    col_nit_x = right_x + right_w * 0.73
+    cr.set_font_size(7.8)
+    cr.set_source_rgb(0.62, 0.80, 0.84)
+    cr.move_to(right_x + 10, hdr_y)
+    cr.show_text("BAND / MHz")
+    cr.move_to(col_day_x + 8, hdr_y)
+    cr.show_text("DAY")
+    cr.move_to(col_nit_x + 4, hdr_y)
+    cr.show_text("NIGHT")
+
+    pill_colors = {
+        "GOOD": ((0.10, 0.44, 0.26), (0.38, 1.00, 0.66)),
+        "FAIR": ((0.46, 0.34, 0.08), (1.00, 0.82, 0.28)),
+        "POOR": ((0.44, 0.12, 0.14), (1.00, 0.44, 0.46)),
+    }
+
+    bands = cond["bands"]
+    matrix_h = avail_h - 92.0
+    row_h = max(21.0, matrix_h / max(1, len(bands)))
+    pill_w = max(46.0, right_w * 0.22)
+
+    for idx, brow in enumerate(bands):
+        ry = hdr_y + 6.0 + idx * row_h
+        if idx % 2 == 0:
+            cr.rectangle(right_x + 4, ry, right_w - 8, row_h - 1)
+            cr.set_source_rgba(0.08, 0.15, 0.18, 0.45)
+            cr.fill()
+
+        cr.set_font_size(9.0)
+        cr.set_source_rgb(0.88, 0.95, 0.98)
+        cr.move_to(right_x + 10, ry + row_h * 0.68)
+        cr.show_text(f"{brow['band']:>3s}")
+        cr.set_font_size(7.5)
+        cr.set_source_rgb(0.48, 0.68, 0.74)
+        cr.move_to(right_x + 44, ry + row_h * 0.68)
+        cr.show_text(brow["freq"])
+
+        for px_col, st_val in ((col_day_x, brow["day"]), (col_nit_x, brow["night"])):
+            bg_c, fg_c = pill_colors.get(st_val, pill_colors["FAIR"])
+            cr.rectangle(px_col, ry + 2.0, pill_w, row_h - 5.0)
+            cr.set_source_rgb(*bg_c)
+            cr.fill_preserve()
+            cr.set_line_width(1.0)
+            cr.set_source_rgba(fg_c[0], fg_c[1], fg_c[2], 0.65)
+            cr.stroke()
+            cr.set_font_size(8.2)
+            cr.set_source_rgb(*fg_c)
+            ext = cr.text_extents(st_val)
+            cr.move_to(px_col + (pill_w - ext.width) * 0.5, ry + row_h * 0.68)
+            cr.show_text(st_val)
+
+    # VHF Propagation Box at bottom of Right Pane
+    vy0 = hdr_y + 10.0 + len(bands) * row_h
+    vh_box = max(38.0, top_y + avail_h - vy0 - 6.0)
+    cr.rectangle(right_x + 6, vy0, right_w - 12, vh_box)
+    cr.set_source_rgb(0.04, 0.10, 0.12)
+    cr.fill()
+    cr.set_source_rgba(0.28, 0.62, 0.60, 0.6)
+    cr.set_line_width(1.0)
+    cr.rectangle(right_x + 6, vy0, right_w - 12, vh_box)
+    cr.stroke()
+
+    cr.set_font_size(8.0)
+    cr.set_source_rgb(0.46, 0.96, 0.84)
+    cr.move_to(right_x + 12, vy0 + 13)
+    cr.show_text(f"VHF AURORA : {cond['vhf_aurora']}")
+    cr.set_source_rgb(1.0, 0.80, 0.32)
+    cr.move_to(right_x + 12, vy0 + 27)
+    cr.show_text(f"6m/2m E-SKIP: {cond['vhf_eskip']}")
+    cr.set_font_size(7.2)
+    cr.set_source_rgb(0.52, 0.72, 0.76)
+    cr.move_to(right_x + 12, vy0 + min(vh_box - 4.0, 40.0))
+    cr.show_text(f"FEED: {solar.get('source', 'SWPC')} ({solar.get('updated_utc', '')})")
+
+
+# ---------------------------------------------------------------------------
+# 3 Warm Backlit Analog Weather Instruments Renderer
+# (1. BAROMETER inHg/hPa, 2. WIND COMPASS & KT/MPH, 3. TEMP / DEWPOINT / RH%)
+# ---------------------------------------------------------------------------
+def _draw_incandescent_dial_face(cr: cairo.Context, cx: float, cy: float, r: float):
+    # Machined outer brass/charcoal bezel
+    cr.arc(cx, cy, r + 4.5, 0, 2 * math.pi)
+    cr.set_source_rgb(0.08, 0.09, 0.12)
+    cr.fill()
+
+    rim = cairo.LinearGradient(cx - r, cy - r, cx + r, cy + r)
+    rim.add_color_stop_rgb(0.0, 0.68, 0.60, 0.42)
+    rim.add_color_stop_rgb(0.5, 0.34, 0.31, 0.25)
+    rim.add_color_stop_rgb(1.0, 0.54, 0.47, 0.32)
+    cr.arc(cx, cy, r + 2.2, 0, 2 * math.pi)
+    cr.set_source(rim)
+    cr.fill()
+
+    # Warm incandescent cream radial lamp face
+    glow = cairo.RadialGradient(cx, cy + r * 0.25, r * 0.08, cx, cy, r * 1.05)
+    glow.add_color_stop_rgb(0.0, 1.00, 0.95, 0.78)
+    glow.add_color_stop_rgb(0.68, 0.96, 0.86, 0.58)
+    glow.add_color_stop_rgb(1.0, 0.82, 0.68, 0.39)
+    cr.arc(cx, cy, r, 0, 2 * math.pi)
+    cr.set_source(glow)
+    cr.fill()
+
+
+def _draw_vfd_box(cr: cairo.Context, x: float, y: float, w: float, h: float):
+    cr.rectangle(x, y, w, h)
+    cr.set_source_rgb(0.03, 0.08, 0.08)
+    cr.fill()
+    cr.set_line_width(1.5)
+    cr.set_source_rgb(0.01, 0.03, 0.03)
+    cr.move_to(x, y + h)
+    cr.line_to(x, y)
+    cr.line_to(x + w, y)
+    cr.stroke()
+    cr.set_source_rgb(0.32, 0.38, 0.46)
+    cr.move_to(x, y + h)
+    cr.line_to(x + w, y + h)
+    cr.line_to(x + w, y)
+    cr.stroke()
+
+
+def render_weather_instrument_cluster(
+    cr: cairo.Context,
+    W: float,
+    H: float,
+    metar: dict[str, Any],
+    anim_baro_inhg: float,
+    anim_wind_deg: float,
+    anim_temp_f: float,
+    anim_dew_f: float,
+):
+    cr.rectangle(0, 0, W, H)
+    cr.set_source_rgb(0.16, 0.18, 0.22)
+    cr.fill()
+
+    pad = 5.0
+    mod_h = (H - pad * 4.0) / 3.0
+    mod_w = W - pad * 2.0
+    cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+
+    # =========================================================================
+    # MODULE 1: BAROMETER (28.5 .. 31.0 inHg + hPa, STORM / CHANGE / FAIR)
+    # =========================================================================
+    y0 = pad
+    cr.rectangle(pad, y0, mod_w, mod_h)
+    cr.set_source_rgb(0.11, 0.13, 0.16)
+    cr.fill()
+    cr.set_line_width(1.2)
+    cr.set_source_rgb(0.35, 0.39, 0.48)
+    cr.rectangle(pad, y0, mod_w, mod_h)
+    cr.stroke()
+
+    r = min((mod_h - 18.0) * 0.5, 62.0)
+    cx = pad + r + 10.0
+    cy = y0 + mod_h * 0.5 + 1.0
+    _draw_incandescent_dial_face(cr, cx, cy, r)
+
+    # 28.5 .. 31.0 inHg across 260 degrees (140° .. 400°)
+    a_start = math.radians(140.0)
+    a_span = math.radians(260.0)
+
+    def baro_ang(inhg: float) -> float:
+        frac = max(0.0, min(1.0, (inhg - 28.5) / 2.5))
+        return a_start + frac * a_span
+
+    cr.set_line_width(1.8)
+    cr.set_source_rgb(0.20, 0.16, 0.10)
+    cr.arc(cx, cy, r * 0.80, a_start, a_start + a_span)
+    cr.stroke()
+
+    for step_i in range(26):
+        val = 28.5 + step_i * 0.1
+        ang = baro_ang(val)
+        is_maj = (step_i % 5 == 0)
+        r_in = r * (0.68 if is_maj else 0.74)
+        cr.set_line_width(1.6 if is_maj else 0.9)
+        cr.set_source_rgb(0.18, 0.14, 0.08)
+        cr.move_to(cx + r_in * math.cos(ang), cy + r_in * math.sin(ang))
+        cr.line_to(cx + r * 0.82 * math.cos(ang), cy + r * 0.82 * math.sin(ang))
+        cr.stroke()
+        if is_maj:
+            cr.set_font_size(7.2)
+            lbl = f"{val:.1f}"
+            ext = cr.text_extents(lbl)
+            tx = cx + r * 0.53 * math.cos(ang)
+            ty = cy + r * 0.53 * math.sin(ang)
+            cr.move_to(tx - ext.width * 0.5, ty + ext.height * 0.4)
+            cr.show_text(lbl)
+
+    # Engraved Brass STORM / CHANGE / FAIR legends
+    cr.set_font_size(6.4)
+    cr.set_source_rgb(0.58, 0.22, 0.10)
+    cr.move_to(cx - r * 0.43, cy + r * 0.18)
+    cr.show_text("STORM")
+    cr.set_source_rgb(0.46, 0.32, 0.10)
+    ext_ch = cr.text_extents("CHANGE")
+    cr.move_to(cx - ext_ch.width * 0.5, cy - r * 0.20)
+    cr.show_text("CHANGE")
+    cr.set_source_rgb(0.14, 0.44, 0.22)
+    cr.move_to(cx + r * 0.14, cy + r * 0.18)
+    cr.show_text("FAIR")
+    cr.set_source_rgb(0.28, 0.22, 0.12)
+    ext_u = cr.text_extents("inHg")
+    cr.move_to(cx - ext_u.width * 0.5, cy + r * 0.52)
+    cr.show_text("inHg")
+
+    # Standard 29.92 gold set-hand + crimson active pressure needle
+    ang_std = baro_ang(29.92)
+    cr.set_line_width(1.4)
+    cr.set_source_rgba(0.76, 0.54, 0.12, 0.85)
+    cr.move_to(cx, cy)
+    cr.line_to(cx + r * 0.76 * math.cos(ang_std), cy + r * 0.76 * math.sin(ang_std))
+    cr.stroke()
+
+    ang_b = baro_ang(anim_baro_inhg)
+    cr.set_line_width(2.3)
+    cr.set_source_rgb(0.78, 0.12, 0.12)
+    cr.move_to(cx - r * 0.16 * math.cos(ang_b), cy - r * 0.16 * math.sin(ang_b))
+    cr.line_to(cx + r * 0.82 * math.cos(ang_b), cy + r * 0.82 * math.sin(ang_b))
+    cr.stroke()
+    cr.arc(cx, cy, 4.5, 0, 2 * math.pi)
+    cr.set_source_rgb(0.22, 0.18, 0.14)
+    cr.fill()
+
+    # Right VFD Box for Barometer
+    vx = cx + r + 10.0
+    vw = max(110.0, W - vx - pad - 6.0)
+    vy = y0 + 7.0
+    vh = mod_h - 14.0
+    _draw_vfd_box(cr, vx, vy, vw, vh)
+
+    cr.set_font_size(8.2)
+    cr.set_source_rgb(0.46, 0.88, 0.80)
+    cr.move_to(vx + 8, vy + 15)
+    cr.show_text("BAROMETER / ALTIM")
+    cr.set_font_size(18.0)
+    cr.set_source_rgb(0.28, 0.99, 0.86)
+    cr.move_to(vx + 8, vy + 40)
+    cr.show_text(f"{metar['altim_inhg']:05.2f}")
+    cr.set_font_size(9.0)
+    cr.move_to(vx + 72, vy + 40)
+    cr.show_text("inHg")
+
+    cr.set_font_size(11.0)
+    cr.set_source_rgb(1.0, 0.76, 0.26)
+    cr.move_to(vx + 8, vy + 62)
+    cr.show_text(f"{metar['altim_hpa']:.1f} hPa")
+
+    cr.set_font_size(8.5)
+    cr.set_source_rgb(0.55, 0.96, 0.78)
+    cr.move_to(vx + 8, vy + 82)
+    cr.show_text(f"TREND: {metar['tendency']}")
+    cr.set_font_size(7.8)
+    cr.set_source_rgb(0.44, 0.74, 0.70)
+    cr.move_to(vx + 8, vy + min(vh - 6.0, 102.0))
+    cr.show_text(f"OBS {metar['station']} {metar['obs_time']}")
+
+    # =========================================================================
+    # MODULE 2: WIND COMPASS & KT/MPH (360° Compass Rose + Digital Gust VFD)
+    # =========================================================================
+    y1 = pad * 2.0 + mod_h
+    cr.rectangle(pad, y1, mod_w, mod_h)
+    cr.set_source_rgb(0.11, 0.13, 0.16)
+    cr.fill()
+    cr.set_line_width(1.2)
+    cr.set_source_rgb(0.35, 0.39, 0.48)
+    cr.rectangle(pad, y1, mod_w, mod_h)
+    cr.stroke()
+
+    cy2 = y1 + mod_h * 0.5 + 1.0
+    _draw_incandescent_dial_face(cr, cx, cy2, r)
+
+    # 360° Compass Rose (0° North at top = -90° Cairo angle)
+    for deg_i in range(0, 360, 15):
+        ra = math.radians(deg_i - 90.0)
+        is_card = (deg_i % 90 == 0)
+        is_inter = (deg_i % 45 == 0)
+        r_in = r * (0.68 if is_card else (0.74 if is_inter else 0.80))
+        cr.set_line_width(1.8 if is_card else 0.9)
+        cr.set_source_rgb(0.76, 0.14, 0.12) if deg_i == 0 else cr.set_source_rgb(0.18, 0.14, 0.08)
+        cr.move_to(cx + r_in * math.cos(ra), cy2 + r_in * math.sin(ra))
+        cr.line_to(cx + r * 0.86 * math.cos(ra), cy2 + r * 0.86 * math.sin(ra))
+        cr.stroke()
+
+    for deg_c, clbl in ((0, "N"), (90, "E"), (180, "S"), (270, "W"), (45, "NE"), (135, "SE"), (225, "SW"), (315, "NW")):
+        ra = math.radians(deg_c - 90.0)
+        cr.set_font_size(8.8 if len(clbl) == 1 else 6.8)
+        cr.set_source_rgb(0.78, 0.12, 0.12) if clbl == "N" else cr.set_source_rgb(0.20, 0.16, 0.10)
+        ext = cr.text_extents(clbl)
+        rr = r * (0.50 if len(clbl) == 1 else 0.54)
+        cr.move_to(cx + rr * math.cos(ra) - ext.width * 0.5, cy2 + rr * math.sin(ra) + ext.height * 0.4)
+        cr.show_text(clbl)
+
+    # Directional Wind Arrow Needle
+    if metar["wind_kt"] >= 0.5:
+        wa = math.radians(anim_wind_deg - 90.0)
+        if metar["gust_kt"] > metar["wind_kt"]:
+            cr.new_sub_path()
+            cr.arc(cx, cy2, r * 0.83, wa - 0.24, wa + 0.24)
+            cr.set_line_width(3.0)
+            cr.set_source_rgba(0.92, 0.42, 0.12, 0.55)
+            cr.stroke()
+
+        tip_x = cx + r * 0.80 * math.cos(wa)
+        tip_y = cy2 + r * 0.80 * math.sin(wa)
+        tail_x = cx - r * 0.45 * math.cos(wa)
+        tail_y = cy2 - r * 0.45 * math.sin(wa)
+        cr.set_line_width(2.4)
+        cr.set_source_rgb(0.78, 0.12, 0.12)
+        cr.move_to(tail_x, tail_y)
+        cr.line_to(tip_x, tip_y)
+        cr.stroke()
+        # Arrowhead
+        for side in (-2.55, 2.55):
+            cr.move_to(tip_x, tip_y)
+            cr.line_to(tip_x + 7.5 * math.cos(wa + side), tip_y + 7.5 * math.sin(wa + side))
+            cr.stroke()
+
+    cr.arc(cx, cy2, 4.5, 0, 2 * math.pi)
+    cr.set_source_rgb(0.22, 0.18, 0.14)
+    cr.fill()
+
+    # Right VFD Box for Wind & Gust
+    vy2 = y1 + 7.0
+    _draw_vfd_box(cr, vx, vy2, vw, vh)
+    cr.set_font_size(8.2)
+    cr.set_source_rgb(0.46, 0.88, 0.80)
+    cr.move_to(vx + 8, vy2 + 15)
+    cr.show_text("WIND COMPASS & GUST")
+
+    wdir_txt = "VRB" if metar["wind_vrb"] else (
+        "CALM" if metar["wind_kt"] < 0.5 else f"{int(round(metar['wind_dir'] or 0.0)):03d}° {metar['wind_card']}"
+    )
+    cr.set_font_size(14.5)
+    cr.set_source_rgb(0.28, 0.99, 0.86)
+    cr.move_to(vx + 8, vy2 + 37)
+    cr.show_text(f"{wdir_txt}")
+
+    cr.set_font_size(12.5)
+    cr.set_source_rgb(0.56, 0.98, 0.84)
+    cr.move_to(vx + 8, vy2 + 57)
+    cr.show_text(f"{metar['wind_kt']:.0f} KT / {metar['wind_mph']:.0f} MPH")
+
+    # Dedicated Digital Gust VFD Pill
+    cr.rectangle(vx + 7, vy2 + 65, vw - 14, 22)
+    if metar["gust_kt"] > 0.5:
+        cr.set_source_rgba(1.0, 0.62, 0.14, 0.22)
+        cr.fill()
+        cr.set_font_size(10.5)
+        cr.set_source_rgb(1.0, 0.76, 0.22)
+        cr.move_to(vx + 12, vy2 + 80)
+        cr.show_text(f"GUST {metar['gust_kt']:.0f} KT ({metar['gust_mph']:.0f}M)")
+    else:
+        cr.set_source_rgba(0.16, 0.42, 0.38, 0.22)
+        cr.fill()
+        cr.set_font_size(9.5)
+        cr.set_source_rgb(0.42, 0.84, 0.76)
+        cr.move_to(vx + 12, vy2 + 80)
+        cr.show_text("NO GUSTS REPORTED")
+
+    cr.set_font_size(7.8)
+    cr.set_source_rgb(0.44, 0.74, 0.70)
+    cr.move_to(vx + 8, vy2 + min(vh - 6.0, 103.0))
+    cr.show_text(f"VIS {metar['vis_sm']:g} SM  {metar['clouds'][0][:10]}")
+
+    # =========================================================================
+    # MODULE 3: DUAL-NEEDLE TEMP / DEWPOINT (-20°F .. 110°F) & RH% HYGROMETER
+    # =========================================================================
+    y2 = pad * 3.0 + mod_h * 2.0
+    cr.rectangle(pad, y2, mod_w, mod_h)
+    cr.set_source_rgb(0.11, 0.13, 0.16)
+    cr.fill()
+    cr.set_line_width(1.2)
+    cr.set_source_rgb(0.35, 0.39, 0.48)
+    cr.rectangle(pad, y2, mod_w, mod_h)
+    cr.stroke()
+
+    cy3 = y2 + mod_h * 0.5 + 1.0
+    _draw_incandescent_dial_face(cr, cx, cy3, r)
+
+    def temp_ang(tf: float) -> float:
+        frac = max(0.0, min(1.0, (tf - (-20.0)) / 130.0))
+        return a_start + frac * a_span
+
+    # Freeze arc (-20..32°F) in cobalt blue + warm arc in dark bronze
+    a_32 = temp_ang(32.0)
+    cr.set_line_width(2.0)
+    cr.set_source_rgb(0.14, 0.42, 0.78)
+    cr.arc(cx, cy3, r * 0.80, a_start, a_32)
+    cr.stroke()
+    cr.set_source_rgb(0.22, 0.16, 0.10)
+    cr.arc(cx, cy3, r * 0.80, a_32, a_start + a_span)
+    cr.stroke()
+
+    for tf_v in range(-20, 115, 10):
+        ang = temp_ang(float(tf_v))
+        is_maj = (tf_v % 30 == 0 or tf_v == 32)
+        r_in = r * (0.68 if is_maj else 0.74)
+        cr.set_line_width(1.4 if is_maj else 0.8)
+        cr.set_source_rgb(0.18, 0.14, 0.08)
+        cr.move_to(cx + r_in * math.cos(ang), cy3 + r_in * math.sin(ang))
+        cr.line_to(cx + r * 0.82 * math.cos(ang), cy3 + r * 0.82 * math.sin(ang))
+        cr.stroke()
+        if tf_v in (-20, 10, 40, 70, 100):
+            cr.set_font_size(7.0)
+            lbl = f"{tf_v}"
+            ext = cr.text_extents(lbl)
+            tx = cx + r * 0.52 * math.cos(ang)
+            ty = cy3 + r * 0.52 * math.sin(ang)
+            cr.move_to(tx - ext.width * 0.5, ty + ext.height * 0.4)
+            cr.show_text(lbl)
+
+    # Lower RH% sub-legend on dial face
+    cr.set_font_size(7.0)
+    cr.set_source_rgb(0.26, 0.20, 0.12)
+    rh_lbl = f"RH {metar['rh_pct']:.0f}%"
+    ext_rh = cr.text_extents(rh_lbl)
+    cr.move_to(cx - ext_rh.width * 0.5, cy3 + r * 0.48)
+    cr.show_text(rh_lbl)
+
+    # Needle 1 (Cobalt Blue): Dewpoint °F
+    ang_dw = temp_ang(anim_dew_f)
+    cr.set_line_width(2.0)
+    cr.set_source_rgb(0.10, 0.46, 0.86)
+    cr.move_to(cx, cy3)
+    cr.line_to(cx + r * 0.74 * math.cos(ang_dw), cy3 + r * 0.74 * math.sin(ang_dw))
+    cr.stroke()
+
+    # Needle 2 (Crimson): Air Temperature °F
+    ang_tp = temp_ang(anim_temp_f)
+    cr.set_line_width(2.4)
+    cr.set_source_rgb(0.80, 0.12, 0.12)
+    cr.move_to(cx - r * 0.14 * math.cos(ang_tp), cy3 - r * 0.14 * math.sin(ang_tp))
+    cr.line_to(cx + r * 0.82 * math.cos(ang_tp), cy3 + r * 0.82 * math.sin(ang_tp))
+    cr.stroke()
+
+    cr.arc(cx, cy3, 4.5, 0, 2 * math.pi)
+    cr.set_source_rgb(0.22, 0.18, 0.14)
+    cr.fill()
+
+    # Right VFD Box for Temp / Dewpoint / RH% + Flight Category
+    vy3 = y2 + 7.0
+    _draw_vfd_box(cr, vx, vy3, vw, vh)
+    cr.set_font_size(8.2)
+    cr.set_source_rgb(0.46, 0.88, 0.80)
+    cr.move_to(vx + 8, vy3 + 15)
+    cr.show_text("TEMP / DEW / RH%")
+
+    cr.set_font_size(13.5)
+    cr.set_source_rgb(0.28, 0.99, 0.86)
+    cr.move_to(vx + 8, vy3 + 36)
+    cr.show_text(f"T {metar['temp_f']:+5.1f}°F ({metar['temp_c']:+.1f}C)")
+
+    cr.set_font_size(11.5)
+    cr.set_source_rgb(0.48, 0.84, 1.0)
+    cr.move_to(vx + 8, vy3 + 55)
+    cr.show_text(f"D {metar['dew_f']:+5.1f}°F ({metar['dew_c']:+.1f}C)")
+
+    cr.set_font_size(11.0)
+    cr.set_source_rgb(1.0, 0.78, 0.28)
+    cr.move_to(vx + 8, vy3 + 74)
+    cr.show_text(f"RH {metar['rh_pct']:.0f}%")
+
+    # FAA Flight Category Jewel Badge
+    fcat = metar["flight_cat"]
+    cat_cols = {
+        "VFR": ((0.10, 0.44, 0.22), (0.38, 1.00, 0.62)),
+        "MVFR": ((0.12, 0.28, 0.56), (0.48, 0.82, 1.00)),
+        "IFR": ((0.52, 0.12, 0.14), (1.00, 0.42, 0.42)),
+        "LIFR": ((0.48, 0.12, 0.48), (1.00, 0.48, 0.96)),
+    }
+    cbg, cfg_c = cat_cols.get(fcat, cat_cols["VFR"])
+    bx_cat = vx + vw - 54.0
+    cr.rectangle(bx_cat, vy3 + 60, 46.0, 18.0)
+    cr.set_source_rgb(*cbg)
+    cr.fill_preserve()
+    cr.set_line_width(1.0)
+    cr.set_source_rgb(*cfg_c)
+    cr.stroke()
+    cr.set_font_size(9.5)
+    ext_fc = cr.text_extents(fcat)
+    cr.move_to(bx_cat + (46.0 - ext_fc.width) * 0.5, vy3 + 73)
+    cr.show_text(fcat)
+
+    cr.set_font_size(7.8)
+    cr.set_source_rgb(0.48, 0.80, 0.74)
+    cr.move_to(vx + 8, vy3 + min(vh - 6.0, 102.0))
+    cr.show_text(metar["wx_summary"][:24])
+
+
+# ---------------------------------------------------------------------------
+# Main GTK 3 CDE Window (`DtRadarWindow`)
+# ---------------------------------------------------------------------------
+class DtRadarWindow(Gtk.Window):
+    def __init__(self, self_test: bool = False):
+        super().__init__(title="dtRadar — NEXRAD Doppler, GOES Satellite & HF Propagation Console")
+        self._self_test = self_test
+        self.set_default_size(1120, 660)
+        self.set_position(Gtk.WindowPosition.CENTER)
+
+        icon_p = Path(__file__).resolve().parent.parent / "assets" / "icons" / "dtradar.png"
+        if icon_p.is_file():
+            try:
+                self.set_icon_from_file(str(icon_p))
+            except Exception:
+                pass
+
+        chrome, sel, well = load_cde_palette()
+        prov = Gtk.CssProvider()
+        prov.load_from_data(build_radar_css(chrome, sel, well))
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        self.cfg = self._load_config()
+        self.map_lat = float(self.cfg["lat"])
+        self.map_lon = float(self.cfg["lon"])
+        self.map_zoom = int(self.cfg.get("map_zoom", 7))
+        self.view_mode = int(self.cfg.get("view_mode", 0))
+
+        # Animation & viewport pan/zoom state
+        self.loop_playing = bool(self.cfg.get("loop_playing", True))
+        self.frame_idx = 5
+        self.sweep_deg = -35.0
+        self._last_loop_step = time.monotonic()
+        self._dragging = False
+        self._drag_last = (0.0, 0.0)
+        self._hover_latlon: tuple[float, float] | None = None
+        self.ridge_zoom = 1.0
+        self.ridge_pan = (0.0, 0.0)
+        self.sat_zoom = 1.0
+        self.sat_pan = (0.0, 0.0)
+        self._updating_scrubber = False
+
+        # Ballistic analog instrument needles
+        self.anim_baro = 30.04
+        self.anim_wind_deg = 230.0
+        self.anim_temp_f = 47.0
+        self.anim_dew_f = 27.0
+
+        self.engine = RadarDataEngine(on_update_cb=self._on_engine_updated)
+
+        self._build_ui()
+        self._sync_view_buttons()
+        self._refresh_teletype()
+
+        # 30 FPS PPI sweep + ballistic needles + radar loop timer
+        GLib.timeout_add(33, self._on_tick_30fps)
+        # Periodic 4-minute auto-refresh timer
+        GLib.timeout_add_seconds(240, self._on_periodic_refresh)
+
+        self.connect("destroy", self._on_destroy)
+
+        if self._self_test:
+            GLib.timeout_add(220, self._step_gtk_self_test, 0)
+        else:
+            GLib.idle_add(self._trigger_live_fetches, False)
+
+    # ---- Config Persistence ----
+    def _load_config(self) -> dict[str, Any]:
+        cfg = {
+            "callsign": DEFAULT_CALLSIGN,
+            "grid": DEFAULT_GRID,
+            "lat": DEFAULT_LAT,
+            "lon": DEFAULT_LON,
+            "nexrad_site": DEFAULT_NEXRAD,
+            "metar_id": DEFAULT_METAR,
+            "goes_key": DEFAULT_GOES_KEY,
+            "view_mode": 0,
+            "map_zoom": 7,
+            "ppi_sweep": True,
+            "show_rings": True,
+            "show_alerts": True,
+            "loop_playing": True,
+            "teletype_amber": False,
+            "ridge_loop": True,
+        }
+        if CONFIG_FILE.is_file():
+            try:
+                saved = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                if isinstance(saved, dict):
+                    cfg.update(saved)
+            except Exception:
+                pass
+        return cfg
+
+    def _save_config(self):
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            self.cfg["view_mode"] = self.view_mode
+            self.cfg["map_zoom"] = self.map_zoom
+            self.cfg["loop_playing"] = self.loop_playing
+            CONFIG_FILE.write_text(json.dumps(self.cfg, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    # ---- UI Construction ----
+    def _build_ui(self):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(outer)
+
+        cab = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        cab.get_style_context().add_class("radar-cabinet")
+        outer.pack_start(cab, True, True, 0)
+
+        # =====================================================================
+        # 1. Top QTH & Station Configuration Strip
+        # =====================================================================
+        top_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        top_bar.get_style_context().add_class("radar-strip")
+        cab.pack_start(top_bar, False, False, 0)
+
+        def add_lbl(txt: str):
+            l = Gtk.Label(label=txt)
+            l.get_style_context().add_class("rx-engraved")
+            top_bar.pack_start(l, False, False, 1)
+
+        add_lbl("QTH")
+        self.ent_call = Gtk.Entry()
+        self.ent_call.get_style_context().add_class("qth-entry")
+        self.ent_call.set_width_chars(7)
+        self.ent_call.set_text(str(self.cfg["callsign"]))
+        self.ent_call.set_tooltip_text("Station Callsign")
+        self.ent_call.connect("activate", self._on_apply_qth)
+        top_bar.pack_start(self.ent_call, False, False, 0)
+
+        add_lbl("GRID/LL")
+        self.ent_grid = Gtk.Entry()
+        self.ent_grid.get_style_context().add_class("qth-entry")
+        self.ent_grid.set_width_chars(14)
+        self.ent_grid.set_text(f"{self.cfg['grid']} ({self.cfg['lat']:.2f},{self.cfg['lon']:.2f})")
+        self.ent_grid.set_tooltip_text("Enter 4/6-char Maidenhead Grid (e.g. FN31pr) or Lat,Lon (e.g. 41.73,-72.71)")
+        self.ent_grid.connect("activate", self._on_apply_qth)
+        top_bar.pack_start(self.ent_grid, False, False, 0)
+
+        add_lbl("NEXRAD")
+        self.combo_ridge = Gtk.ComboBoxText()
+        active_r = 0
+        for idx, (sid, slbl, _la, _lo) in enumerate(RIDGE_STATIONS):
+            self.combo_ridge.append(sid, slbl[:26])
+            if sid == self.cfg.get("nexrad_site", DEFAULT_NEXRAD):
+                active_r = idx
+        self.combo_ridge.set_active(active_r)
+        self.combo_ridge.connect("changed", self._on_ridge_combo_changed)
+        top_bar.pack_start(self.combo_ridge, False, False, 0)
+
+        add_lbl("METAR")
+        self.ent_metar = Gtk.Entry()
+        self.ent_metar.get_style_context().add_class("qth-entry")
+        self.ent_metar.set_width_chars(5)
+        self.ent_metar.set_text(str(self.cfg["metar_id"]))
+        self.ent_metar.set_tooltip_text("ICAO Airport Weather Station (e.g. KBDL, KBOS, KJFK, KORD)")
+        self.ent_metar.connect("activate", self._on_apply_qth)
+        top_bar.pack_start(self.ent_metar, False, False, 0)
+
+        add_lbl("SAT")
+        self.combo_goes = Gtk.ComboBoxText()
+        active_g = 0
+        for idx, (gkey, glbl, _gurl) in enumerate(GOES_FEEDS):
+            self.combo_goes.append(gkey, glbl[:31])
+            if gkey == self.cfg.get("goes_key", DEFAULT_GOES_KEY):
+                active_g = idx
+        self.combo_goes.set_active(active_g)
+        self.combo_goes.connect("changed", self._on_goes_combo_changed)
+        top_bar.pack_start(self.combo_goes, False, False, 0)
+
+        btn_apply = Gtk.Button(label="SAVE QTH")
+        btn_apply.get_style_context().add_class("btn-home")
+        btn_apply.set_tooltip_text("Apply & Save QTH, NEXRAD, METAR & Satellite configuration")
+        btn_apply.connect("clicked", self._on_apply_qth)
+        top_bar.pack_start(btn_apply, False, False, 1)
+
+        btn_sync = Gtk.Button(label="⟳ LIVE")
+        btn_sync.get_style_context().add_class("btn-sync")
+        btn_sync.set_tooltip_text("Refresh live NOAA NEXRAD, RIDGE, GOES, METAR & SWPC Solar feeds now")
+        btn_sync.connect("clicked", lambda _b: self._trigger_live_fetches(True))
+        top_bar.pack_start(btn_sync, False, False, 0)
+
+        self.lbl_clock = Gtk.Label(label="00:00:00Z")
+        self.lbl_clock.get_style_context().add_class("vfd-clock")
+        top_bar.pack_end(self.lbl_clock, False, False, 0)
+
+        # =====================================================================
+        # 2. View Switcher + Loop Transport + Frame Scrubber + PPI Controls
+        # =====================================================================
+        ctrl_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        ctrl_bar.get_style_context().add_class("radar-strip")
+        cab.pack_start(ctrl_bar, False, False, 0)
+
+        self.view_btns: list[Gtk.Button] = []
+        view_defs = [
+            (0, "1: NEXRAD MAP"),
+            (1, "2: NWS RIDGE"),
+            (2, "3: GOES SAT"),
+            (3, "4: HF SOLAR"),
+        ]
+        for v_id, v_lbl in view_defs:
+            b = Gtk.Button(label=v_lbl)
+            b.get_style_context().add_class("view-tab")
+            b.connect("clicked", self._on_view_clicked, v_id)
+            self.view_btns.append(b)
+            ctrl_bar.pack_start(b, False, False, 0)
+
+        ctrl_bar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 2)
+
+        self.btn_loop = Gtk.Button(label="▶ LOOP")
+        self.btn_loop.set_tooltip_text("Play / Pause animated multi-frame NEXRAD & RIDGE radar loop")
+        self.btn_loop.connect("clicked", self._on_toggle_loop)
+        ctrl_bar.pack_start(self.btn_loop, False, False, 0)
+
+        btn_prev = Gtk.Button(label="◀")
+        btn_prev.connect("clicked", lambda _b: self._step_frame(-1))
+        ctrl_bar.pack_start(btn_prev, False, False, 0)
+
+        self.scrubber = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 5, 1)
+        self.scrubber.set_draw_value(False)
+        self.scrubber.set_size_request(110, -1)
+        self.scrubber.set_value(5)
+        self.scrubber.connect("value-changed", self._on_scrubber_changed)
+        ctrl_bar.pack_start(self.scrubber, True, True, 2)
+
+        btn_next = Gtk.Button(label="▶")
+        btn_next.connect("clicked", lambda _b: self._step_frame(+1))
+        ctrl_bar.pack_start(btn_next, False, False, 0)
+
+        self.lbl_frame = Gtk.Label(label="F6/6 LIVE")
+        self.lbl_frame.get_style_context().add_class("rx-engraved")
+        ctrl_bar.pack_start(self.lbl_frame, False, False, 2)
+
+        ctrl_bar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 2)
+
+        self.btn_ppi = Gtk.Button(label="PPI SWEEP")
+        self.btn_ppi.set_tooltip_text("Toggle rotating green phosphor PPI radar sweep arm")
+        self.btn_ppi.connect("clicked", self._on_toggle_ppi)
+        ctrl_bar.pack_start(self.btn_ppi, False, False, 0)
+
+        self.btn_rings = Gtk.Button(label="RINGS")
+        self.btn_rings.set_tooltip_text("Toggle 50/100/150/200 km geodesic range rings")
+        self.btn_rings.connect("clicked", self._on_toggle_rings)
+        ctrl_bar.pack_start(self.btn_rings, False, False, 0)
+
+        self.btn_ridge_mode = Gtk.Button(label="GIF LOOP")
+        self.btn_ridge_mode.set_tooltip_text("Switch NWS RIDGE between animated _loop.gif and latest _0.gif still")
+        self.btn_ridge_mode.connect("clicked", self._on_toggle_ridge_loop)
+        ctrl_bar.pack_start(self.btn_ridge_mode, False, False, 0)
+
+        btn_zin = Gtk.Button(label="+")
+        btn_zin.set_tooltip_text("Zoom In")
+        btn_zin.connect("clicked", lambda _b: self._zoom_step(+1))
+        ctrl_bar.pack_start(btn_zin, False, False, 0)
+
+        btn_zout = Gtk.Button(label="−")
+        btn_zout.set_tooltip_text("Zoom Out")
+        btn_zout.connect("clicked", lambda _b: self._zoom_step(-1))
+        ctrl_bar.pack_start(btn_zout, False, False, 0)
+
+        btn_center = Gtk.Button(label="QTH")
+        btn_center.set_tooltip_text("Re-center viewport on Home QTH / Fit view")
+        btn_center.connect("clicked", self._on_reset_view)
+        ctrl_bar.pack_start(btn_center, False, False, 0)
+
+        # =====================================================================
+        # 3. Main Split Deck: Left CRT Viewport + Right 3 Analog Weather Dials
+        # =====================================================================
+        mid_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        cab.pack_start(mid_row, True, True, 0)
+
+        crt_frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        crt_frame.get_style_context().add_class("crt-bezel")
+        mid_row.pack_start(crt_frame, True, True, 0)
+
+        self.crt_area = Gtk.DrawingArea()
+        self.crt_area.set_size_request(730, 420)
+        self.crt_area.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+            | Gdk.EventMask.LEAVE_NOTIFY_MASK
+            | Gdk.EventMask.SCROLL_MASK
+        )
+        self.crt_area.connect("draw", self._on_draw_crt)
+        self.crt_area.connect("button-press-event", self._on_crt_press)
+        self.crt_area.connect("button-release-event", self._on_crt_release)
+        self.crt_area.connect("motion-notify-event", self._on_crt_motion)
+        self.crt_area.connect("leave-notify-event", self._on_crt_leave)
+        self.crt_area.connect("scroll-event", self._on_crt_scroll)
+        crt_frame.pack_start(self.crt_area, True, True, 0)
+
+        dial_frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        dial_frame.get_style_context().add_class("crt-bezel")
+        mid_row.pack_start(dial_frame, False, False, 0)
+
+        self.dials_area = Gtk.DrawingArea()
+        self.dials_area.set_size_request(356, 420)
+        self.dials_area.connect("draw", self._on_draw_dials)
+        dial_frame.pack_start(self.dials_area, True, True, 0)
+
+        # =====================================================================
+        # 4. Bottom Sunken #FFF7E9 / Amber METAR, TAF & NWS CAP Teletype Strip
+        # =====================================================================
+        tty_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        cab.pack_start(tty_box, False, False, 0)
+
+        tty_side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        tty_side.get_style_context().add_class("radar-strip")
+        tty_box.pack_start(tty_side, False, False, 0)
+
+        lbl_tty = Gtk.Label(label="TELETYPE\nWX / CAP")
+        lbl_tty.get_style_context().add_class("rx-engraved")
+        tty_side.pack_start(lbl_tty, False, False, 1)
+
+        self.btn_tty_mode = Gtk.Button(label="AMBER CRT")
+        self.btn_tty_mode.set_tooltip_text("Toggle teletype well between #FFF7E9 Teleprinter Paper and Amber CRT")
+        self.btn_tty_mode.connect("clicked", self._on_toggle_tty_style)
+        tty_side.pack_start(self.btn_tty_mode, False, False, 0)
+
+        self.tty_scroll = Gtk.ScrolledWindow()
+        self.tty_scroll.get_style_context().add_class("tty-well")
+        self.tty_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.tty_scroll.set_size_request(-1, 96)
+        tty_box.pack_start(self.tty_scroll, True, True, 0)
+
+        self.tty_view = Gtk.TextView()
+        self.tty_view.set_editable(False)
+        self.tty_view.set_cursor_visible(False)
+        self.tty_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.tty_view.set_left_margin(7)
+        self.tty_view.set_right_margin(7)
+        self.tty_view.set_top_margin(4)
+        self.tty_view.set_bottom_margin(4)
+        self.tty_buf = self.tty_view.get_buffer()
+        self.tag_alert = self.tty_buf.create_tag("alert", weight=Pango.Weight.BOLD, foreground="#c92418")
+        self.tag_hdr = self.tty_buf.create_tag("hdr", weight=Pango.Weight.BOLD)
+        self.tty_scroll.add(self.tty_view)
+        self._apply_tty_style()
+
+        # =====================================================================
+        # 5. CDE Bottom Sunken Status Bar
+        # =====================================================================
+        st_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        st_bar.get_style_context().add_class("cde-status")
+        outer.pack_start(st_bar, False, False, 0)
+
+        self.lbl_status = Gtk.Label(label="READY — HOME QTH W1AW / FN31pr (KBOX / KBDL)")
+        self.lbl_status.set_xalign(0.0)
+        st_bar.pack_start(self.lbl_status, True, True, 0)
+
+        self.lbl_right_status = Gtk.Label(label="CACHE ~/.cache/dtradar")
+        self.lbl_right_status.set_xalign(1.0)
+        st_bar.pack_end(self.lbl_right_status, False, False, 0)
+
+    # ---- Button State Sync ----
+    def _set_btn_class(self, btn: Gtk.Button, cls: str, enabled: bool):
+        ctx = btn.get_style_context()
+        if enabled:
+            ctx.add_class(cls)
+        else:
+            ctx.remove_class(cls)
+
+    def _sync_view_buttons(self):
+        for i, b in enumerate(self.view_btns):
+            self._set_btn_class(b, "sw-active", i == self.view_mode)
+        self._set_btn_class(self.btn_loop, "sw-active", self.loop_playing)
+        self.btn_loop.set_label("⏸ LOOP" if self.loop_playing else "▶ LOOP")
+        self._set_btn_class(self.btn_ppi, "sw-active", bool(self.cfg.get("ppi_sweep", True)))
+        self._set_btn_class(self.btn_rings, "sw-active", bool(self.cfg.get("show_rings", True)))
+        ridge_lp = bool(self.cfg.get("ridge_loop", True))
+        self._set_btn_class(self.btn_ridge_mode, "sw-amber", ridge_lp)
+        self.btn_ridge_mode.set_label("GIF LOOP" if ridge_lp else "STILL _0")
+        self._update_scrubber_bounds()
+
+    def _apply_tty_style(self):
+        ctx = self.tty_view.get_style_context()
+        is_amber = bool(self.cfg.get("teletype_amber", False))
+        if is_amber:
+            ctx.remove_class("tty-paper")
+            ctx.add_class("tty-amber")
+            self.tag_alert.set_property("foreground", "#ff5e3a")
+            self.btn_tty_mode.set_label("PAPER #FFF")
+            self._set_btn_class(self.btn_tty_mode, "sw-amber", True)
+        else:
+            ctx.remove_class("tty-amber")
+            ctx.add_class("tty-paper")
+            self.tag_alert.set_property("foreground", "#b81d13")
+            self.btn_tty_mode.set_label("AMBER CRT")
+            self._set_btn_class(self.btn_tty_mode, "sw-amber", False)
+
+    def _frame_count_for_current_view(self) -> int:
+        if self.view_mode == 1:
+            site = str(self.cfg.get("nexrad_site", DEFAULT_NEXRAD)).upper()
+            r_frames = self.engine.ridge_frames.get((site, bool(self.cfg.get("ridge_loop", True))), [])
+            return max(1, len(r_frames)) if r_frames else 6
+        return 6
+
+    def _update_scrubber_bounds(self):
+        n = self._frame_count_for_current_view()
+        self._updating_scrubber = True
+        self.scrubber.set_range(0, max(1, n - 1))
+        self.frame_idx = max(0, min(n - 1, self.frame_idx))
+        self.scrubber.set_value(self.frame_idx)
+        self._updating_scrubber = False
+        self._update_frame_label()
+
+    def _update_frame_label(self):
+        n = self._frame_count_for_current_view()
+        idx = max(0, min(n - 1, self.frame_idx))
+        if self.view_mode == 0 and n == 6:
+            lbl = f"F{idx+1}/6 {NEXRAD_LAGS[idx][1]}"
+        else:
+            lbl = f"F{idx+1}/{n}"
+        self.lbl_frame.set_text(lbl)
+
+    # ---- Teletype Formatter ----
+    def _refresh_teletype(self):
+        m = self.engine.metar_data
+        alerts = self.engine.alerts
+        self.tty_buf.set_text("")
+        it = self.tty_buf.get_end_iter()
+
+        if alerts:
+            for al in alerts[:4]:
+                line = f"⚠ NWS ACTIVE ALERT [{al['severity'].upper()}]: {al['event']} — {al['headline']}\n"
+                self.tty_buf.insert_with_tags(it, line, self.tag_alert)
+        else:
+            ok_ln = (
+                f"NWS CAP ALERTS ({self.cfg['grid']} / {self.cfg['lat']:.2f}N, {self.cfg['lon']:.2f}W): "
+                f"NO ACTIVE SEVERE WEATHER WARNINGS OR WATCHES.\n"
+            )
+            self.tty_buf.insert_with_tags(it, ok_ln, self.tag_hdr)
+
+        dec_ln = (
+            f"DECODED {m['station']} ({m['obs_time']}) [{m['flight_cat']}]: "
+            f"Wind {m['wind_card']} {m['wind_kt']:.0f}kt"
+            f"{(' G' + str(int(round(m['gust_kt']))) + 'kt') if m['gust_kt'] > 0.5 else ''} | "
+            f"Vis {m['vis_sm']:g}SM | Sky {', '.join(m['clouds'][:3])} | "
+            f"Temp {m['temp_f']:.1f}°F ({m['temp_c']:.1f}°C) Dew {m['dew_f']:.1f}°F RH {m['rh_pct']:.0f}% | "
+            f"Altim {m['altim_inhg']:.2f}\" ({m['altim_hpa']:.1f} hPa, {m['tendency']})\n"
+        )
+        self.tty_buf.insert_with_tags(it, dec_ln, self.tag_hdr)
+        self.tty_buf.insert(it, f"METAR : {m['raw_metar']}\n")
+        if m.get("raw_taf"):
+            self.tty_buf.insert(it, f"TAF   : {m['raw_taf']}")
+
+        sol = self.engine.solar_data
+        self.lbl_right_status.set_text(
+            f"WX:{m['source'][:14]} | SFI:{sol['sfi']:.0f} Kp:{sol['kp']:.1f} {sol['cond']['xray_class']}"
+        )
+
+    # ---- Live Data Fetch Triggers ----
+    def _trigger_live_fetches(self, force: bool = False):
+        if force:
+            self.engine.clear_nexrad_cache_for_refresh()
+        self.lbl_status.set_text(
+            f"SYNCING NOAA/NWS/SWPC — QTH {self.cfg['callsign']} {self.cfg['grid']} "
+            f"| NEXRAD {self.cfg['nexrad_site']} | METAR {self.cfg['metar_id']}..."
+        )
+        self.engine.fetch_all_telemetry_async(
+            str(self.cfg["metar_id"]), float(self.cfg["lat"]), float(self.cfg["lon"])
+        )
+        self.engine.fetch_ridge_async(
+            str(self.cfg["nexrad_site"]), bool(self.cfg.get("ridge_loop", True)), force=force
+        )
+        self.engine.fetch_satellite_async(str(self.cfg["goes_key"]), force=force)
+        self.crt_area.queue_draw()
+        return False
+
+    def _on_periodic_refresh(self) -> bool:
+        self._trigger_live_fetches(force=True)
+        return True
+
+    def _on_engine_updated(self) -> bool:
+        self._update_scrubber_bounds()
+        self._refresh_teletype()
+        m = self.engine.metar_data
+        self.lbl_status.set_text(
+            f"QTH {self.cfg['callsign']} ({self.cfg['grid']})  |  "
+            f"{m['station']} {m['flight_cat']} {m['temp_f']:.0f}°F {m['altim_inhg']:.2f}\"  |  "
+            f"ALERTS: {len(self.engine.alerts)}"
+        )
+        self.crt_area.queue_draw()
+        self.dials_area.queue_draw()
+        return False
+
+    # ---- 30 FPS Animation & Ballistic Damping Loop ----
+    def _on_tick_30fps(self) -> bool:
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        now_loc = datetime.datetime.now()
+        self.lbl_clock.set_text(f"{now_utc.strftime('%H:%M:%SZ')} / {now_loc.strftime('%H:%M')}L")
+
+        # Advance phosphor PPI sweep arm smoothly (48 deg/sec)
+        if self.cfg.get("ppi_sweep", True):
+            self.sweep_deg = (self.sweep_deg + 1.6) % 360.0
+
+        # Advance animated radar loop every 0.58s
+        mono = time.monotonic()
+        if self.loop_playing and self.view_mode in (0, 1) and (mono - self._last_loop_step) >= 0.58:
+            self._last_loop_step = mono
+            n = self._frame_count_for_current_view()
+            self.frame_idx = (self.frame_idx + 1) % max(1, n)
+            self._updating_scrubber = True
+            self.scrubber.set_value(self.frame_idx)
+            self._updating_scrubber = False
+            self._update_frame_label()
+
+        # Ballistic analog weather needles
+        m = self.engine.metar_data
+        self.anim_baro += (float(m["altim_inhg"]) - self.anim_baro) * 0.14
+        self.anim_temp_f += (float(m["temp_f"]) - self.anim_temp_f) * 0.14
+        self.anim_dew_f += (float(m["dew_f"]) - self.anim_dew_f) * 0.14
+
+        tgt_w = float(m["wind_dir"]) if m["wind_dir"] is not None else (self.anim_wind_deg + 1.8) % 360.0
+        diff_w = ((tgt_w - self.anim_wind_deg + 180.0) % 360.0) - 180.0
+        self.anim_wind_deg = (self.anim_wind_deg + diff_w * 0.14) % 360.0
+
+        self.crt_area.queue_draw()
+        self.dials_area.queue_draw()
+        return True
+
+    # ---- Event Handlers ----
+    def _on_apply_qth(self, *_args):
+        call = self.ent_call.get_text().strip().upper() or DEFAULT_CALLSIGN
+        raw_loc = self.ent_grid.get_text().strip()
+        metar_id = self.ent_metar.get_text().strip().upper() or DEFAULT_METAR
+
+        lat, lon = float(self.cfg["lat"]), float(self.cfg["lon"])
+        grid = str(self.cfg["grid"])
+
+        # Parse either "41.73,-72.71" or "FN31pr ..."
+        m_ll = re.search(r"([+-]?\d+\.\d+)\s*,\s*([+-]?\d+\.\d+)", raw_loc)
+        token0 = raw_loc.split()[0].strip(",") if raw_loc else ""
+        g_parsed = grid_to_latlon(token0)
+        if g_parsed is not None and not re.match(r"^[+-]?\d", token0):
+            lat, lon = g_parsed
+            grid = token0[:2].upper() + token0[2:4] + (token0[4:6].lower() if len(token0) >= 6 else "")
+        elif m_ll:
+            lat = max(-84.0, min(84.0, float(m_ll.group(1))))
+            lon = max(-180.0, min(180.0, float(m_ll.group(2))))
+            grid = latlon_to_grid(lat, lon)
+
+        self.cfg["callsign"] = call
+        self.cfg["grid"] = grid
+        self.cfg["lat"] = round(lat, 5)
+        self.cfg["lon"] = round(lon, 5)
+        self.cfg["metar_id"] = metar_id
+        self.map_lat = lat
+        self.map_lon = lon
+        self.ent_call.set_text(call)
+        self.ent_grid.set_text(f"{grid} ({lat:.2f},{lon:.2f})")
+        self.ent_metar.set_text(metar_id)
+
+        self._save_config()
+        self._trigger_live_fetches(force=True)
+
+    def _on_ridge_combo_changed(self, combo: Gtk.ComboBoxText):
+        sid = combo.get_active_id() or DEFAULT_NEXRAD
+        self.cfg["nexrad_site"] = sid
+        self._save_config()
+        self.engine.fetch_ridge_async(sid, bool(self.cfg.get("ridge_loop", True)), force=False)
+        self._update_scrubber_bounds()
+        self.crt_area.queue_draw()
+
+    def _on_goes_combo_changed(self, combo: Gtk.ComboBoxText):
+        gkey = combo.get_active_id() or DEFAULT_GOES_KEY
+        self.cfg["goes_key"] = gkey
+        self.sat_zoom = 1.0
+        self.sat_pan = (0.0, 0.0)
+        self._save_config()
+        self.engine.fetch_satellite_async(gkey, force=False)
+        self.crt_area.queue_draw()
+
+    def _on_view_clicked(self, _btn: Gtk.Button, v_id: int):
+        self.view_mode = v_id
+        self._sync_view_buttons()
+        self._save_config()
+        if v_id == 1:
+            self.engine.fetch_ridge_async(
+                str(self.cfg["nexrad_site"]), bool(self.cfg.get("ridge_loop", True))
+            )
+        elif v_id == 2:
+            self.engine.fetch_satellite_async(str(self.cfg["goes_key"]))
+        self.crt_area.queue_draw()
+
+    def _on_toggle_loop(self, _btn: Gtk.Button):
+        self.loop_playing = not self.loop_playing
+        self._sync_view_buttons()
+        self._save_config()
+
+    def _step_frame(self, delta: int):
+        self.loop_playing = False
+        n = self._frame_count_for_current_view()
+        self.frame_idx = (self.frame_idx + delta) % max(1, n)
+        self._sync_view_buttons()
+
+    def _on_scrubber_changed(self, scale: Gtk.Scale):
+        if self._updating_scrubber:
+            return
+        self.loop_playing = False
+        self.frame_idx = int(round(scale.get_value()))
+        self._sync_view_buttons()
+        self.crt_area.queue_draw()
+
+    def _on_toggle_ppi(self, _btn: Gtk.Button):
+        self.cfg["ppi_sweep"] = not bool(self.cfg.get("ppi_sweep", True))
+        self._sync_view_buttons()
+        self._save_config()
+
+    def _on_toggle_rings(self, _btn: Gtk.Button):
+        self.cfg["show_rings"] = not bool(self.cfg.get("show_rings", True))
+        self._sync_view_buttons()
+        self._save_config()
+
+    def _on_toggle_ridge_loop(self, _btn: Gtk.Button):
+        self.cfg["ridge_loop"] = not bool(self.cfg.get("ridge_loop", True))
+        self._sync_view_buttons()
+        self._save_config()
+        self.engine.fetch_ridge_async(
+            str(self.cfg["nexrad_site"]), bool(self.cfg["ridge_loop"]), force=False
+        )
+
+    def _on_toggle_tty_style(self, _btn: Gtk.Button):
+        self.cfg["teletype_amber"] = not bool(self.cfg.get("teletype_amber", False))
+        self._apply_tty_style()
+        self._save_config()
+
+    def _zoom_step(self, delta: int):
+        if self.view_mode == 0:
+            self.map_zoom = max(MIN_ZOOM, min(MAX_ZOOM, self.map_zoom + delta))
+            self._save_config()
+        elif self.view_mode == 1:
+            self.ridge_zoom = max(0.8, min(5.0, self.ridge_zoom * (1.25 if delta > 0 else 0.8)))
+        elif self.view_mode == 2:
+            self.sat_zoom = max(0.8, min(6.0, self.sat_zoom * (1.25 if delta > 0 else 0.8)))
+        self.crt_area.queue_draw()
+
+    def _on_reset_view(self, *_args):
+        self.map_lat = float(self.cfg["lat"])
+        self.map_lon = float(self.cfg["lon"])
+        self.map_zoom = 7
+        self.ridge_zoom = 1.0
+        self.ridge_pan = (0.0, 0.0)
+        self.sat_zoom = 1.0
+        self.sat_pan = (0.0, 0.0)
+        self._save_config()
+        self.crt_area.queue_draw()
+
+    # ---- CRT Mouse Pan / Scroll Zoom / Cursor Range Readout ----
+    def _on_crt_press(self, _w, ev: Gdk.EventButton) -> bool:
+        if ev.button == 1:
+            self._dragging = True
+            self._drag_last = (ev.x, ev.y)
+        return True
+
+    def _on_crt_release(self, _w, ev: Gdk.EventButton) -> bool:
+        if ev.button == 1:
+            self._dragging = False
+        return True
+
+    def _on_crt_leave(self, *_args) -> bool:
+        self._hover_latlon = None
+        return False
+
+    def _on_crt_motion(self, w: Gtk.Widget, ev: Gdk.EventMotion) -> bool:
+        alloc = w.get_allocation()
+        W, H = float(alloc.width), float(alloc.height)
+        if self.view_mode == 0:
+            c_wx, c_wy = latlon_to_world_px(self.map_lat, self.map_lon, float(self.map_zoom))
+            self._hover_latlon = world_px_to_latlon(
+                c_wx + (ev.x - W * 0.5), c_wy + (ev.y - H * 0.5), float(self.map_zoom)
+            )
+
+        if self._dragging:
+            dx = ev.x - self._drag_last[0]
+            dy = ev.y - self._drag_last[1]
+            self._drag_last = (ev.x, ev.y)
+            if self.view_mode == 0:
+                c_wx, c_wy = latlon_to_world_px(self.map_lat, self.map_lon, float(self.map_zoom))
+                self.map_lat, self.map_lon = world_px_to_latlon(
+                    c_wx - dx, c_wy - dy, float(self.map_zoom)
+                )
+            elif self.view_mode == 1:
+                self.ridge_pan = (self.ridge_pan[0] + dx, self.ridge_pan[1] + dy)
+            elif self.view_mode == 2:
+                self.sat_pan = (self.sat_pan[0] + dx, self.sat_pan[1] + dy)
+            self.crt_area.queue_draw()
+        return True
+
+    def _on_crt_scroll(self, w: Gtk.Widget, ev: Gdk.EventScroll) -> bool:
+        step = 0
+        if ev.direction == Gdk.ScrollDirection.UP:
+            step = 1
+        elif ev.direction == Gdk.ScrollDirection.DOWN:
+            step = -1
+        elif ev.direction == Gdk.ScrollDirection.SMOOTH:
+            ok, _dx, dy = ev.get_scroll_deltas()
+            if ok and abs(dy) > 0.05:
+                step = 1 if dy < 0 else -1
+        if step == 0:
+            return False
+
+        if self.view_mode == 0:
+            alloc = w.get_allocation()
+            W, H = float(alloc.width), float(alloc.height)
+            old_z = self.map_zoom
+            new_z = max(MIN_ZOOM, min(MAX_ZOOM, old_z + step))
+            if new_z != old_z:
+                # Anchor zoom around mouse cursor
+                c_wx, c_wy = latlon_to_world_px(self.map_lat, self.map_lon, float(old_z))
+                cur_lat, cur_lon = world_px_to_latlon(
+                    c_wx + (ev.x - W * 0.5), c_wy + (ev.y - H * 0.5), float(old_z)
+                )
+                n_wx, n_wy = latlon_to_world_px(cur_lat, cur_lon, float(new_z))
+                self.map_lat, self.map_lon = world_px_to_latlon(
+                    n_wx - (ev.x - W * 0.5), n_wy - (ev.y - H * 0.5), float(new_z)
+                )
+                self.map_zoom = new_z
+                self._save_config()
+        else:
+            self._zoom_step(step)
+        self.crt_area.queue_draw()
+        return True
+
+    # ---- Cairo Draw Callbacks ----
+    def _on_draw_crt(self, w: Gtk.Widget, cr: cairo.Context) -> bool:
+        alloc = w.get_allocation()
+        W, H = float(alloc.width), float(alloc.height)
+        if self.view_mode == 0:
+            render_view_nexrad_map(
+                cr,
+                W,
+                H,
+                self.engine,
+                self.cfg,
+                self.map_lat,
+                self.map_lon,
+                self.map_zoom,
+                self.frame_idx,
+                self.sweep_deg,
+                self._hover_latlon,
+            )
+        elif self.view_mode == 1:
+            render_view_nws_ridge(
+                cr,
+                W,
+                H,
+                self.engine,
+                str(self.cfg.get("nexrad_site", DEFAULT_NEXRAD)),
+                bool(self.cfg.get("ridge_loop", True)),
+                self.frame_idx,
+                self.ridge_zoom,
+                self.ridge_pan,
+                self.sweep_deg,
+                bool(self.cfg.get("ppi_sweep", True)),
+            )
+        elif self.view_mode == 2:
+            render_view_goes_satellite(
+                cr,
+                W,
+                H,
+                self.engine,
+                str(self.cfg.get("goes_key", DEFAULT_GOES_KEY)),
+                self.sat_zoom,
+                self.sat_pan,
+                self.cfg,
+            )
+        else:
+            render_view_hf_solar_desk(cr, W, H, self.engine.solar_data)
+        return False
+
+    def _on_draw_dials(self, w: Gtk.Widget, cr: cairo.Context) -> bool:
+        alloc = w.get_allocation()
+        render_weather_instrument_cluster(
+            cr,
+            float(alloc.width),
+            float(alloc.height),
+            self.engine.metar_data,
+            self.anim_baro,
+            self.anim_wind_deg,
+            self.anim_temp_f,
+            self.anim_dew_f,
+        )
+        return False
+
+    def _step_gtk_self_test(self, step: int) -> bool:
+        if step < 4:
+            self._on_view_clicked(self.view_btns[step], step)
+            GLib.timeout_add(110, self._step_gtk_self_test, step + 1)
+            return False
+        print("DTRADAR_SELF_TEST_OK", flush=True)
+        self.destroy()
+        Gtk.main_quit()
+        return False
+
+    def _on_destroy(self, *_args):
+        self._save_config()
+        self.engine.shutdown()
+        if Gtk.main_level() > 0:
+            Gtk.main_quit()
+
+
+# ---------------------------------------------------------------------------
+# Comprehensive Deterministic `--self-test` Suite
+# ---------------------------------------------------------------------------
+def run_self_test_suite() -> int:
+    # 1. Verify Maidenhead Grid <-> Lat/Lon & Geodesic / Slippy-Tile Math
+    ll = grid_to_latlon("FN31pr")
+    assert ll is not None, "Failed to parse FN31pr"
+    assert abs(ll[0] - 41.729167) < 0.01 and abs(ll[1] - (-72.708333)) < 0.01, f"Bad FN31pr: {ll}"
+    assert latlon_to_grid(ll[0], ll[1]) == "FN31pr"
+
+    tx, ty = latlon_to_tile_xy(DEFAULT_LAT, DEFAULT_LON, 7)
+    assert tx == 38 and ty == 47, f"Unexpected Web Mercator tile for Newington z=7: {(tx, ty)}"
+    dlat, dlon = dest_latlon_km(DEFAULT_LAT, DEFAULT_LON, 0.0, 100.0)
+    dkm, brg = haversine_bearing_km(DEFAULT_LAT, DEFAULT_LON, dlat, dlon)
+    assert abs(dkm - 100.0) < 0.25 and (brg < 1.0 or brg > 359.0), f"Range ring math error: {dkm}, {brg}"
+
+    # 2. Verify Embedded World & US State Vector Geography
+    assert len(WORLD_POLYGONS) >= 50, f"Expected >=50 world polygons, got {len(WORLD_POLYGONS)}"
+    assert len(US_BORDER_POLYLINES) >= 20
+
+    # 3. Verify Aviation METAR Parser (VFR + Gusts + Negative Dewpoint + IFR edge case)
+    m1 = parse_metar_raw(
+        "KBDL 270053Z 23014G22KT 10SM FEW065 SCT120 09/M02 A3004 RMK AO2 SLP173 T00891022 52012",
+        "KBDL",
+    )
+    assert m1["station"] == "KBDL"
+    assert m1["wind_dir"] == 230.0 and m1["wind_kt"] == 14.0 and m1["gust_kt"] == 22.0
+    assert abs(m1["temp_c"] - 8.9) < 0.05 and abs(m1["dew_c"] - (-2.2)) < 0.05
+    assert abs(m1["altim_inhg"] - 30.04) < 0.01 and abs(m1["altim_hpa"] - 1017.3) < 0.3
+    assert m1["flight_cat"] == "VFR"
+
+    m2 = parse_metar_raw("KBOI 270115Z VRB04KT 1 1/2SM -SN BR OVC006 M03/M04 A2968", "KBOI")
+    assert m2["wind_vrb"] is True and abs(m2["vis_sm"] - 1.5) < 0.01
+    assert m2["ceiling_ft"] == 600 and m2["flight_cat"] == "IFR"
+
+    # 4. Verify SWPC HF Band Condition Matrix Math
+    c_good = calculate_hf_band_conditions(sfi=168.0, kp=2.0, a_idx=7.0, xray_flux=1.2e-6, bz_nt=1.5)
+    bmap_good = {b["band"]: b for b in c_good["bands"]}
+    assert bmap_good["20m"]["day"] == "GOOD" and bmap_good["10m"]["day"] == "GOOD"
+    assert bmap_good["80m"]["night"] == "GOOD" and c_good["r_scale"][0] == "R0"
+
+    c_storm = calculate_hf_band_conditions(sfi=95.0, kp=7.3, a_idx=130.0, xray_flux=6.5e-5, bz_nt=-11.0)
+    bmap_storm = {b["band"]: b for b in c_storm["bands"]}
+    assert c_storm["r_scale"][0] == "R2" and c_storm["g_scale"][0] == "G3"
+    assert bmap_storm["40m"]["day"] == "POOR" and bmap_storm["10m"]["day"] == "POOR"
+
+    # 5. Verify Multi-Frame GIF Unpacker + Offscreen Cairo Rendering of All 4 Views & 3 Analog Dials
+    eng = RadarDataEngine()
+    try:
+        # Build a 3-frame test animated GIF in memory and verify PIL->Cairo unpacker
+        gif_buf = io.BytesIO()
+        g_frames = []
+        for gi_idx in range(3):
+            im = Image.new("RGBA", (64, 64), (10, 20 + gi_idx * 30, 40, 255))
+            g_frames.append(im)
+        g_frames[0].save(gif_buf, format="GIF", save_all=True, append_images=g_frames[1:], loop=0)
+        unpacked = eng._unpack_gif_bytes(gif_buf.getvalue())
+        assert len(unpacked) == 3, f"GIF unpacker expected 3 frames, got {len(unpacked)}"
+
+        cfg_test = {
+            "callsign": DEFAULT_CALLSIGN,
+            "grid": DEFAULT_GRID,
+            "lat": DEFAULT_LAT,
+            "lon": DEFAULT_LON,
+            "nexrad_site": DEFAULT_NEXRAD,
+            "metar_id": DEFAULT_METAR,
+            "goes_key": DEFAULT_GOES_KEY,
+            "ppi_sweep": True,
+            "show_rings": True,
+            "show_alerts": True,
+        }
+
+        crt_surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 750, 445)
+        cr = cairo.Context(crt_surf)
+
+        render_view_nexrad_map(cr, 750, 445, eng, cfg_test, DEFAULT_LAT, DEFAULT_LON, 7, 5, 42.0, (43.1, -112.2))
+        arr0 = np.frombuffer(crt_surf.get_data(), dtype=np.uint8)
+        assert float(arr0.std()) > 8.0, "NEXRAD map surface failed to render detail"
+
+        render_view_nws_ridge(cr, 750, 445, eng, "KBOX", True, 2, 1.0, (0.0, 0.0), 85.0, True)
+        arr1 = np.frombuffer(crt_surf.get_data(), dtype=np.uint8)
+        assert float(arr1.std()) > 8.0, "NWS RIDGE surface failed to render detail"
+
+        for gk in ("nr_geocolor", "aurora_north"):
+            render_view_goes_satellite(cr, 750, 445, eng, gk, 1.0, (0.0, 0.0), cfg_test)
+            arr2 = np.frombuffer(crt_surf.get_data(), dtype=np.uint8)
+            assert float(arr2.std()) > 8.0, f"GOES view {gk} failed to render"
+
+        render_view_hf_solar_desk(cr, 750, 445, eng.solar_data)
+        arr3 = np.frombuffer(crt_surf.get_data(), dtype=np.uint8)
+        assert float(arr3.std()) > 8.0, "HF Solar desk surface failed to render"
+
+        dial_surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 356, 445)
+        cr_d = cairo.Context(dial_surf)
+        render_weather_instrument_cluster(cr_d, 356, 445, m1, 30.04, 230.0, 48.0, 28.0)
+        arr_d = np.frombuffer(dial_surf.get_data(), dtype=np.uint8)
+        assert float(arr_d.std()) > 12.0, "Analog weather dials failed to render"
+    finally:
+        eng.shutdown()
+
+    # If an X11/Wayland display is accessible, also exercise full GTK window & view-tab lifecycle
+    ok_gtk, _ = Gtk.init_check(sys.argv)
+    if ok_gtk and os.environ.get("DISPLAY"):
+        win = DtRadarWindow(self_test=True)
+        win.show_all()
+        Gtk.main()
+    else:
+        print("DTRADAR_SELF_TEST_OK", flush=True)
+    return 0
+
+
+def main() -> int:
+    if "--self-test" in sys.argv:
+        return run_self_test_suite()
+    ok, _ = Gtk.init_check(sys.argv)
+    if not ok:
+        sys.stderr.write("dtRadar: unable to open X11/GTK display.\n")
+        return 1
+    win = DtRadarWindow(self_test=False)
+    win.show_all()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
