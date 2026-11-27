@@ -251,6 +251,7 @@ PYTHON_CDE_APPS = [
     ("dtZip",    "dtzip",    ("python3", "gir1.2-gtk-3", "p7zip", "7zip", "xz-utils", "bzip2")),
     ("dtWine",   "dtwine",   ("python3", "gir1.2-gtk-3", "wine", "libwine", "python3-pil")),
     ("dtUpdate", "dtupdate", ("python3", "gir1.2-gtk-3", "apt")),
+    ("dtRadio",  "dtradio",  ("python3", "gir1.2-gtk-3", "libgtk-3", "gir1.2-gst", "gstreamer1.0", "libcairo")),
 ]
 
 # Known C/Motif targets when a Makefile-based CDE source directory is present

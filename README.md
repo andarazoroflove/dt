@@ -2,7 +2,7 @@
 
 # `dt` — Modern Workstation Application Suite for CDE
 
-**Thirteen cohesive, native-feeling desktop applications crafted for the Common Desktop Environment (CDE) on Linux & UNIX.**
+**Fourteen cohesive, native-feeling desktop applications crafted for the Common Desktop Environment (CDE) on Linux & UNIX.**
 
 <p>
   <img src="assets/screenshots/hero-collage.png" alt="dt CDE Application Suite Showcase" width="100%" />
@@ -10,7 +10,7 @@
 
 <p>
   <a href="#quick-start--installation"><b>Quick Install</b></a> •
-  <a href="#application-directory"><b>All 13 Apps</b></a> •
+  <a href="#application-directory"><b>All 14 Apps</b></a> •
   <a href="#cde-palette--front-panel-architecture"><b>Palette Architecture</b></a> •
   <a href="./LICENSE"><b>MIT License</b></a>
 </p>
@@ -21,7 +21,7 @@
 
 ## Overview
 
-The **`dt` suite** brings essential modern capabilities — Microsoft 365 email & calendar sync, Apple Podcasts streaming & downloading, universal image viewing & MS Paint-style editing, GStreamer music/video playback with 60-second clip trimming, TLS Libera.Chat IRC, Rich Text/Markdown editing, fillable PDF forms, drag-and-drop archives, and classic Windows game management — straight to the **Common Desktop Environment (`dtwm`)** without sacrificing the crisp 3D beveled ergonomics, spatial speed, or warm ivory reading wells of 1990s UNIX workstations.
+The **`dt` suite** brings essential modern capabilities — Microsoft 365 email & calendar sync, Apple Podcasts streaming & downloading, universal image viewing & MS Paint-style editing, GStreamer music/video playback with 60-second clip trimming, TLS Libera.Chat IRC, Rich Text/Markdown editing, fillable PDF forms, drag-and-drop archives, vintage HF/shortwave & NOAA/emergency radio reception, and classic Windows game management — straight to the **Common Desktop Environment (`dtwm`)** without sacrificing the crisp 3D beveled ergonomics, spatial speed, or warm ivory reading wells of 1990s UNIX workstations.
 
 Every application lives in **its own self-contained directory** with its source code, multi-size CDE XPM icon set (`.pm`, `.l.pm`, `.m.pm`, `.s.pm`, `.t.pm`), CDE `DtDts` action/datatype definitions, Front Panel subpanel control (`.fp`), and standalone `install.sh`.
 
@@ -44,6 +44,7 @@ Every application lives in **its own self-contained directory** with its source 
 | <img src="assets/icons/dtzip.png" width="32" height="32" alt="dtZip" /> | **[`dtZip/`](./dtZip/)** | **Drag-and-Drop Archive Manager for CDE** | `Utilities Subpanel` |
 | <img src="assets/icons/dtwine.png" width="32" height="32" alt="dtWine" /> | **[`dtWine/`](./dtWine/)** | **Classic Windows Game & Application Prefix Manager for CDE** | `Utilities Subpanel` |
 | <img src="assets/icons/dtupdate.png" width="32" height="32" alt="dtUpdate" /> | **[`dtUpdate/`](./dtUpdate/)** | **All-in-One Debian (`apt-get`) & CDE Application Rebuild Manager** | `Utilities Subpanel` |
+| <img src="assets/icons/dtradio.png" width="32" height="32" alt="dtRadio" /> | **[`dtRadio/`](./dtRadio/)** | **Vintage HF/Shortwave (`0–30 MHz`), Ham Repeater, NOAA, Emergency & Space Receiver** | `Radio Apps Subpanel` |
 
 ---
 
@@ -72,7 +73,7 @@ sudo apt install -y \
 
 *(Note: `dtMail`, `dtCalendar`, and `dtTerm` also link against `/usr/dt/include` and `/usr/dt/lib` from a standard CDE installation.)*
 
-### Install All 13 Applications
+### Install All 14 Applications
 
 ```bash
 git clone https://github.com/andarazoroflove/dt.git
@@ -86,7 +87,7 @@ Or install any individual application from its own directory:
 cd dtPod && ./install.sh
 ```
 
-After installing, reload the CDE Workspace Manager (**Workspace Menu -> Restart Workspace Manager**) so the Front Panel **Utilities** and **Mail** subpanels pick up all new icons.
+After installing, reload the CDE Workspace Manager (**Workspace Menu -> Restart Workspace Manager**) so the Front Panel **Utilities**, **Mail**, and **Radio Apps** subpanels pick up all new icons.
 
 ---
 
@@ -351,6 +352,22 @@ An all-in-one workstation update manager for Debian (`apt-get`) and custom CDE a
 
 ```bash
 cd dtUpdate && ./install.sh
+```
+---
+
+## <img src="assets/icons/dtradio.png" width="40" height="40" align="absmiddle" alt="dtRadio icon" /> dtRadio
+
+**Folder:** [`./dtRadio/`](./dtRadio/) &nbsp;•&nbsp; **Front Panel:** `Radio Apps Subpanel` &nbsp;•&nbsp; **Stack:** Python 3 • GTK 3 (CDE Motif CSS) • Cairo • GStreamer 1.0 DSP • KiwiSDR WebSocket Engine • RTL-SDR (`rtl_fm`)
+
+A tabletop 1980s/1990s HF communications receiver styled for CDE. Combines live `0–30 MHz` off-air HF/Shortwave reception via the public KiwiSDR network with curated shortwave relays, linked amateur repeaters, NOAA Weather Radio, emergency feeds, space/mission audio, and plug-and-play USB RTL-SDR dongle support.
+
+### Highlights
+- **Vintage Receiver Faceplate** — Warm backlit ballistic analog **S-Meter**, glowing cyan-green **Vacuum Fluorescent Display (VFD)** + vernier slide-rule scale, and weighted spun-aluminum **VFO flywheel**.
+- **Real-Time GStreamer Audio DSP Knobs** — Interactive rotary knobs and switches for **AF Gain**, **RF Gain**, **Squelch**, **Clarifier (`±2.50 kHz` RIT/Pitch)**, **IF Bandpass (`300 Hz` CW – `12 kHz` Wide)**, **Tone**, **Noise Blanker (`NB` + `NB Level`)**, and **ANL**.
+- **Direct Emergency & NOAA Buttons + Hold-to-Save Memories** — Dedicated safety-orange **`FEMA / EMERG`** and NOAA-blue **`NOAA WX`** buttons, curated non-music category dropdowns, 12 press-and-hold memory presets (`M01`–`M12`), 1-click `.wav` aircheck recording, and plug-and-play **RTL-SDR** support.
+
+```bash
+cd dtRadio && ./install.sh
 ```
 
 

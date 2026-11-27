@@ -1,0 +1,12 @@
+set DtDbVersion=1.0
+
+ACTION dtRadio
+{
+     LABEL         dtRadio
+     ARG_COUNT     0
+     ICON          dtradio
+     TYPE          COMMAND
+     WINDOW_TYPE   NO_STDIO
+     EXEC_STRING   __HOME__/.local/bin/dtradio
+     DESCRIPTION   dtRadio — Vintage HF/Shortwave, Amateur Repeater, NOAA, Emergency & Space Receiver.
+}

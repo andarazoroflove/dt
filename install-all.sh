@@ -16,6 +16,7 @@ APPS=(
     dtZip
     dtWine
     dtUpdate
+    dtRadio
 )
 
 echo "=== Installing CDE 'dt' Application Suite into $HOME/.local/bin ==="
@@ -29,5 +30,5 @@ if [ -x /usr/dt/bin/dtaction ]; then
 fi
 
 echo ""
-echo "All 13 CDE applications installed! Restart dtwm (Workspace Menu -> Restart Workspace Manager)"
-echo "to see all launchers in your Utilities and Mail Front Panel subpanels."
+echo "All 14 CDE applications installed! Restart dtwm (Workspace Menu -> Restart Workspace Manager)"
+echo "to see all launchers in your Utilities, Mail, and Radio Apps Front Panel subpanels."

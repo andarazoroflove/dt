@@ -1,0 +1,2318 @@
+#!/usr/bin/env python3
+"""
+dtRadio — Vintage HF/Shortwave, Amateur Repeater, NOAA, Emergency & Space Receiver for CDE
+
+Features:
+  - Authentic 1980s/1990s communications receiver faceplate styled for CDE (OSF/Motif bevels):
+      * Warm backlit ballistic Analog S-Meter (S1..S9 +20 +40 +60 dB) driven by live audio/RF
+      * Glowing cyan-green Vacuum Fluorescent Display (VFD) + scrolling vernier dial scale
+      * Weighted spun-aluminum VFO tuning flywheel (drag or scroll wheel)
+      * 6 interactive rotary DSP knobs: AF GAIN, RF GAIN, SQUELCH, CLARIFIER, IF WIDTH, TONE/NB
+      * Hardware switches: NB (Noise Blanker), ANL (Voice Limiter), CLAR, ATT (-12dB), AGC, LOCK, MUTE, REC
+  - Direct Safety-Orange [FEMA / EMERG] button (Emergency audio + live OpenFEMA & NWS CAP alerts)
+  - Direct NOAA-Blue [NOAA WX] button (24/7 live NOAA Weather Radio All-Hazards transmitters)
+  - Live 0-30 MHz off-air HF/Shortwave reception via the public KiwiSDR network (WebSocket PCM/ADPCM)
+  - Curated non-music station banks (HF Time/Utility, Ham Bands & CW, Shortwave Relays, NOAA, Emergency/Scanners, Space)
+  - 12-channel Memory Bank (M01-M12): short-click to recall, press-and-hold (0.65s) to store favorite
+  - Built-in plug-and-play USB RTL-SDR hardware support (`rtl_fm` 24-1766 MHz) ready when a dongle is connected
+"""
+
+import array
+import base64
+import datetime
+import json
+import math
+import os
+import queue
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+import wave
+from pathlib import Path
+
+import cairo
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("Pango", "1.0")
+gi.require_version("Gst", "1.0")
+from gi.repository import Gdk, GLib, Gst, Gtk, Pango
+
+Gst.init(None)
+
+HOME = Path.home()
+CONFIG_DIR = HOME / ".config" / "dtradio"
+MEM_FILE = CONFIG_DIR / "memories.json"
+STATE_FILE = CONFIG_DIR / "state.json"
+REC_DIR = HOME / "Music" / "dtRadio"
+UA = "dtRadio/1.0 (CDE Workstation Communications Receiver)"
+
+
+# ---------------------------------------------------------------------------
+# CDE Palette Loader & Vintage Receiver Motif CSS
+# ---------------------------------------------------------------------------
+def load_cde_palette() -> tuple[str, str, str]:
+    chrome, sel, well = "#aeb2c3", "#2c567e", "#fff7e9"
+    try:
+        out = subprocess.check_output(["xrdb", "-query"], text=True, stderr=subprocess.DEVNULL)
+        pal_name = "Crimson.dp"
+        for ln in out.splitlines():
+            if "ColorPalette:" in ln:
+                pal_name = ln.split(":", 1)[1].strip()
+                break
+        for pdir in (HOME / ".dt/palettes", Path("/usr/dt/palettes")):
+            pf = pdir / pal_name
+            if pf.is_file():
+                hexes = [l.strip() for l in pf.read_text().splitlines() if l.strip().startswith("#")]
+                if len(hexes) >= 4:
+                    def norm16(h: str) -> str:
+                        h = h.lstrip("#")
+                        return f"#{h[0:2]}{h[4:6]}{h[8:10]}" if len(h) == 12 else "#" + h[:6]
+                    chrome, sel, well = norm16(hexes[1]), norm16(hexes[2]), norm16(hexes[3])
+                break
+    except Exception:
+        pass
+    return chrome, sel, well
+
+
+def build_receiver_css(chrome: str, sel: str, well: str) -> bytes:
+    css = f"""
+    window, dialog, .background {{
+        background-color: {chrome};
+        color: #101216;
+        font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+        font-size: 9pt;
+    }}
+    .rx-cabinet {{
+        background-color: #2f343f;
+        border-top: 2px solid #596173;
+        border-left: 2px solid #596173;
+        border-right: 2px solid #171a20;
+        border-bottom: 2px solid #171a20;
+        padding: 6px;
+    }}
+    .rx-strip {{
+        background-color: #383e4b;
+        border-top: 2px solid #575f70;
+        border-left: 2px solid #575f70;
+        border-right: 2px solid #1c2028;
+        border-bottom: 2px solid #1c2028;
+        padding: 4px 6px;
+    }}
+    .rx-engraved {{
+        color: #d7deeb;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8pt;
+    }}
+    button {{
+        background-image: none;
+        background-color: #464d5c;
+        color: #edf2f7;
+        border-top: 2px solid #757f94;
+        border-left: 2px solid #757f94;
+        border-right: 2px solid #1d2129;
+        border-bottom: 2px solid #1d2129;
+        border-radius: 0px;
+        padding: 3px 7px;
+        box-shadow: none;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-weight: bold;
+        font-size: 8.5pt;
+    }}
+    button label {{
+        color: #edf2f7;
+    }}
+    button:hover {{
+        background-color: #525a6b;
+    }}
+    button:active, button:checked {{
+        background-color: #282d37;
+        border-top: 2px solid #191c22;
+        border-left: 2px solid #191c22;
+        border-right: 2px solid #6d768a;
+        border-bottom: 2px solid #6d768a;
+    }}
+    button.sw-active {{
+        background-color: #234c3e;
+        color: #68f7c4;
+        border-top: 2px solid #142b23;
+        border-left: 2px solid #142b23;
+        border-right: 2px solid #4fa387;
+        border-bottom: 2px solid #4fa387;
+    }}
+    button.sw-active label {{
+        color: #68f7c4;
+    }}
+    button.btn-fema {{
+        background-color: #d95b16;
+        color: #ffffff;
+        border-top: 2px solid #ff9c63;
+        border-left: 2px solid #ff9c63;
+        border-right: 2px solid #662705;
+        border-bottom: 2px solid #662705;
+        padding: 4px 10px;
+    }}
+    button.btn-fema:hover {{
+        background-color: #eb6821;
+    }}
+    button.btn-fema label {{
+        color: #ffffff;
+        font-weight: bold;
+    }}
+    button.btn-noaa {{
+        background-color: #1d5ba8;
+        color: #ffffff;
+        border-top: 2px solid #6ba4eb;
+        border-left: 2px solid #6ba4eb;
+        border-right: 2px solid #0b274a;
+        border-bottom: 2px solid #0b274a;
+        padding: 4px 10px;
+    }}
+    button.btn-noaa:hover {{
+        background-color: #256bc2;
+    }}
+    button.btn-noaa label {{
+        color: #ffffff;
+        font-weight: bold;
+    }}
+    button.btn-rec-on {{
+        background-color: #9e1f1f;
+        color: #ffdada;
+        border-top: 2px solid #470a0a;
+        border-left: 2px solid #470a0a;
+        border-right: 2px solid #e06c6c;
+        border-bottom: 2px solid #e06c6c;
+    }}
+    button.btn-rec-on label {{
+        color: #ffffff;
+    }}
+    button.mem-btn {{
+        background-color: #3b4250;
+        padding: 3px 4px;
+        font-size: 8pt;
+    }}
+    button.mem-active {{
+        background-color: #2c4a63;
+        border-top: 2px solid #162633;
+        border-left: 2px solid #162633;
+        border-right: 2px solid #6aa9db;
+        border-bottom: 2px solid #6aa9db;
+    }}
+    button.mem-active label {{
+        color: #5efce0;
+    }}
+    combobox button.combo {{
+        background-color: #232832;
+        color: #d8f8ee;
+        border-top: 2px solid #161920;
+        border-left: 2px solid #161920;
+        border-right: 2px solid #626b7f;
+        border-bottom: 2px solid #626b7f;
+        padding: 3px 6px;
+    }}
+    combobox button.combo label, combobox cellview {{
+        color: #d8f8ee;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8.5pt;
+    }}
+    menu {{
+        background-color: #2b303b;
+        color: #edf2f7;
+        border: 1px solid #6c758a;
+    }}
+    menuitem {{
+        color: #edf2f7;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8.5pt;
+        padding: 3px 8px;
+    }}
+    menuitem:hover {{
+        background-color: {sel};
+        color: #ffffff;
+    }}
+    .cde-status {{
+        background-color: {chrome};
+        color: #101216;
+        padding: 2px 8px;
+        border-top: 2px solid #585c6c;
+        border-left: 2px solid #585c6c;
+        border-right: 2px solid #e6e9f2;
+        border-bottom: 2px solid #e6e9f2;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8pt;
+    }}
+    """
+    return css.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Curated Non-Music Station Catalog (HF/SW, Repeaters/CW, NOAA, FEMA, Space, RTL-SDR)
+# ---------------------------------------------------------------------------
+# source: "kiwi" (live 0-30 MHz KiwiSDR), "stream" (verified HTTP stream), "rtlsdr" (local USB dongle)
+STATION_BANKS: list[tuple[str, list[dict]]] = [
+    (
+        "HF TIME & UTILITY (0-30 MHz SDR)",
+        [
+            {"title": "WWV 10.000 MHz — NIST Atomic Time (Ft. Collins)", "freq_khz": 10000.0, "mode": "AM", "source": "kiwi"},
+            {"title": "WWV 5.000 MHz — NIST 60m Nighttime Time", "freq_khz": 5000.0, "mode": "AM", "source": "kiwi"},
+            {"title": "WWV 15.000 MHz — NIST 20m Daytime Time", "freq_khz": 15000.0, "mode": "AM", "source": "kiwi"},
+            {"title": "WWV 20.000 MHz — NIST 15m Propagation Beacon", "freq_khz": 20000.0, "mode": "AM", "source": "kiwi"},
+            {"title": "CHU 3.330 MHz — NRC Ottawa Time Signal", "freq_khz": 3330.0, "mode": "USB", "source": "kiwi"},
+            {"title": "CHU 7.850 MHz — NRC Ottawa 40m Time", "freq_khz": 7850.0, "mode": "USB", "source": "kiwi"},
+            {"title": "CHU 14.670 MHz — NRC Ottawa 20m Time", "freq_khz": 14670.0, "mode": "USB", "source": "kiwi"},
+            {"title": "USAF HFGCS 11.175 MHz — Primary EAM 'Skyking'", "freq_khz": 11175.0, "mode": "USB", "source": "kiwi"},
+            {"title": "USAF HFGCS 8.992 MHz — Night EAM Net", "freq_khz": 8992.0, "mode": "USB", "source": "kiwi"},
+            {"title": "USAF HFGCS 13.200 MHz — High-Band EAM", "freq_khz": 13200.0, "mode": "USB", "source": "kiwi"},
+            {"title": "Shannon VOLMET 5.505 MHz — North Atlantic WX", "freq_khz": 5505.0, "mode": "USB", "source": "kiwi"},
+            {"title": "Gander/NY VOLMET 6.604 MHz — Atlantic Aero WX", "freq_khz": 6604.0, "mode": "USB", "source": "kiwi"},
+            {"title": "Shannon VOLMET 8.957 MHz — Daytime Aero WX", "freq_khz": 8957.0, "mode": "USB", "source": "kiwi"},
+            {"title": "USCG 5.696 MHz — Coast Guard HF SAR Guard", "freq_khz": 5696.0, "mode": "USB", "source": "kiwi"},
+            {"title": "USCG 8.983 MHz — Coast Guard CAMS Atlantic", "freq_khz": 8983.0, "mode": "USB", "source": "kiwi"},
+            {"title": "UVB-76 4.625 MHz — 'The Buzzer' Marker", "freq_khz": 4625.0, "mode": "USB", "source": "kiwi"},
+        ],
+    ),
+    (
+        "SHORTWAVE BROADCASTERS (SW)",
+        [
+            {"title": "WRMI 9.395 MHz — Radio Miami Int'l (SW Relay)", "freq_khz": 9395.0, "mode": "AM", "source": "stream", "url": "http://wrmi.listen.creek.fm/stream"},
+            {"title": "WBCQ 7.490 MHz — 'The Planet' Monticello ME", "freq_khz": 7490.0, "mode": "AM", "source": "stream", "url": "http://splatterbox.us/wbcq1"},
+            {"title": "WBCQ 6.160 MHz — Area 51 Shortwave", "freq_khz": 6160.0, "mode": "AM", "source": "stream", "url": "http://splatterbox.us/area51"},
+            {"title": "WINB 9.265 MHz — Red Lion PA Shortwave", "freq_khz": 9265.0, "mode": "AM", "source": "stream", "url": "http://winb.mntts.com:82/broadwave.mp3"},
+            {"title": "RNZ Pacific 13.840 MHz — New Zealand SW", "freq_khz": 13840.0, "mode": "AM", "source": "stream", "url": "http://radionz-ice.streamguys.com/international.mp3"},
+            {"title": "BBC World Service 12.095 MHz — Int'l SW Feed", "freq_khz": 12095.0, "mode": "AM", "source": "stream", "url": "http://stream.live.vc.bbcmedia.co.uk/bbc_world_service"},
+            {"title": "WWCR 12.160 MHz — Nashville Shortwave", "freq_khz": 12160.0, "mode": "AM", "source": "stream", "url": "http://wwcr.gsradio.net:3763/;.mp3"},
+            {"title": "WTWW 5.085 MHz — Lebanon TN (Live 60m SDR)", "freq_khz": 5085.0, "mode": "AM", "source": "kiwi"},
+            {"title": "WRMI 5.950 MHz — Okeechobee FL (Live 49m SDR)", "freq_khz": 5950.0, "mode": "AM", "source": "kiwi"},
+            {"title": "CFRX 6.070 MHz — Toronto SW Relay (Live 49m SDR)", "freq_khz": 6070.0, "mode": "AM", "source": "kiwi"},
+            {"title": "CHU / SW 9.420 MHz — 31m Int'l Broadcast Band (SDR)", "freq_khz": 9420.0, "mode": "AM", "source": "kiwi"},
+        ],
+    ),
+    (
+        "HAM BANDS, CW & SCANNERS",
+        [
+            {"title": "20m 14.300 MHz — Maritime & Global Emergency Net", "freq_khz": 14300.0, "mode": "USB", "source": "kiwi"},
+            {"title": "20m 14.325 MHz — Hurricane Watch Net (HWN)", "freq_khz": 14325.0, "mode": "USB", "source": "kiwi"},
+            {"title": "20m 14.230 MHz — International SSTV Calling", "freq_khz": 14230.0, "mode": "USB", "source": "kiwi"},
+            {"title": "20m 14.245 MHz — 20m DX SSB Window", "freq_khz": 14245.0, "mode": "USB", "source": "kiwi"},
+            {"title": "20m 14.074 MHz — 20m FT8 Digital Center", "freq_khz": 14074.0, "mode": "USB", "source": "kiwi"},
+            {"title": "40m 7.255 MHz — East Coast Waterway Net", "freq_khz": 7255.0, "mode": "LSB", "source": "kiwi"},
+            {"title": "40m 7.185 MHz — 40m General SSB Ragchew", "freq_khz": 7185.0, "mode": "LSB", "source": "kiwi"},
+            {"title": "40m 7.074 MHz — 40m FT8 Digital Center", "freq_khz": 7074.0, "mode": "USB", "source": "kiwi"},
+            {"title": "40m 7.030 MHz — 40m QRP CW Calling", "freq_khz": 7030.0, "mode": "CW", "source": "kiwi"},
+            {"title": "75m 3.860 MHz — Nighttime Regional LSB", "freq_khz": 3860.0, "mode": "LSB", "source": "kiwi"},
+            {"title": "10m 28.400 MHz — 10m Worldwide SSB Calling", "freq_khz": 28400.0, "mode": "USB", "source": "kiwi"},
+            {"title": "MorseOps Ch.1 — 15 WPM Live CW Practice", "freq_khz": 7040.0, "mode": "CW", "source": "stream", "url": "https://stream.morseops.com/15wpm.mp3"},
+            {"title": "MorseOps Ch.2 — 20 WPM Live CW Practice", "freq_khz": 7041.0, "mode": "CW", "source": "stream", "url": "https://stream.morseops.com/20wpm.mp3"},
+            {"title": "MorseOps Ch.3 — 25 WPM Live CW Practice", "freq_khz": 7042.0, "mode": "CW", "source": "stream", "url": "https://stream.morseops.com/25wpm.mp3"},
+            {"title": "MorseOps Ch.4 — 30 WPM High-Speed CW", "freq_khz": 7043.0, "mode": "CW", "source": "stream", "url": "https://stream.morseops.com/30wpm.mp3"},
+            {"title": "VHF Repeater — SF Metro Dispatch Scanner", "freq_khz": 154190.0, "mode": "NFM", "source": "stream", "url": "https://ice4.somafm.com/scanner-128-mp3"},
+            {"title": "VHF Airband — JFK Tower 119.10 MHz", "freq_khz": 119100.0, "mode": "AM", "source": "stream", "url": "http://d.liveatc.net/kjfk_twr"},
+            {"title": "VHF Airband — LAX Tower 120.95 MHz", "freq_khz": 120950.0, "mode": "AM", "source": "stream", "url": "http://d.liveatc.net/klax3"},
+            {"title": "VHF Airband — Atlanta Tower 119.10 MHz", "freq_khz": 119100.0, "mode": "AM", "source": "stream", "url": "http://d.liveatc.net/katl_twr"},
+        ],
+    ),
+    (
+        "NOAA WEATHER RADIO (NWR)",
+        [
+            {"title": "NOAA KWO35 162.550 — New York City / NJ", "freq_khz": 162550.0, "mode": "NFM", "source": "stream", "url": "https://wxradio.org/NY-NewYorkCity-KWO35"},
+            {"title": "NOAA KEC56 162.400 — Dallas / Ft. Worth TX", "freq_khz": 162400.0, "mode": "NFM", "source": "stream", "url": "https://wxradio.org/TX-Dallas-KEC56"},
+            {"title": "NOAA KEC49 162.550 — Monterey / Bay Area CA", "freq_khz": 162550.0, "mode": "NFM", "source": "stream", "url": "https://wxradio.org/CA-Monterey-KEC49"},
+            {"title": "NOAA KIH35 162.550 — Pittsburgh PA", "freq_khz": 162550.0, "mode": "NFM", "source": "stream", "url": "https://wxradio.org/PA-Pittsburgh-KIH35"},
+            {"title": "NOAA KHB60 162.550 — Seattle WA", "freq_khz": 162550.0, "mode": "NFM", "source": "stream", "url": "https://wxradio.bobc.io/stream/KHB60"},
+            {"title": "NOAA WWG24 162.425 — Puget Sound Marine WA", "freq_khz": 162425.0, "mode": "NFM", "source": "stream", "url": "https://wxradio.bobc.io/stream/WWG24"},
+            {"title": "NOAA KEC74 162.550 — Indianapolis IN", "freq_khz": 162550.0, "mode": "NFM", "source": "stream", "url": "http://wxradio.org:8000/IN-Indianapolis-KEC74"},
+            {"title": "NOAA WXK56 162.400 — Athens / Atlanta GA", "freq_khz": 162400.0, "mode": "NFM", "source": "stream", "url": "https://wxradio.org/GA-Athens-WXK56"},
+            {"title": "NOAA WWG57 162.450 — Mansfield OH", "freq_khz": 162450.0, "mode": "NFM", "source": "stream", "url": "https://wxradio.org/OH-Mansfield-WWG57"},
+            {"title": "NOAA WXJ71 162.475 — Peoria IL", "freq_khz": 162475.0, "mode": "NFM", "source": "stream", "url": "https://wxradio.org/IL-Peoria-WXJ71"},
+            {"title": "NOAA WNG654 162.500 — Stillwater OK", "freq_khz": 162500.0, "mode": "NFM", "source": "stream", "url": "https://wxradio.org/OK-Stillwater-WNG654"},
+            {"title": "NOAA WZ2523 162.400 — Frankfort KY", "freq_khz": 162400.0, "mode": "NFM", "source": "stream", "url": "https://wxradio.org/KY-Frankfort-WZ2523"},
+        ],
+    ),
+    (
+        "FEMA & EMERGENCY NETS",
+        [
+            {"title": "VOV1650 — Civil Emergency & Island Alert TIS", "freq_khz": 1650.0, "mode": "AM", "source": "stream", "url": "https://ice23.securenetsystems.net/VOV1650"},
+            {"title": "WPSB / WWOP — Municipal Emergency Advisory", "freq_khz": 99500.0, "mode": "NFM", "source": "stream", "url": "https://ice6.securenetsystems.net:80/WPSBLP"},
+            {"title": "FEMA FNARS 10.493 MHz — National Radio System (SDR)", "freq_khz": 10493.0, "mode": "USB", "source": "kiwi"},
+            {"title": "FEMA FNARS 5.211 MHz — Night Emergency HF (SDR)", "freq_khz": 5211.0, "mode": "USB", "source": "kiwi"},
+            {"title": "60m Ch.3 5.357 MHz — Fed/Ham Interop Emergency (SDR)", "freq_khz": 5357.0, "mode": "USB", "source": "kiwi"},
+            {"title": "Hurricane Watch Net 14.325 MHz — Emergency USB (SDR)", "freq_khz": 14325.0, "mode": "USB", "source": "kiwi"},
+            {"title": "Global Emergency Net 14.300 MHz — Maritime/ARES (SDR)", "freq_khz": 14300.0, "mode": "USB", "source": "kiwi"},
+            {"title": "WARSUG — Fire & Emergency Command Dispatch", "freq_khz": 163100.0, "mode": "NFM", "source": "stream", "url": "https://stream.warsug.info/WARSUG"},
+        ],
+    ),
+    (
+        "SPACE & MISSION AUDIO",
+        [
+            {"title": "NASA NTV-1 — ISS & Live Mission Operations Audio", "freq_khz": 259700.0, "mode": "AM", "source": "stream", "url": "https://ntv1.akamaized.net/hls/live/2014075/NASA-NTV1-HLS/master.m3u8"},
+            {"title": "Radio Jove 20.100 MHz — Jupiter / Solar HF Monitor (SDR)", "freq_khz": 20100.0, "mode": "USB", "source": "kiwi"},
+            {"title": "WWV 10.000 MHz — Space Weather Broadcast (:18 hr)", "freq_khz": 10000.0, "mode": "AM", "source": "kiwi"},
+            {"title": "WWV 15.000 MHz — Ionospheric Propagation Beacon", "freq_khz": 15000.0, "mode": "AM", "source": "kiwi"},
+        ],
+    ),
+    (
+        "RTL-SDR LOCAL USB (24-1766 MHz)",
+        [
+            {"title": "RTL-SDR 162.550 MHz — Local NOAA Weather Ch.7", "freq_khz": 162550.0, "mode": "NFM", "source": "rtlsdr"},
+            {"title": "RTL-SDR 162.400 MHz — Local NOAA Weather Ch.1", "freq_khz": 162400.0, "mode": "NFM", "source": "rtlsdr"},
+            {"title": "RTL-SDR 146.520 MHz — 2m National FM Simplex", "freq_khz": 146520.0, "mode": "NFM", "source": "rtlsdr"},
+            {"title": "RTL-SDR 446.000 MHz — 70cm National FM Simplex", "freq_khz": 446000.0, "mode": "NFM", "source": "rtlsdr"},
+            {"title": "RTL-SDR 145.800 MHz — ISS VHF Voice Downlink", "freq_khz": 145800.0, "mode": "NFM", "source": "rtlsdr"},
+            {"title": "RTL-SDR 121.500 MHz — VHF Aeronautical Guard", "freq_khz": 121500.0, "mode": "AM", "source": "rtlsdr"},
+            {"title": "RTL-SDR 156.800 MHz — Marine VHF Ch.16 Distress", "freq_khz": 156800.0, "mode": "NFM", "source": "rtlsdr"},
+        ],
+    ),
+]
+
+DEFAULT_MEMORIES: list[dict] = [
+    {"label": "WWV 10M",  "title": "WWV 10.000 MHz — NIST Atomic Time",      "freq_khz": 10000.0,  "mode": "AM",  "source": "kiwi"},
+    {"label": "SKYKING",  "title": "USAF HFGCS 11.175 MHz — Primary EAM",    "freq_khz": 11175.0,  "mode": "USB", "source": "kiwi"},
+    {"label": "14.300",   "title": "20m 14.300 MHz — Global Emergency Net",  "freq_khz": 14300.0,  "mode": "USB", "source": "kiwi"},
+    {"label": "WRMI SW",  "title": "WRMI 9.395 MHz — Radio Miami Int'l",     "freq_khz": 9395.0,   "mode": "AM",  "source": "stream", "url": "http://wrmi.listen.creek.fm/stream"},
+    {"label": "WBCQ SW",  "title": "WBCQ 7.490 MHz — The Planet SW",         "freq_khz": 7490.0,   "mode": "AM",  "source": "stream", "url": "http://splatterbox.us/wbcq1"},
+    {"label": "RNZ SW",   "title": "RNZ Pacific 13.840 MHz — Shortwave",     "freq_khz": 13840.0,  "mode": "AM",  "source": "stream", "url": "http://radionz-ice.streamguys.com/international.mp3"},
+    {"label": "BBC WS",   "title": "BBC World Service 12.095 MHz — SW",      "freq_khz": 12095.0,  "mode": "AM",  "source": "stream", "url": "http://stream.live.vc.bbcmedia.co.uk/bbc_world_service"},
+    {"label": "CW 15W",   "title": "MorseOps Ch.1 — 15 WPM Live CW",         "freq_khz": 7040.0,   "mode": "CW",  "source": "stream", "url": "https://stream.morseops.com/15wpm.mp3"},
+    {"label": "NOAA NY",  "title": "NOAA KWO35 162.550 — NYC Weather",       "freq_khz": 162550.0, "mode": "NFM", "source": "stream", "url": "https://wxradio.org/NY-NewYorkCity-KWO35"},
+    {"label": "NOAA TX",  "title": "NOAA KEC56 162.400 — Dallas Weather",    "freq_khz": 162400.0, "mode": "NFM", "source": "stream", "url": "https://wxradio.org/TX-Dallas-KEC56"},
+    {"label": "JFK TWR",  "title": "VHF Airband — JFK Tower 119.10 MHz",     "freq_khz": 119100.0, "mode": "AM",  "source": "stream", "url": "http://d.liveatc.net/kjfk_twr"},
+    {"label": "NASA ISS", "title": "NASA NTV-1 — ISS & Mission Operations",  "freq_khz": 259700.0, "mode": "AM",  "source": "stream", "url": "https://ntv1.akamaized.net/hls/live/2014075/NASA-NTV1-HLS/master.m3u8"},
+]
+
+# Built-in reliable North American & Global KiwiSDR seed servers (supplemented live by rx.linkfanel.net)
+SEED_KIWISDRS: list[tuple[str, str]] = [
+    ("http://ve3hoa.ddns.net:8073", "VE3HOA — Ottawa, Canada (0-30 MHz)"),
+    ("http://sigmasdr.ddns.net:8075", "N1NTE — Massachusetts, USA (0-30 MHz)"),
+    ("http://ea8bfk.ddns.net:8073", "EA8BFK — Atlantic DX Receiver (0-30 MHz)"),
+    ("http://g8ure.ddns.net:8079", "G8URE — UK Transatlantic HF (0-30 MHz)"),
+    ("http://sa4bna.hopto.org:8073", "SA4BNA — Nordic HF Receiver (0-30 MHz)"),
+]
+
+
+# ---------------------------------------------------------------------------
+# IMA-ADPCM Decoder for KiwiSDR Compressed Audio Frames (flags & 0x10)
+# ---------------------------------------------------------------------------
+IMA_STEP_TABLE = (
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31,
+    34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143,
+    157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658,
+    724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024,
+    3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899,
+    15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
+)
+IMA_INDEX_TABLE = (-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8)
+
+
+def decode_ima_adpcm(data: bytes, state: list[int]) -> bytes:
+    pred, idx = state[0], state[1]
+    out = array.array("h")
+    append = out.append
+    for b in data:
+        for nib in (b & 0x0F, (b >> 4) & 0x0F):
+            step = IMA_STEP_TABLE[idx]
+            diff = step >> 3
+            if nib & 1:
+                diff += step >> 2
+            if nib & 2:
+                diff += step >> 1
+            if nib & 4:
+                diff += step
+            if nib & 8:
+                pred -= diff
+                if pred < -32768:
+                    pred = -32768
+            else:
+                pred += diff
+                if pred > 32767:
+                    pred = 32767
+            idx += IMA_INDEX_TABLE[nib]
+            if idx < 0:
+                idx = 0
+            elif idx > 88:
+                idx = 88
+            append(pred)
+    state[0], state[1] = pred, idx
+    return out.tobytes()
+
+
+# ---------------------------------------------------------------------------
+# RTL-SDR Hardware Detection Helper
+# ---------------------------------------------------------------------------
+def detect_rtlsdr_status() -> tuple[bool, str]:
+    has_bin = bool(shutil.which("rtl_fm"))
+    has_usb = False
+    try:
+        for dev in Path("/sys/bus/usb/devices").glob("*"):
+            vid_f = dev / "idVendor"
+            pid_f = dev / "idProduct"
+            if vid_f.is_file() and pid_f.is_file():
+                vid = vid_f.read_text().strip().lower()
+                pid = pid_f.read_text().strip().lower()
+                if vid == "0bda" and pid in ("2838", "2832"):
+                    has_usb = True
+                    break
+    except Exception:
+        pass
+    if has_usb and has_bin:
+        return True, "RTL2832U USB SDR READY"
+    if has_usb and not has_bin:
+        return False, "RTL2832U FOUND (INSTALL rtl-sdr)"
+    return False, "NO USB RTL-SDR CONNECTED (PLUG IN LATER)"
+
+
+# ---------------------------------------------------------------------------
+# Interactive Machined Vintage Rotary Knob Widget (Cairo)
+# ---------------------------------------------------------------------------
+class RotaryKnob(Gtk.DrawingArea):
+    def __init__(self, label: str, init_val: float, default_val: float, on_change, fmt_fn=None):
+        super().__init__()
+        self.label = label
+        self.value = max(0.0, min(1.0, init_val))
+        self.default_val = default_val
+        self.on_change = on_change
+        self.fmt_fn = fmt_fn
+        self._drag_y = None
+        self._drag_start_val = self.value
+
+        self.set_size_request(86, 86)
+        self.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+            | Gdk.EventMask.SCROLL_MASK
+        )
+        self.connect("draw", self._on_draw)
+        self.connect("button-press-event", self._on_press)
+        self.connect("button-release-event", self._on_release)
+        self.connect("motion-notify-event", self._on_motion)
+        self.connect("scroll-event", self._on_scroll)
+
+    def set_value(self, v: float, notify: bool = False):
+        self.value = max(0.0, min(1.0, v))
+        self.queue_draw()
+        if notify and self.on_change:
+            self.on_change(self.value)
+
+    def _on_press(self, _w, ev):
+        if ev.type == Gdk.EventType._2BUTTON_PRESS:
+            self.set_value(self.default_val, notify=True)
+            return True
+        if ev.button == 1:
+            self._drag_y = ev.y
+            self._drag_start_val = self.value
+            return True
+        return False
+
+    def _on_release(self, _w, _ev):
+        self._drag_y = None
+        return True
+
+    def _on_motion(self, _w, ev):
+        if self._drag_y is not None:
+            dy = self._drag_y - ev.y
+            self.set_value(self._drag_start_val + dy / 110.0, notify=True)
+            return True
+        return False
+
+    def _on_scroll(self, _w, ev):
+        step = 0.04
+        if ev.direction == Gdk.ScrollDirection.UP:
+            self.set_value(self.value + step, notify=True)
+        elif ev.direction == Gdk.ScrollDirection.DOWN:
+            self.set_value(self.value - step, notify=True)
+        elif ev.direction == Gdk.ScrollDirection.SMOOTH:
+            _, _dx, dy = ev.get_scroll_deltas()
+            self.set_value(self.value - dy * 0.03, notify=True)
+        return True
+
+    def _on_draw(self, w, cr: cairo.Context):
+        alloc = w.get_allocation()
+        cx = alloc.width * 0.5
+        cy = 34.0
+        r = 21.0
+
+        # Scale ticks (-135 deg to +135 deg from top = 135..405 deg in math coords)
+        a_start = math.radians(135.0)
+        a_span = math.radians(270.0)
+        for i in range(11):
+            frac = i / 10.0
+            ang = a_start + frac * a_span
+            r0 = r + 3.5
+            r1 = r + (7.0 if i in (0, 5, 10) else 5.2)
+            cr.set_line_width(1.5 if i in (0, 5, 10) else 1.0)
+            if frac <= self.value + 0.001:
+                cr.set_source_rgb(0.32, 0.94, 0.82)
+            else:
+                cr.set_source_rgb(0.62, 0.67, 0.76)
+            cr.move_to(cx + r0 * math.cos(ang), cy + r0 * math.sin(ang))
+            cr.line_to(cx + r1 * math.cos(ang), cy + r1 * math.sin(ang))
+            cr.stroke()
+
+        # Drop shadow
+        cr.arc(cx + 1.5, cy + 2.2, r + 1.0, 0, 2 * math.pi)
+        cr.set_source_rgba(0.05, 0.06, 0.08, 0.75)
+        cr.fill()
+
+        # Outer knurled dark skirt
+        cr.arc(cx, cy, r, 0, 2 * math.pi)
+        cr.set_source_rgb(0.16, 0.18, 0.22)
+        cr.fill()
+
+        # Knurl notches
+        cr.set_line_width(1.0)
+        cr.set_source_rgba(0.45, 0.50, 0.60, 0.55)
+        for k in range(18):
+            ka = k * (2.0 * math.pi / 18.0)
+            cr.move_to(cx + (r - 2.5) * math.cos(ka), cy + (r - 2.5) * math.sin(ka))
+            cr.line_to(cx + r * math.cos(ka), cy + r * math.sin(ka))
+            cr.stroke()
+
+        # Brushed aluminum cap gradient
+        pat = cairo.LinearGradient(cx - r, cy - r, cx + r, cy + r)
+        pat.add_color_stop_rgb(0.0, 0.82, 0.85, 0.91)
+        pat.add_color_stop_rgb(0.5, 0.53, 0.57, 0.65)
+        pat.add_color_stop_rgb(1.0, 0.30, 0.34, 0.40)
+        cr.arc(cx, cy, r - 3.2, 0, 2 * math.pi)
+        cr.set_source(pat)
+        cr.fill()
+
+        # Pointer line
+        val_ang = a_start + self.value * a_span
+        cr.set_line_width(2.4)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_source_rgb(1.0, 0.44, 0.16)
+        cr.move_to(cx + 4.0 * math.cos(val_ang), cy + 4.0 * math.sin(val_ang))
+        cr.line_to(cx + (r - 4.8) * math.cos(val_ang), cy + (r - 4.8) * math.sin(val_ang))
+        cr.stroke()
+
+        # Engraved label + compact readout
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(9.5)
+        ext = cr.text_extents(self.label)
+        cr.set_source_rgb(0.86, 0.90, 0.96)
+        cr.move_to(cx - ext.width * 0.5, 72.0)
+        cr.show_text(self.label)
+
+        if self.fmt_fn:
+            sub = self.fmt_fn(self.value)
+            cr.set_font_size(8.2)
+            ext2 = cr.text_extents(sub)
+            cr.set_source_rgb(0.45, 0.92, 0.82)
+            cr.move_to(cx - ext2.width * 0.5, 83.5)
+            cr.show_text(sub)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Main Audio DSP + KiwiSDR WebSocket + HTTP Stream + RTL-SDR Engine
+# ---------------------------------------------------------------------------
+class ReceiverAudioEngine:
+    def __init__(self, on_level_cb, on_meta_cb, on_status_cb):
+        self.on_level_cb = on_level_cb
+        self.on_meta_cb = on_meta_cb
+        self.on_status_cb = on_status_cb
+
+        self.af_gain = 0.78
+        self.rf_gain = 0.80
+        self.squelch = 0.0
+        self.clarifier_khz = 0.0
+        self.clar_enabled = False
+        self.if_width_norm = 0.68  # 0.0=300Hz CW .. 1.0=12kHz Wide
+        self.tone_norm = 0.60
+        self.nb_enabled = False
+        self.anl_enabled = False
+        self.att_enabled = False
+        self.agc_slow = False
+        self.muted = False
+        self.squelch_open = True
+
+        self.recording = False
+        self._wav_lock = threading.Lock()
+        self._wav_fp = None
+        self.rec_path = ""
+
+        self._pipe = None
+        self._appsrc = None
+        self._rf_vol = None
+        self._af_vol = None
+        self._if_bp = None
+        self._tone_eq = None
+        self._nb_comp = None
+
+        self._worker_stop = threading.Event()
+        self._worker_thread = None
+        self._kiwi_cmd_q: queue.Queue[str] = queue.Queue()
+        self._rtl_proc = None
+
+        self.kiwi_servers: list[tuple[str, str]] = list(SEED_KIWISDRS)
+        self.selected_kiwi_idx = 0  # 0 = Auto
+
+    def _teardown_workers(self):
+        self._worker_stop.set()
+        if self._rtl_proc is not None:
+            try:
+                self._rtl_proc.terminate()
+                self._rtl_proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    self._rtl_proc.kill()
+                except Exception:
+                    pass
+            self._rtl_proc = None
+        if self._worker_thread and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=1.2)
+        self._worker_thread = None
+        self._worker_stop = threading.Event()
+        while not self._kiwi_cmd_q.empty():
+            try:
+                self._kiwi_cmd_q.get_nowait()
+            except Exception:
+                break
+
+    def stop_pipeline(self):
+        self._teardown_workers()
+        if self._pipe is not None:
+            try:
+                self._pipe.set_state(Gst.State.NULL)
+            except Exception:
+                pass
+            self._pipe = None
+            self._appsrc = None
+            self._rf_vol = None
+            self._af_vol = None
+            self._if_bp = None
+            self._tone_eq = None
+            self._nb_comp = None
+
+    def _build_dsp_tail(self, pipe: Gst.Pipeline) -> Gst.Element:
+        conv1 = Gst.ElementFactory.make("audioconvert", None)
+        res1 = Gst.ElementFactory.make("audioresample", None)
+        capsf = Gst.ElementFactory.make("capsfilter", None)
+        capsf.set_property("caps", Gst.Caps.from_string("audio/x-raw,format=F32LE,rate=48000,channels=1"))
+
+        rf_vol = Gst.ElementFactory.make("volume", "rf_vol")
+        nb_comp = Gst.ElementFactory.make("audiodynamic", "nb_comp")
+        if_bp = Gst.ElementFactory.make("audiochebband", "if_bp")
+        tone_eq = Gst.ElementFactory.make("equalizer-3bands", "tone_eq")
+        lvl = Gst.ElementFactory.make("level", "smeter_lvl")
+        lvl.set_property("interval", 40_000_000)  # 25 Hz
+        lvl.set_property("post-messages", True)
+        af_vol = Gst.ElementFactory.make("volume", "af_vol")
+
+        tee = Gst.ElementFactory.make("tee", "rec_tee")
+        q_audio = Gst.ElementFactory.make("queue", None)
+        conv_out = Gst.ElementFactory.make("audioconvert", None)
+        res_out = Gst.ElementFactory.make("audioresample", None)
+        sink = Gst.ElementFactory.make("autoaudiosink", None)
+
+        q_rec = Gst.ElementFactory.make("queue", None)
+        conv_rec = Gst.ElementFactory.make("audioconvert", None)
+        res_rec = Gst.ElementFactory.make("audioresample", None)
+        caps_rec = Gst.ElementFactory.make("capsfilter", None)
+        caps_rec.set_property("caps", Gst.Caps.from_string("audio/x-raw,format=S16LE,rate=22050,channels=1"))
+        appsink = Gst.ElementFactory.make("appsink", "wav_tap")
+        appsink.set_property("emit-signals", True)
+        appsink.set_property("sync", False)
+        appsink.set_property("drop", True)
+        appsink.set_property("max-buffers", 12)
+        appsink.connect("new-sample", self._on_rec_sample)
+
+        for el in (
+            conv1, res1, capsf, rf_vol, nb_comp, if_bp, tone_eq, lvl, af_vol,
+            tee, q_audio, conv_out, res_out, sink,
+            q_rec, conv_rec, res_rec, caps_rec, appsink,
+        ):
+            pipe.add(el)
+
+        conv1.link(res1)
+        res1.link(capsf)
+        capsf.link(rf_vol)
+        rf_vol.link(nb_comp)
+        nb_comp.link(if_bp)
+        if_bp.link(tone_eq)
+        tone_eq.link(lvl)
+        lvl.link(af_vol)
+        af_vol.link(tee)
+
+        tee.link(q_audio)
+        q_audio.link(conv_out)
+        conv_out.link(res_out)
+        res_out.link(sink)
+
+        tee.link(q_rec)
+        q_rec.link(conv_rec)
+        conv_rec.link(res_rec)
+        res_rec.link(caps_rec)
+        caps_rec.link(appsink)
+
+        self._rf_vol = rf_vol
+        self._nb_comp = nb_comp
+        self._if_bp = if_bp
+        self._tone_eq = tone_eq
+        self._af_vol = af_vol
+        self.apply_dsp_params()
+
+        bus = pipe.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_bus_msg)
+        return conv1
+
+    def _on_rec_sample(self, appsink):
+        sample = appsink.emit("pull-sample")
+        if sample and self.recording:
+            buf = sample.get_buffer()
+            ok, mapinfo = buf.map(Gst.MapFlags.READ)
+            if ok:
+                try:
+                    with self._wav_lock:
+                        if self._wav_fp is not None:
+                            self._wav_fp.writeframesraw(mapinfo.data)
+                finally:
+                    buf.unmap(mapinfo)
+        return Gst.FlowReturn.OK
+
+    def toggle_recording(self) -> tuple[bool, str]:
+        with self._wav_lock:
+            if self.recording:
+                self.recording = False
+                if self._wav_fp is not None:
+                    try:
+                        self._wav_fp.close()
+                    except Exception:
+                        pass
+                    self._wav_fp = None
+                return False, self.rec_path
+            REC_DIR.mkdir(parents=True, exist_ok=True)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_p = REC_DIR / f"dtradio_aircheck_{ts}.wav"
+            wf = wave.open(str(out_p), "wb")
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(22050)
+            self._wav_fp = wf
+            self.rec_path = str(out_p)
+            self.recording = True
+            return True, self.rec_path
+
+    def apply_dsp_params(self):
+        if self._rf_vol is not None:
+            rf = max(0.05, self.rf_gain * 1.25)
+            if self.att_enabled:
+                rf *= 0.25  # -12 dB pad
+            self._rf_vol.set_property("volume", rf)
+
+        if self._nb_comp is not None:
+            if self.nb_enabled:
+                Gst.util_set_object_arg(self._nb_comp, "mode", "compressor")
+                Gst.util_set_object_arg(self._nb_comp, "characteristics", "hard-knee")
+                self._nb_comp.set_property("threshold", 0.30)
+                self._nb_comp.set_property("ratio", 8.0)
+            else:
+                self._nb_comp.set_property("threshold", 1.0)
+                self._nb_comp.set_property("ratio", 1.0)
+
+        if self._if_bp is not None:
+            Gst.util_set_object_arg(self._if_bp, "mode", "band-pass")
+            # Map IF WIDTH knob (0..1) from 350 Hz narrow CW to 11.5 kHz wide
+            span_hz = 350.0 * math.pow(33.0, self.if_width_norm)
+            if self.anl_enabled:
+                low_hz = 280.0
+                high_hz = min(span_hz, 2950.0)
+            else:
+                low_hz = 95.0 if self.if_width_norm > 0.25 else 360.0
+                high_hz = max(low_hz + 260.0, min(14000.0, low_hz + span_hz))
+            # Subtle Clarifier passband shift when on web stream
+            if self.clar_enabled and abs(self.clarifier_khz) > 0.01:
+                shift = self.clarifier_khz * 120.0
+                low_hz = max(60.0, low_hz + shift * 0.5)
+                high_hz = max(low_hz + 260.0, min(15000.0, high_hz + shift))
+            self._if_bp.set_property("lower-frequency", float(low_hz))
+            self._if_bp.set_property("upper-frequency", float(high_hz))
+
+        if self._tone_eq is not None:
+            # Tone knob shapes HF hiss rolloff (-18 dB .. +4 dB on band2)
+            hi_db = -18.0 + self.tone_norm * 22.0
+            mid_db = -3.0 + self.tone_norm * 5.0
+            if self.anl_enabled:
+                hi_db = min(hi_db, -9.0)
+            self._tone_eq.set_property("band0", -2.0 if self.anl_enabled else 0.0)
+            self._tone_eq.set_property("band1", float(mid_db))
+            self._tone_eq.set_property("band2", float(hi_db))
+
+        self._update_af_gate()
+
+    def _update_af_gate(self):
+        if self._af_vol is not None:
+            if self.muted or not self.squelch_open:
+                self._af_vol.set_property("volume", 0.0)
+            else:
+                self._af_vol.set_property("volume", float(self.af_gain * 1.35))
+
+    def _on_bus_msg(self, _bus, msg):
+        t = msg.type
+        if t == Gst.MessageType.ELEMENT:
+            st = msg.get_structure()
+            if st and st.get_name() == "level":
+                rms_list = st.get_value("rms")
+                if rms_list and len(rms_list) > 0:
+                    rms_db = float(rms_list[0])
+                    # Map RMS (-65 .. -6 dB) to 0..1 signal strength
+                    norm = max(0.0, min(1.0, (rms_db + 62.0) / 54.0))
+                    sq_open = (self.squelch <= 0.02) or (norm >= self.squelch * 0.85)
+                    if sq_open != self.squelch_open:
+                        self.squelch_open = sq_open
+                        self._update_af_gate()
+                    self.on_level_cb(rms_db, norm, self.squelch_open)
+        elif t == Gst.MessageType.TAG:
+            tags = msg.parse_tag()
+            ok_t, title = tags.get_string("title")
+            ok_o, org = tags.get_string("organization")
+            txt = title if ok_t and title else (org if ok_o and org else "")
+            if txt:
+                self.on_meta_cb(txt.strip())
+        elif t == Gst.MessageType.ERROR:
+            err, _dbg = msg.parse_error()
+            self.on_status_cb(f"STREAM ERR: {err.message[:48]}")
+
+    # ---- Mode 1: Direct Web Stream (HTTP MP3/AAC/HLS) ----
+    def start_web_stream(self, url: str, title: str):
+        self.stop_pipeline()
+        self.on_status_cb(f"TUNING STREAM: {title[:44]}...")
+        pipe = Gst.Pipeline.new("rx_stream_pipe")
+        src = Gst.ElementFactory.make("uridecodebin", "urisrc")
+        src.set_property("uri", url)
+        pipe.add(src)
+        dsp_head = self._build_dsp_tail(pipe)
+
+        def on_pad_added(_el, pad):
+            caps = pad.get_current_caps() or pad.query_caps(None)
+            if caps and caps.get_size() > 0:
+                name = caps.get_structure(0).get_name()
+                if name.startswith("audio/"):
+                    sink_pad = dsp_head.get_static_pad("sink")
+                    if sink_pad and not sink_pad.is_linked():
+                        pad.link(sink_pad)
+                        GLib.idle_add(self.on_status_cb, f"LOCKED STREAM: {title[:46]}")
+
+        src.connect("pad-added", on_pad_added)
+        self._pipe = pipe
+        pipe.set_state(Gst.State.PLAYING)
+
+    # ---- Mode 2: Live 0-30 MHz KiwiSDR WebSocket Receiver ----
+    def _build_appsrc_pipeline(self, sample_rate: int = 12000):
+        pipe = Gst.Pipeline.new("rx_pcm_pipe")
+        appsrc = Gst.ElementFactory.make("appsrc", "pcmsrc")
+        appsrc.set_property("is-live", True)
+        appsrc.set_property("format", Gst.Format.TIME)
+        appsrc.set_property("do-timestamp", True)
+        appsrc.set_property(
+            "caps",
+            Gst.Caps.from_string(f"audio/x-raw,format=S16LE,channels=1,rate={sample_rate},layout=interleaved"),
+        )
+        pipe.add(appsrc)
+        dsp_head = self._build_dsp_tail(pipe)
+        appsrc.link(dsp_head)
+        self._pipe = pipe
+        self._appsrc = appsrc
+        pipe.set_state(Gst.State.PLAYING)
+
+    def _kiwi_mod_cmd(self, freq_khz: float, mode: str) -> str:
+        eff_khz = max(10.0, min(30000.0, freq_khz + (self.clarifier_khz if self.clar_enabled else 0.0)))
+        m = mode.upper()
+        if m == "USB":
+            return f"SET mod=usb low_cut=300 high_cut=2700 freq={eff_khz:.3f}"
+        if m == "LSB":
+            return f"SET mod=lsb low_cut=-2700 high_cut=-300 freq={eff_khz:.3f}"
+        if m == "CW":
+            return f"SET mod=cw low_cut=300 high_cut=900 freq={eff_khz:.3f}"
+        if m == "NFM":
+            return f"SET mod=nbfm low_cut=-6000 high_cut=6000 freq={eff_khz:.3f}"
+        return f"SET mod=am low_cut=-4500 high_cut=4500 freq={eff_khz:.3f}"
+
+    def retune_kiwi_live(self, freq_khz: float, mode: str):
+        if self._worker_thread and self._worker_thread.is_alive():
+            self._kiwi_cmd_q.put(self._kiwi_mod_cmd(freq_khz, mode))
+            nb_flag = 1 if self.nb_enabled else 0
+            self._kiwi_cmd_q.put(f"SET nb={nb_flag}")
+
+    def start_kiwisdr(self, freq_khz: float, mode: str, title: str):
+        self.stop_pipeline()
+        self._build_appsrc_pipeline(12000)
+
+        # Build candidate server order
+        if self.selected_kiwi_idx > 0 and self.selected_kiwi_idx <= len(self.kiwi_servers):
+            chosen = [self.kiwi_servers[self.selected_kiwi_idx - 1]] + self.kiwi_servers
+        else:
+            chosen = list(self.kiwi_servers)
+
+        stop_ev = self._worker_stop
+
+        def worker():
+            for base_url, srv_label in chosen:
+                if stop_ev.is_set():
+                    return
+                p = urllib.parse.urlparse(base_url)
+                host = p.hostname
+                port = p.port or 80
+                if not host:
+                    continue
+                GLib.idle_add(self.on_status_cb, f"CONNECTING HF SDR: {srv_label[:38]}...")
+                try:
+                    ts = int(time.time())
+                    sock = socket.create_connection((host, port), timeout=4.2)
+                    key = base64.b64encode(os.urandom(16)).decode("ascii")
+                    host_hdr = f"{host}:{port}" if p.port else host
+                    req = (
+                        f"GET /kiwi/{ts}/SND HTTP/1.1\r\n"
+                        f"Host: {host_hdr}\r\n"
+                        f"Upgrade: websocket\r\n"
+                        f"Connection: Upgrade\r\n"
+                        f"Sec-WebSocket-Key: {key}\r\n"
+                        f"Sec-WebSocket-Version: 13\r\n\r\n"
+                    )
+                    sock.sendall(req.encode("ascii"))
+                    hdr = b""
+                    while b"\r\n\r\n" not in hdr:
+                        ch = sock.recv(1024)
+                        if not ch:
+                            raise ConnectionError("EOF")
+                        hdr += ch
+                    if b"101" not in hdr.split(b"\r\n", 1)[0]:
+                        sock.close()
+                        continue
+
+                    def ws_send(txt: str):
+                        payload = txt.encode("utf-8")
+                        mask = os.urandom(4)
+                        masked = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
+                        ln = len(payload)
+                        frm = (
+                            struct.pack("!BB", 0x81, 0x80 | ln)
+                            if ln < 126
+                            else struct.pack("!BBH", 0x81, 0x80 | 126, ln)
+                        ) + mask + masked
+                        sock.sendall(frm)
+
+                    ws_send("SET auth t=kiwi p=")
+                    buf = hdr.split(b"\r\n\r\n", 1)[1]
+                    sock.settimeout(0.25)
+                    adpcm_state = [0, 0]
+                    tuned = False
+                    got_audio = False
+                    last_ka = time.time()
+                    connect_t0 = time.time()
+
+                    while not stop_ev.is_set():
+                        # Drain live retune commands
+                        while not self._kiwi_cmd_q.empty():
+                            cmd = self._kiwi_cmd_q.get_nowait()
+                            ws_send(cmd)
+
+                        now = time.time()
+                        if now - last_ka >= 4.5:
+                            ws_send("SET keepalive")
+                            last_ka = now
+                        if not got_audio and now - connect_t0 > 5.0:
+                            break  # Try next KiwiSDR if busy/redirected
+
+                        try:
+                            more = sock.recv(4096)
+                            if not more:
+                                break
+                            buf += more
+                        except socket.timeout:
+                            continue
+
+                        while len(buf) >= 2:
+                            b0, b1 = buf[0], buf[1]
+                            op = b0 & 0x0F
+                            ln = b1 & 0x7F
+                            off = 2
+                            if ln == 126:
+                                if len(buf) < 4:
+                                    break
+                                ln = struct.unpack("!H", buf[2:4])[0]
+                                off = 4
+                            elif ln == 127:
+                                if len(buf) < 10:
+                                    break
+                                ln = struct.unpack("!Q", buf[2:10])[0]
+                                off = 10
+                            if len(buf) < off + ln:
+                                break
+                            pkt = buf[off : off + ln]
+                            buf = buf[off + ln :]
+
+                            if op == 8:
+                                sock.close()
+                                got_audio = False
+                                break
+                            if pkt[:3] == b"MSG":
+                                txt = pkt[4:].decode("utf-8", "ignore")
+                                if "too_busy=" in txt and not txt.endswith("too_busy=0"):
+                                    buf = b""
+                                    raise ConnectionError("busy")
+                                m_sr = re.search(r"(?:audio_rate|sample_rate)=([\d.]+)", txt)
+                                if m_sr and not tuned:
+                                    rate = int(float(m_sr.group(1)))
+                                    if self._appsrc is not None:
+                                        self._appsrc.set_property(
+                                            "caps",
+                                            Gst.Caps.from_string(
+                                                f"audio/x-raw,format=S16LE,channels=1,rate={rate},layout=interleaved"
+                                            ),
+                                        )
+                                    ws_send(f"SET AR OK in={rate} out=44100")
+                                    ws_send(self._kiwi_mod_cmd(freq_khz, mode))
+                                    ws_send("SET agc=1 hang=0 thresh=-100 slope=6 decay=500 manGain=50")
+                                    ws_send("SET ident_user=dtRadio")
+                                    ws_send("SET compression=1")
+                                    tuned = True
+                            elif pkt[:3] == b"SND" and len(pkt) > 10:
+                                flags = pkt[3]
+                                smeter_raw = struct.unpack(">H", pkt[8:10])[0]
+                                dbm = 0.1 * smeter_raw - 127.0
+                                raw_audio = pkt[10:]
+                                if flags & 0x10:
+                                    pcm = decode_ima_adpcm(raw_audio, adpcm_state)
+                                elif flags & 0x80:
+                                    pcm = raw_audio
+                                else:
+                                    # Big-endian S16 -> Little-endian S16
+                                    nsamp = len(raw_audio) // 2
+                                    arr = array.array("h")
+                                    arr.frombytes(raw_audio[: nsamp * 2])
+                                    arr.byteswap()
+                                    pcm = arr.tobytes()
+
+                                if self._appsrc is not None and pcm:
+                                    gbuf = Gst.Buffer.new_wrapped(pcm)
+                                    self._appsrc.emit("push-buffer", gbuf)
+                                if not got_audio:
+                                    got_audio = True
+                                    GLib.idle_add(self.on_meta_cb, f"RX via {srv_label}")
+                                    GLib.idle_add(self.on_status_cb, f"LIVE HF SDR ({dbm:.0f} dBm) — {srv_label[:34]}")
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    if got_audio and stop_ev.is_set():
+                        return
+                except Exception:
+                    continue
+            if not stop_ev.is_set():
+                GLib.idle_add(self.on_status_cb, "ALL KIWISDR SLOTS BUSY — SELECT ANOTHER KIWI RX OR WEB STREAM")
+
+        self._worker_thread = threading.Thread(target=worker, daemon=True)
+        self._worker_thread.start()
+
+    # ---- Mode 3: Local USB RTL-SDR (`rtl_fm`) Engine ----
+    def start_rtlsdr(self, freq_khz: float, mode: str, title: str):
+        self.stop_pipeline()
+        ok_hw, msg = detect_rtlsdr_status()
+        if not ok_hw:
+            self.on_status_cb(f"RTL-SDR STANDBY: {msg}")
+            self.on_meta_cb("USB RTL-SDR slot ready — connect RTL2832U dongle anytime")
+            return
+
+        rate = 24000
+        self._build_appsrc_pipeline(rate)
+        m_map = {"NFM": "fm", "AM": "am", "USB": "usb", "LSB": "lsb", "CW": "usb"}
+        rtl_m = m_map.get(mode.upper(), "fm")
+        eff_hz = int((freq_khz + (self.clarifier_khz if self.clar_enabled else 0.0)) * 1000.0)
+        sq_lvl = int(self.squelch * 120)
+        cmd = [
+            "rtl_fm",
+            "-f", str(eff_hz),
+            "-M", rtl_m,
+            "-s", str(rate),
+            "-r", str(rate),
+            "-l", str(sq_lvl),
+            "-",
+        ]
+        stop_ev = self._worker_stop
+
+        def rtl_worker():
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                self._rtl_proc = proc
+                GLib.idle_add(self.on_status_cb, f"USB RTL-SDR ACTIVE: {freq_khz/1000.0:.4f} MHz ({mode})")
+                while not stop_ev.is_set():
+                    chunk = proc.stdout.read(2048) if proc.stdout else b""
+                    if not chunk:
+                        break
+                    if self._appsrc is not None:
+                        self._appsrc.emit("push-buffer", Gst.Buffer.new_wrapped(chunk))
+            except Exception as e:
+                GLib.idle_add(self.on_status_cb, f"RTL-SDR ERR: {e}")
+
+        self._worker_thread = threading.Thread(target=rtl_worker, daemon=True)
+        self._worker_thread.start()
+
+
+# ---------------------------------------------------------------------------
+# Main dtRadio Vintage Communications Receiver Window
+# ---------------------------------------------------------------------------
+class DtRadioWindow(Gtk.Window):
+    def __init__(self, self_test: bool = False):
+        super().__init__(title="dtRadio — Communications Receiver")
+        self.set_default_size(940, 560)
+        self.set_resizable(True)
+        self._self_test = self_test
+
+        icon_p = HOME / ".dt" / "icons" / "dtradio.pm"
+        if icon_p.is_file():
+            try:
+                self.set_icon_from_file(str(icon_p))
+            except Exception:
+                pass
+
+        chrome, sel, well = load_cde_palette()
+        prov = Gtk.CssProvider()
+        prov.load_from_data(build_receiver_css(chrome, sel, well))
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        # Receiver state
+        self.freq_khz = 10000.0
+        self.mode = "AM"
+        self.source_kind = "kiwi"  # "kiwi" | "stream" | "rtlsdr"
+        self.current_url = ""
+        self.station_title = "WWV 10.000 MHz — NIST Atomic Time"
+        self.live_meta = ""
+        self.solar_badge = "SOLAR --"
+        self.step_khz = 1.0
+        self.dial_locked = False
+        self._vfo_angle = 0.0
+        self._vfo_dragging = False
+        self._vfo_last_ang = 0.0
+
+        # Ballistic S-meter state
+        self.target_s_norm = 0.06
+        self.needle_norm = 0.06
+        self.peak_db = -65.0
+        self.noaa_cycle_idx = 0
+        self.fema_cycle_idx = 0
+        self.active_mem_idx = -1
+        self.flash_vfd_msg = ""
+        self.flash_until = 0.0
+
+        self.memories = self._load_memories()
+        self.engine = ReceiverAudioEngine(self._on_audio_level, self._on_stream_meta, self._set_status)
+
+        self._updating_combos = False
+        self._build_ui()
+        self._load_saved_state()
+
+        # 30 fps S-meter ballistic needle & VFD animation loop
+        GLib.timeout_add(33, self._tick_meter_and_vfd)
+        # Background discovery of public KiwiSDRs + NOAA Solar SFI/Kp
+        threading.Thread(target=self._bg_fetch_kiwis_and_solar, daemon=True).start()
+
+        self.connect("destroy", self._on_destroy)
+
+        if self._self_test:
+            GLib.timeout_add(350, self._run_self_test, 0)
+        else:
+            # Tune initial channel immediately
+            GLib.idle_add(self._tune_current)
+
+    # ---- Persistence ----
+    def _load_memories(self) -> list[dict]:
+        if MEM_FILE.is_file():
+            try:
+                data = json.loads(MEM_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, list) and len(data) == 12:
+                    return data
+            except Exception:
+                pass
+        return [dict(m) for m in DEFAULT_MEMORIES]
+
+    def _save_memories(self):
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        MEM_FILE.write_text(json.dumps(self.memories, indent=2), encoding="utf-8")
+
+    def _load_saved_state(self):
+        if STATE_FILE.is_file():
+            try:
+                st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+                self.freq_khz = float(st.get("freq_khz", self.freq_khz))
+                self.mode = str(st.get("mode", self.mode))
+                self.source_kind = str(st.get("source", self.source_kind))
+                self.current_url = str(st.get("url", self.current_url))
+                self.station_title = str(st.get("title", self.station_title))
+                self.knob_af.set_value(float(st.get("af_gain", 0.78)), notify=True)
+                self.knob_rf.set_value(float(st.get("rf_gain", 0.80)), notify=True)
+                self.knob_sq.set_value(float(st.get("squelch", 0.0)), notify=True)
+                self.knob_if.set_value(float(st.get("if_width", 0.68)), notify=True)
+                self.knob_tone.set_value(float(st.get("tone", 0.60)), notify=True)
+                self._sync_mode_buttons()
+            except Exception:
+                pass
+
+    def _save_state(self):
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            st = {
+                "freq_khz": self.freq_khz,
+                "mode": self.mode,
+                "source": self.source_kind,
+                "url": self.current_url,
+                "title": self.station_title,
+                "af_gain": self.knob_af.value,
+                "rf_gain": self.knob_rf.value,
+                "squelch": self.knob_sq.value,
+                "if_width": self.knob_if.value,
+                "tone": self.knob_tone.value,
+            }
+            STATE_FILE.write_text(json.dumps(st, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    # ---- UI Construction ----
+    def _build_ui(self):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(outer)
+
+        cab = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        cab.get_style_context().add_class("rx-cabinet")
+        outer.pack_start(cab, True, True, 0)
+
+        # 1. Top Instrument Deck: Analog S-Meter + Fluorescent VFD + Vernier Scale + Spun VFO Wheel
+        self.deck_area = Gtk.DrawingArea()
+        self.deck_area.set_size_request(910, 196)
+        self.deck_area.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+            | Gdk.EventMask.SCROLL_MASK
+        )
+        self.deck_area.connect("draw", self._draw_instrument_deck)
+        self.deck_area.connect("button-press-event", self._on_deck_press)
+        self.deck_area.connect("button-release-event", self._on_deck_release)
+        self.deck_area.connect("motion-notify-event", self._on_deck_motion)
+        self.deck_area.connect("scroll-event", self._on_deck_scroll)
+        cab.pack_start(self.deck_area, True, True, 0)
+
+        # 2. Band / Channel / KiwiSDR Selector + Direct Orange FEMA & Blue NOAA Row
+        sel_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        sel_row.get_style_context().add_class("rx-strip")
+        cab.pack_start(sel_row, False, False, 0)
+
+        lbl_b = Gtk.Label(label="BAND")
+        lbl_b.get_style_context().add_class("rx-engraved")
+        sel_row.pack_start(lbl_b, False, False, 2)
+
+        self.bank_combo = Gtk.ComboBoxText()
+        for bname, _items in STATION_BANKS:
+            self.bank_combo.append_text(bname)
+        self.bank_combo.set_active(0)
+        self.bank_combo.connect("changed", self._on_bank_changed)
+        sel_row.pack_start(self.bank_combo, False, False, 0)
+
+        lbl_c = Gtk.Label(label="CH")
+        lbl_c.get_style_context().add_class("rx-engraved")
+        sel_row.pack_start(lbl_c, False, False, 2)
+
+        self.chan_combo = Gtk.ComboBoxText()
+        self.chan_combo.set_hexpand(True)
+        self.chan_combo.connect("changed", self._on_channel_changed)
+        sel_row.pack_start(self.chan_combo, True, True, 0)
+
+        lbl_k = Gtk.Label(label="SDR")
+        lbl_k.get_style_context().add_class("rx-engraved")
+        sel_row.pack_start(lbl_k, False, False, 2)
+
+        self.kiwi_combo = Gtk.ComboBoxText()
+        self.kiwi_combo.append_text("AUTO HF ANTENNA")
+        for _u, klbl in self.engine.kiwi_servers:
+            self.kiwi_combo.append_text(klbl[:28])
+        self.kiwi_combo.set_active(0)
+        self.kiwi_combo.connect("changed", self._on_kiwi_changed)
+        sel_row.pack_start(self.kiwi_combo, False, False, 0)
+
+        # Direct Orange Emergency/FEMA button & Blue NOAA button
+        self.btn_fema = Gtk.Button(label="⚠ FEMA / EMERG")
+        self.btn_fema.get_style_context().add_class("btn-fema")
+        self.btn_fema.set_tooltip_text("Direct Emergency / FEMA HF & Alert Stream (click again to step channels)")
+        self.btn_fema.connect("clicked", self._on_fema_clicked)
+        sel_row.pack_start(self.btn_fema, False, False, 2)
+
+        self.btn_noaa = Gtk.Button(label="NOAA WX")
+        self.btn_noaa.get_style_context().add_class("btn-noaa")
+        self.btn_noaa.set_tooltip_text("Direct 24/7 NOAA Weather Radio Stream (click again to cycle transmitters)")
+        self.btn_noaa.connect("clicked", self._on_noaa_clicked)
+        sel_row.pack_start(self.btn_noaa, False, False, 0)
+
+        # 3. Mode / Step / Hardware Latching Switch Bar
+        sw_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        sw_row.get_style_context().add_class("rx-strip")
+        cab.pack_start(sw_row, False, False, 0)
+
+        lbl_m = Gtk.Label(label="MODE")
+        lbl_m.get_style_context().add_class("rx-engraved")
+        sw_row.pack_start(lbl_m, False, False, 3)
+
+        self.mode_btns: dict[str, Gtk.Button] = {}
+        for m in ("AM", "USB", "LSB", "CW", "NFM"):
+            b = Gtk.Button(label=m)
+            b.connect("clicked", self._on_mode_clicked, m)
+            self.mode_btns[m] = b
+            sw_row.pack_start(b, False, False, 0)
+
+        sw_row.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 4)
+
+        lbl_st = Gtk.Label(label="STEP")
+        lbl_st.get_style_context().add_class("rx-engraved")
+        sw_row.pack_start(lbl_st, False, False, 2)
+
+        self.step_btns: dict[float, Gtk.Button] = {}
+        for st_khz, slbl in ((0.01, "10Hz"), (0.1, "100Hz"), (1.0, "1kHz"), (5.0, "5kHz")):
+            b = Gtk.Button(label=slbl)
+            b.connect("clicked", self._on_step_clicked, st_khz)
+            self.step_btns[st_khz] = b
+            sw_row.pack_start(b, False, False, 0)
+
+        btn_dn = Gtk.Button(label="◀")
+        btn_dn.connect("clicked", lambda _b: self._nudge_vfo(-self.step_khz))
+        sw_row.pack_start(btn_dn, False, False, 1)
+
+        btn_up = Gtk.Button(label="▶")
+        btn_up.connect("clicked", lambda _b: self._nudge_vfo(+self.step_khz))
+        sw_row.pack_start(btn_up, False, False, 0)
+
+        sw_row.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 4)
+
+        # Receiver DSP & Front-End Switches
+        self.btn_nb = self._make_latch_btn("NB", self._toggle_nb, "Noise Blanker (Impulse Spike Limiter)")
+        self.btn_anl = self._make_latch_btn("ANL", self._toggle_anl, "Auto Noise Limiter / Voice Bandpass")
+        self.btn_clar = self._make_latch_btn("CLAR", self._toggle_clar, "Clarifier (RIT / Passband Offset)")
+        self.btn_att = self._make_latch_btn("ATT", self._toggle_att, "-12 dB RF Attenuator")
+        self.btn_agc = self._make_latch_btn("AGC-S", self._toggle_agc, "Slow / Fast AGC & Meter Decay")
+        self.btn_lock = self._make_latch_btn("LOCK", self._toggle_lock, "VFO Dial Lock")
+        self.btn_mute = self._make_latch_btn("MUTE", self._toggle_mute, "Audio Mute")
+
+        for b in (self.btn_nb, self.btn_anl, self.btn_clar, self.btn_att, self.btn_agc, self.btn_lock, self.btn_mute):
+            sw_row.pack_start(b, False, False, 0)
+
+        self.btn_rec = Gtk.Button(label="● REC")
+        self.btn_rec.set_tooltip_text("Record WAV aircheck to ~/Music/dtRadio/")
+        self.btn_rec.connect("clicked", self._on_rec_clicked)
+        sw_row.pack_end(self.btn_rec, False, False, 0)
+
+        btn_rtl = Gtk.Button(label="RTL-SDR")
+        btn_rtl.set_tooltip_text("Switch to local USB RTL-SDR dongle input (24-1766 MHz)")
+        btn_rtl.connect("clicked", self._on_rtlsdr_btn)
+        sw_row.pack_end(btn_rtl, False, False, 2)
+
+        # 4. Six Machined Rotary Potentiometer Knobs Row
+        knob_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        knob_row.get_style_context().add_class("rx-strip")
+        cab.pack_start(knob_row, False, False, 0)
+
+        self.knob_af = RotaryKnob("AF GAIN", 0.78, 0.78, self._on_af_knob, lambda v: f"{int(v*100):d}%")
+        self.knob_rf = RotaryKnob("RF GAIN", 0.80, 0.80, self._on_rf_knob, lambda v: f"{int(v*100):d}%")
+        self.knob_sq = RotaryKnob("SQUELCH", 0.00, 0.00, self._on_sq_knob, lambda v: "OPEN" if v < 0.03 else f"S{int(1+v*8)}")
+        self.knob_clar = RotaryKnob("CLARIFIER", 0.50, 0.50, self._on_clar_knob, lambda v: f"{(v-0.5)*5.0:+.2f}k")
+        self.knob_if = RotaryKnob(
+            "IF WIDTH",
+            0.68,
+            0.68,
+            self._on_if_knob,
+            lambda v: f"{350.0*math.pow(33.0, v)/1000.0:.1f}k",
+        )
+        self.knob_tone = RotaryKnob("TONE", 0.60, 0.60, self._on_tone_knob, lambda v: f"{int((v-0.5)*20):+d}")
+
+        for kn in (self.knob_af, self.knob_rf, self.knob_sq, self.knob_clar, self.knob_if, self.knob_tone):
+            knob_row.pack_start(kn, True, True, 0)
+
+        # 5. 12-Channel Hold-to-Save Memory Bank (M01..M12)
+        mem_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        mem_row.get_style_context().add_class("rx-strip")
+        cab.pack_start(mem_row, False, False, 0)
+
+        lbl_mem = Gtk.Label(label="MEM")
+        lbl_mem.get_style_context().add_class("rx-engraved")
+        lbl_mem.set_tooltip_text("Click to recall; press & hold 0.65s to store current channel")
+        mem_row.pack_start(lbl_mem, False, False, 3)
+
+        self.mem_btns: list[Gtk.Button] = []
+        self._mem_hold_timer: dict[int, int] = {}
+        self._mem_held_fired: set[int] = set()
+
+        for idx in range(12):
+            mb = Gtk.Button()
+            mb.get_style_context().add_class("mem-btn")
+            mb.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK)
+            mb.connect("button-press-event", self._on_mem_press, idx)
+            mb.connect("button-release-event", self._on_mem_release, idx)
+            self.mem_btns.append(mb)
+            mem_row.pack_start(mb, True, True, 0)
+
+        self._refresh_memory_labels()
+        self._populate_channels_for_bank(0, tune=False)
+        self._sync_mode_buttons()
+        self._sync_step_buttons()
+
+        # 6. Bottom CDE Sunken Status Strip
+        st_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        st_bar.get_style_context().add_class("cde-status")
+        outer.pack_start(st_bar, False, False, 0)
+
+        self.status_lbl = Gtk.Label(label="READY")
+        self.status_lbl.set_xalign(0.0)
+        st_bar.pack_start(self.status_lbl, True, True, 0)
+
+        _, rtl_txt = detect_rtlsdr_status()
+        self.hw_lbl = Gtk.Label(label=rtl_txt)
+        self.hw_lbl.set_xalign(1.0)
+        st_bar.pack_end(self.hw_lbl, False, False, 0)
+
+    def _make_latch_btn(self, text: str, cb, tip: str) -> Gtk.Button:
+        b = Gtk.Button(label=text)
+        b.set_tooltip_text(tip)
+        b.connect("clicked", cb)
+        return b
+
+    def _set_btn_active(self, btn: Gtk.Button, active: bool):
+        ctx = btn.get_style_context()
+        if active:
+            ctx.add_class("sw-active")
+        else:
+            ctx.remove_class("sw-active")
+
+    # ---- Instrument Deck Drawing (S-Meter + Glowing VFD + Vernier Scale + VFO Wheel) ----
+    def _draw_instrument_deck(self, w, cr: cairo.Context):
+        alloc = w.get_allocation()
+        W, H = float(alloc.width), float(alloc.height)
+
+        # Recessed dark faceplate background
+        cr.rectangle(0, 0, W, H)
+        cr.set_source_rgb(0.12, 0.14, 0.17)
+        cr.fill()
+
+        pad = 8.0
+        sm_w = max(215.0, W * 0.26)
+        vfo_w = max(168.0, W * 0.19)
+        vfd_x = pad + sm_w + 8.0
+        vfd_w = max(260.0, W - vfd_x - vfo_w - pad - 8.0)
+
+        self._vfo_geom = (W - pad - vfo_w * 0.5, H * 0.5, min(vfo_w, H) * 0.41)
+
+        # ---- A. Warm Backlit Analog S-Meter ----
+        sx, sy, sw, sh = pad, pad, sm_w, H - 2 * pad
+        # Outer dark bezel
+        cr.rectangle(sx, sy, sw, sh)
+        cr.set_source_rgb(0.07, 0.08, 0.10)
+        cr.fill()
+        # Warm incandescent radial lamp glow
+        mx, my, mw, mh = sx + 6, sy + 6, sw - 12, sh - 12
+        glow = cairo.RadialGradient(mx + mw * 0.5, my + mh * 0.95, 8.0, mx + mw * 0.5, my + mh * 0.65, mw * 0.85)
+        glow.add_color_stop_rgb(0.0, 1.00, 0.94, 0.74)
+        glow.add_color_stop_rgb(0.65, 0.97, 0.85, 0.55)
+        glow.add_color_stop_rgb(1.0, 0.84, 0.69, 0.38)
+        cr.rectangle(mx, my, mw, mh)
+        cr.set_source(glow)
+        cr.fill()
+
+        piv_x = mx + mw * 0.5
+        piv_y = my + mh + 26.0
+        arc_r = min(mw * 0.62, mh * 0.98)
+        a0 = math.radians(-128.0)
+        a1 = math.radians(-52.0)
+        a_s9 = a0 + 0.58 * (a1 - a0)
+
+        # S1..S9 black arc
+        cr.set_line_width(2.2)
+        cr.set_source_rgb(0.14, 0.12, 0.10)
+        cr.arc(piv_x, piv_y, arc_r, a0, a_s9)
+        cr.stroke()
+        # +10..+60 dB red arc
+        cr.set_line_width(3.2)
+        cr.set_source_rgb(0.78, 0.14, 0.12)
+        cr.arc(piv_x, piv_y, arc_r, a_s9, a1)
+        cr.stroke()
+
+        marks = [
+            (0.00, "1", False),
+            (0.14, "3", False),
+            (0.29, "5", False),
+            (0.43, "7", False),
+            (0.58, "9", False),
+            (0.72, "+20", True),
+            (0.86, "+40", True),
+            (1.00, "+60", True),
+        ]
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(9.5)
+        for frac, lbl, is_red in marks:
+            ang = a0 + frac * (a1 - a0)
+            cr.set_source_rgb(0.78, 0.14, 0.12) if is_red else cr.set_source_rgb(0.14, 0.12, 0.10)
+            cr.set_line_width(1.7)
+            cr.move_to(piv_x + (arc_r - 5) * math.cos(ang), piv_y + (arc_r - 5) * math.sin(ang))
+            cr.line_to(piv_x + (arc_r + 6) * math.cos(ang), piv_y + (arc_r + 6) * math.sin(ang))
+            cr.stroke()
+            tx = piv_x + (arc_r + 16) * math.cos(ang)
+            ty = piv_y + (arc_r + 16) * math.sin(ang)
+            ext = cr.text_extents(lbl)
+            cr.move_to(tx - ext.width * 0.5, ty + ext.height * 0.4)
+            cr.show_text(lbl)
+
+        # Minor S-unit ticks
+        cr.set_line_width(1.0)
+        cr.set_source_rgb(0.22, 0.18, 0.14)
+        for i in range(25):
+            ang = a0 + (i / 24.0) * (a1 - a0)
+            cr.move_to(piv_x + (arc_r - 2.5) * math.cos(ang), piv_y + (arc_r - 2.5) * math.sin(ang))
+            cr.line_to(piv_x + (arc_r + 2.5) * math.cos(ang), piv_y + (arc_r + 2.5) * math.sin(ang))
+            cr.stroke()
+
+        # 'S-UNITS / dB' legend
+        cr.set_font_size(9.0)
+        cr.set_source_rgb(0.24, 0.19, 0.12)
+        cr.move_to(mx + 8, my + 15)
+        cr.show_text("SIGNAL")
+        if not self.engine.squelch_open:
+            cr.set_source_rgb(0.75, 0.22, 0.12)
+            cr.move_to(mx + mw - 42, my + 15)
+            cr.show_text("SQL")
+
+        # Ballistic S-Meter Needle (clipped inside meter window)
+        cr.save()
+        cr.rectangle(mx, my, mw, mh)
+        cr.clip()
+        n_ang = a0 + max(0.0, min(1.0, self.needle_norm)) * (a1 - a0)
+        # Subtle needle shadow
+        cr.set_line_width(2.2)
+        cr.set_source_rgba(0.1, 0.08, 0.05, 0.35)
+        cr.move_to(piv_x + 2.0, piv_y + 2.0)
+        cr.line_to(piv_x + 2.0 + (arc_r + 9) * math.cos(n_ang), piv_y + 2.0 + (arc_r + 9) * math.sin(n_ang))
+        cr.stroke()
+        # Crisp crimson/black needle
+        cr.set_line_width(2.0)
+        cr.set_source_rgb(0.76, 0.11, 0.11)
+        cr.move_to(piv_x, piv_y)
+        cr.line_to(piv_x + (arc_r + 9) * math.cos(n_ang), piv_y + (arc_r + 9) * math.sin(n_ang))
+        cr.stroke()
+        # Pivot cap
+        cr.arc(piv_x, my + mh + 4.0, 12.0, 0, 2 * math.pi)
+        cr.set_source_rgb(0.16, 0.16, 0.18)
+        cr.fill()
+        cr.restore()
+
+        # ---- B. Glowing Vacuum Fluorescent Display (VFD) + Vernier Dial ----
+        vy, vh = pad, H - 2 * pad
+        cr.rectangle(vfd_x, vy, vfd_w, vh)
+        cr.set_source_rgb(0.03, 0.07, 0.07)
+        cr.fill()
+        # Recessed glass bevel
+        cr.set_line_width(2.0)
+        cr.set_source_rgb(0.01, 0.03, 0.03)
+        cr.move_to(vfd_x, vy + vh)
+        cr.line_to(vfd_x, vy)
+        cr.line_to(vfd_x + vfd_w, vy)
+        cr.stroke()
+        cr.set_source_rgb(0.32, 0.37, 0.45)
+        cr.move_to(vfd_x, vy + vh)
+        cr.line_to(vfd_x + vfd_w, vy + vh)
+        cr.line_to(vfd_x + vfd_w, vy)
+        cr.stroke()
+
+        # Top VFD Annunciator badges
+        src_badge = {"kiwi": "HF KIWISDR", "stream": "WEB STREAM", "rtlsdr": "USB RTL-SDR"}.get(self.source_kind, "RX")
+        badges = [
+            (src_badge, True, (0.24, 0.98, 0.84)),
+            ("NB", self.engine.nb_enabled, (0.36, 0.98, 0.62)),
+            ("ANL", self.engine.anl_enabled, (0.36, 0.98, 0.62)),
+            ("ATT", self.engine.att_enabled, (1.00, 0.72, 0.25)),
+            ("CLAR", self.engine.clar_enabled, (1.00, 0.72, 0.25)),
+            ("LOCK", self.dial_locked, (1.00, 0.45, 0.32)),
+            ("REC", self.engine.recording, (1.00, 0.30, 0.30)),
+        ]
+        bx = vfd_x + 12.0
+        cr.set_font_size(9.5)
+        for btxt, bon, col in badges:
+            ext = cr.text_extents(btxt)
+            if bon:
+                cr.set_source_rgba(col[0], col[1], col[2], 0.18)
+                cr.rectangle(bx - 4, vy + 7, ext.width + 8, 15)
+                cr.fill()
+                cr.set_source_rgb(*col)
+            else:
+                cr.set_source_rgba(0.16, 0.34, 0.32, 0.48)
+            cr.move_to(bx, vy + 18)
+            cr.show_text(btxt)
+            bx += ext.width + 13.0
+
+        # Solar SFI/Kp badge at top-right of VFD
+        cr.set_source_rgb(0.35, 0.85, 0.78)
+        sext = cr.text_extents(self.solar_badge)
+        cr.move_to(vfd_x + vfd_w - sext.width - 12, vy + 18)
+        cr.show_text(self.solar_badge)
+
+        # Main Glowing VFD Frequency Digits
+        eff_khz = self.freq_khz + (self.engine.clarifier_khz if self.engine.clar_enabled else 0.0)
+        if eff_khz >= 30000.0:
+            freq_str = f"{eff_khz / 1000.0:07.3f}"
+            unit_str = "MHz"
+        else:
+            mhz = int(eff_khz) // 1000
+            rem = eff_khz - mhz * 1000.0
+            freq_str = f"{mhz:2d}.{rem:06.2f}"
+            unit_str = "kHz"
+
+        cr.select_font_face("DejaVu Sans Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(36.0)
+        # Phosphor halo glow
+        cr.set_source_rgba(0.18, 0.98, 0.84, 0.18)
+        cr.move_to(vfd_x + 17.5, vy + 66.5)
+        cr.show_text(freq_str)
+        # Crisp bright VFD segments
+        cr.set_source_rgb(0.26, 0.99, 0.86)
+        cr.move_to(vfd_x + 16.0, vy + 65.0)
+        cr.show_text(freq_str)
+
+        f_ext = cr.text_extents(freq_str)
+        cr.set_font_size(13.0)
+        cr.set_source_rgb(0.45, 0.90, 0.82)
+        cr.move_to(vfd_x + 24.0 + f_ext.width, vy + 65.0)
+        cr.show_text(unit_str)
+
+        # Amber Mode Pill on right of frequency
+        cr.set_font_size(15.0)
+        m_ext = cr.text_extents(self.mode)
+        mx0 = vfd_x + vfd_w - m_ext.width - 24.0
+        cr.set_source_rgba(1.0, 0.68, 0.18, 0.18)
+        cr.rectangle(mx0 - 7, vy + 43, m_ext.width + 14, 24)
+        cr.fill()
+        cr.set_source_rgb(1.0, 0.74, 0.24)
+        cr.move_to(mx0, vy + 61)
+        cr.show_text(self.mode)
+
+        # Station / Live Alert / Flash Memory Sub-line
+        cr.set_font_size(10.5)
+        now = time.time()
+        if now < self.flash_until and self.flash_vfd_msg:
+            cr.set_source_rgb(1.0, 0.76, 0.24)
+            line1 = self.flash_vfd_msg
+        else:
+            cr.set_source_rgb(0.58, 0.96, 0.88)
+            line1 = self.station_title
+
+        cr.save()
+        cr.rectangle(vfd_x + 12, vy + 72, vfd_w - 24, 38)
+        cr.clip()
+        cr.move_to(vfd_x + 14, vy + 86)
+        cr.show_text(line1[:58])
+        if self.live_meta:
+            cr.set_font_size(9.2)
+            cr.set_source_rgb(0.38, 0.78, 0.72)
+            cr.move_to(vfd_x + 14, vy + 102)
+            cr.show_text(self.live_meta[:66])
+        cr.restore()
+
+        # Illuminated Analog Vernier Slide-Rule Scale at bottom of VFD
+        sy0 = vy + vh - 46.0
+        sh0 = 38.0
+        cr.save()
+        cr.rectangle(vfd_x + 8, sy0, vfd_w - 16, sh0)
+        cr.clip()
+        cr.set_source_rgb(0.05, 0.11, 0.11)
+        cr.rectangle(vfd_x + 8, sy0, vfd_w - 16, sh0)
+        cr.fill()
+
+        mid_x = vfd_x + vfd_w * 0.5
+        px_per_khz = 14.0
+        base_k = int(math.floor(eff_khz))
+        frac_k = eff_khz - base_k
+        cr.set_font_size(8.8)
+        for dk in range(-22, 23):
+            k_val = base_k + dk
+            if k_val < 0:
+                continue
+            tx = mid_x + (dk - frac_k) * px_per_khz
+            if tx < vfd_x + 6 or tx > vfd_x + vfd_w - 6:
+                continue
+            if k_val % 10 == 0:
+                th = 15.0
+                cr.set_line_width(1.6)
+                cr.set_source_rgb(0.36, 0.96, 0.84)
+                lbl_k = f"{k_val}" if k_val < 30000 else f"{k_val/1000.0:.2f}"
+                ext_k = cr.text_extents(lbl_k)
+                cr.move_to(tx - ext_k.width * 0.5, sy0 + 33.0)
+                cr.show_text(lbl_k)
+            elif k_val % 5 == 0:
+                th = 10.5
+                cr.set_line_width(1.2)
+                cr.set_source_rgb(0.26, 0.74, 0.66)
+            else:
+                th = 6.5
+                cr.set_line_width(0.9)
+                cr.set_source_rgb(0.18, 0.52, 0.48)
+            cr.move_to(tx, sy0 + 3.0)
+            cr.line_to(tx, sy0 + 3.0 + th)
+            cr.stroke()
+
+        # Red illuminated center hairline cursor
+        cr.set_line_width(2.0)
+        cr.set_source_rgb(1.0, 0.28, 0.22)
+        cr.move_to(mid_x, sy0)
+        cr.line_to(mid_x, sy0 + sh0)
+        cr.stroke()
+        cr.restore()
+
+        # ---- C. Spun-Aluminum Main VFO Tuning Wheel ----
+        vcx, vcy, vr = self._vfo_geom
+        # Outer recessed bezel shadow
+        cr.arc(vcx + 2, vcy + 3, vr + 5, 0, 2 * math.pi)
+        cr.set_source_rgba(0.03, 0.04, 0.05, 0.85)
+        cr.fill()
+
+        # Knurled rubber grip ring
+        cr.arc(vcx, vcy, vr + 4, 0, 2 * math.pi)
+        cr.set_source_rgb(0.14, 0.16, 0.20)
+        cr.fill()
+        cr.set_line_width(1.4)
+        cr.set_source_rgb(0.36, 0.40, 0.48)
+        for i in range(36):
+            ang = self._vfo_angle + i * (2 * math.pi / 36.0)
+            cr.move_to(vcx + (vr + 0.5) * math.cos(ang), vcy + (vr + 0.5) * math.sin(ang))
+            cr.line_to(vcx + (vr + 4.0) * math.cos(ang), vcy + (vr + 4.0) * math.sin(ang))
+            cr.stroke()
+
+        # Brushed aluminum flywheel face
+        vpat = cairo.LinearGradient(vcx - vr, vcy - vr, vcx + vr, vcy + vr)
+        vpat.add_color_stop_rgb(0.0, 0.88, 0.90, 0.95)
+        vpat.add_color_stop_rgb(0.45, 0.58, 0.62, 0.70)
+        vpat.add_color_stop_rgb(1.0, 0.30, 0.34, 0.41)
+        cr.arc(vcx, vcy, vr - 1.0, 0, 2 * math.pi)
+        cr.set_source(vpat)
+        cr.fill()
+
+        # Inner concentric machined ring
+        cr.set_line_width(1.2)
+        cr.set_source_rgba(0.20, 0.23, 0.28, 0.7)
+        cr.arc(vcx, vcy, vr * 0.70, 0, 2 * math.pi)
+        cr.stroke()
+
+        # Orbiting finger dimple
+        dim_r = vr * 0.53
+        dx = vcx + dim_r * math.cos(self._vfo_angle)
+        dy = vcy + dim_r * math.sin(self._vfo_angle)
+        dpat = cairo.RadialGradient(dx - 3, dy - 3, 1.5, dx, dy, vr * 0.22)
+        dpat.add_color_stop_rgb(0.0, 0.16, 0.18, 0.22)
+        dpat.add_color_stop_rgb(1.0, 0.42, 0.46, 0.54)
+        cr.arc(dx, dy, vr * 0.21, 0, 2 * math.pi)
+        cr.set_source(dpat)
+        cr.fill()
+
+        cr.set_font_size(9.0)
+        cr.set_source_rgb(0.78, 0.83, 0.90)
+        v_lbl = "MAIN VFO"
+        v_ext = cr.text_extents(v_lbl)
+        cr.move_to(vcx - v_ext.width * 0.5, vy + vh - 2.0)
+        cr.show_text(v_lbl)
+        return False
+
+    # ---- VFO Wheel Mouse & Scroll Interaction ----
+    def _on_deck_press(self, _w, ev):
+        if ev.button == 1 and hasattr(self, "_vfo_geom"):
+            vcx, vcy, vr = self._vfo_geom
+            if math.hypot(ev.x - vcx, ev.y - vcy) <= vr + 12:
+                self._vfo_dragging = True
+                self._vfo_last_ang = math.atan2(ev.y - vcy, ev.x - vcx)
+                return True
+        return False
+
+    def _on_deck_release(self, _w, _ev):
+        self._vfo_dragging = False
+        return False
+
+    def _on_deck_motion(self, _w, ev):
+        if self._vfo_dragging and hasattr(self, "_vfo_geom"):
+            vcx, vcy, _vr = self._vfo_geom
+            ang = math.atan2(ev.y - vcy, ev.x - vcx)
+            da = ang - self._vfo_last_ang
+            while da > math.pi:
+                da -= 2 * math.pi
+            while da < -math.pi:
+                da += 2 * math.pi
+            self._vfo_last_ang = ang
+            if not self.dial_locked:
+                self._vfo_angle += da
+                steps = da / (math.pi / 14.0)
+                self._nudge_vfo(steps * self.step_khz)
+            return True
+        return False
+
+    def _on_deck_scroll(self, _w, ev):
+        if self.dial_locked:
+            return True
+        if ev.direction == Gdk.ScrollDirection.UP:
+            self._vfo_angle += 0.22
+            self._nudge_vfo(+self.step_khz)
+        elif ev.direction == Gdk.ScrollDirection.DOWN:
+            self._vfo_angle -= 0.22
+            self._nudge_vfo(-self.step_khz)
+        elif ev.direction == Gdk.ScrollDirection.SMOOTH:
+            _, _dx, dy = ev.get_scroll_deltas()
+            self._vfo_angle -= dy * 0.18
+            self._nudge_vfo(-dy * self.step_khz)
+        return True
+
+    def _nudge_vfo(self, delta_khz: float):
+        if self.dial_locked:
+            self._flash_vfd("DIAL LOCKED")
+            return
+        # If currently on a web stream below 30 MHz and user spins VFO, seamlessly hand off to live HF KiwiSDR!
+        if self.source_kind == "stream" and self.freq_khz <= 30000.0:
+            self.source_kind = "kiwi"
+            self.station_title = "MANUAL VFO TUNING (LIVE HF SDR)"
+            self.live_meta = ""
+            self.freq_khz = max(10.0, min(30000.0, self.freq_khz + delta_khz))
+            self._tune_current()
+            return
+
+        if self.source_kind == "rtlsdr":
+            self.freq_khz = max(24000.0, min(1766000.0, self.freq_khz + delta_khz))
+            self._tune_current()
+        else:
+            self.freq_khz = max(10.0, min(30000.0, self.freq_khz + delta_khz))
+            self.engine.retune_kiwi_live(self.freq_khz, self.mode)
+        self.deck_area.queue_draw()
+
+    # ---- Station & Bank Selection ----
+    def _populate_channels_for_bank(self, bank_idx: int, tune: bool = True):
+        if bank_idx < 0 or bank_idx >= len(STATION_BANKS):
+            return
+        self._updating_combos = True
+        self.chan_combo.remove_all()
+        for item in STATION_BANKS[bank_idx][1]:
+            self.chan_combo.append_text(item["title"])
+        self.chan_combo.set_active(0)
+        self._updating_combos = False
+        if tune:
+            self._apply_channel_dict(STATION_BANKS[bank_idx][1][0])
+
+    def _on_bank_changed(self, combo):
+        if self._updating_combos:
+            return
+        idx = combo.get_active()
+        if idx >= 0:
+            self._populate_channels_for_bank(idx, tune=True)
+
+    def _on_channel_changed(self, combo):
+        if self._updating_combos:
+            return
+        b_idx = self.bank_combo.get_active()
+        c_idx = combo.get_active()
+        if b_idx >= 0 and c_idx >= 0 and c_idx < len(STATION_BANKS[b_idx][1]):
+            self.active_mem_idx = -1
+            self._refresh_memory_labels()
+            self._apply_channel_dict(STATION_BANKS[b_idx][1][c_idx])
+
+    def _on_kiwi_changed(self, combo):
+        idx = combo.get_active()
+        if idx >= 0:
+            self.engine.selected_kiwi_idx = idx
+            if self.source_kind == "kiwi":
+                self._tune_current()
+
+    def _apply_channel_dict(self, ch: dict):
+        self.station_title = ch["title"]
+        self.freq_khz = float(ch["freq_khz"])
+        self.mode = ch["mode"]
+        self.source_kind = ch["source"]
+        self.current_url = ch.get("url", "")
+        self.live_meta = ""
+        self._sync_mode_buttons()
+        self._tune_current()
+
+    def _tune_current(self):
+        self.deck_area.queue_draw()
+        self._save_state()
+        if self.source_kind == "stream" and self.current_url:
+            self.engine.start_web_stream(self.current_url, self.station_title)
+        elif self.source_kind == "rtlsdr":
+            self.engine.start_rtlsdr(self.freq_khz, self.mode, self.station_title)
+        else:
+            self.engine.start_kiwisdr(self.freq_khz, self.mode, self.station_title)
+
+    # ---- Direct Orange [FEMA / EMERG] & Blue [NOAA WX] Buttons ----
+    def _on_noaa_clicked(self, _btn):
+        noaa_bank_idx = 3
+        noaa_list = STATION_BANKS[noaa_bank_idx][1]
+        ch = noaa_list[self.noaa_cycle_idx % len(noaa_list)]
+        self.noaa_cycle_idx = (self.noaa_cycle_idx + 1) % len(noaa_list)
+
+        self._updating_combos = True
+        self.bank_combo.set_active(noaa_bank_idx)
+        self.chan_combo.remove_all()
+        for item in noaa_list:
+            self.chan_combo.append_text(item["title"])
+        self.chan_combo.set_active((self.noaa_cycle_idx - 1) % len(noaa_list))
+        self._updating_combos = False
+
+        self.active_mem_idx = -1
+        self._refresh_memory_labels()
+        self._flash_vfd("NOAA ALL-HAZARDS WX")
+        self._apply_channel_dict(ch)
+
+    def _on_fema_clicked(self, _btn):
+        fema_bank_idx = 4
+        fema_list = STATION_BANKS[fema_bank_idx][1]
+        ch = fema_list[self.fema_cycle_idx % len(fema_list)]
+        self.fema_cycle_idx = (self.fema_cycle_idx + 1) % len(fema_list)
+
+        self._updating_combos = True
+        self.bank_combo.set_active(fema_bank_idx)
+        self.chan_combo.remove_all()
+        for item in fema_list:
+            self.chan_combo.append_text(item["title"])
+        self.chan_combo.set_active((self.fema_cycle_idx - 1) % len(fema_list))
+        self._updating_combos = False
+
+        self.active_mem_idx = -1
+        self._refresh_memory_labels()
+        self._flash_vfd("⚠ EMERGENCY / FEMA FEED")
+        self._apply_channel_dict(ch)
+        threading.Thread(target=self._bg_fetch_fema_and_eas_alerts, daemon=True).start()
+
+    def _on_rtlsdr_btn(self, _btn):
+        rtl_bank_idx = 6
+        self._updating_combos = True
+        self.bank_combo.set_active(rtl_bank_idx)
+        self._updating_combos = False
+        self._populate_channels_for_bank(rtl_bank_idx, tune=True)
+
+    # ---- Mode / Step / Knobs / Switches ----
+    def _on_mode_clicked(self, _btn, m: str):
+        self.mode = m
+        self._sync_mode_buttons()
+        if self.source_kind == "kiwi":
+            self.engine.retune_kiwi_live(self.freq_khz, self.mode)
+        elif self.source_kind == "rtlsdr":
+            self._tune_current()
+        self.deck_area.queue_draw()
+
+    def _sync_mode_buttons(self):
+        for m, b in self.mode_btns.items():
+            self._set_btn_active(b, m == self.mode)
+
+    def _on_step_clicked(self, _btn, st_khz: float):
+        self.step_khz = st_khz
+        self._sync_step_buttons()
+
+    def _sync_step_buttons(self):
+        for st_khz, b in self.step_btns.items():
+            self._set_btn_active(b, abs(st_khz - self.step_khz) < 1e-6)
+
+    def _on_af_knob(self, v: float):
+        self.engine.af_gain = v
+        self.engine.apply_dsp_params()
+
+    def _on_rf_knob(self, v: float):
+        self.engine.rf_gain = v
+        self.engine.apply_dsp_params()
+
+    def _on_sq_knob(self, v: float):
+        self.engine.squelch = v
+        self.engine.apply_dsp_params()
+
+    def _on_clar_knob(self, v: float):
+        self.engine.clarifier_khz = (v - 0.5) * 5.0
+        if not self.engine.clar_enabled and abs(self.engine.clarifier_khz) > 0.03:
+            self.engine.clar_enabled = True
+            self._set_btn_active(self.btn_clar, True)
+        self.engine.apply_dsp_params()
+        if self.source_kind == "kiwi":
+            self.engine.retune_kiwi_live(self.freq_khz, self.mode)
+        self.deck_area.queue_draw()
+
+    def _on_if_knob(self, v: float):
+        self.engine.if_width_norm = v
+        self.engine.apply_dsp_params()
+
+    def _on_tone_knob(self, v: float):
+        self.engine.tone_norm = v
+        self.engine.apply_dsp_params()
+
+    def _toggle_nb(self, _b):
+        self.engine.nb_enabled = not self.engine.nb_enabled
+        self._set_btn_active(self.btn_nb, self.engine.nb_enabled)
+        self.engine.apply_dsp_params()
+        if self.source_kind == "kiwi":
+            self.engine.retune_kiwi_live(self.freq_khz, self.mode)
+        self.deck_area.queue_draw()
+
+    def _toggle_anl(self, _b):
+        self.engine.anl_enabled = not self.engine.anl_enabled
+        self._set_btn_active(self.btn_anl, self.engine.anl_enabled)
+        self.engine.apply_dsp_params()
+        self.deck_area.queue_draw()
+
+    def _toggle_clar(self, _b):
+        self.engine.clar_enabled = not self.engine.clar_enabled
+        self._set_btn_active(self.btn_clar, self.engine.clar_enabled)
+        self.engine.apply_dsp_params()
+        if self.source_kind == "kiwi":
+            self.engine.retune_kiwi_live(self.freq_khz, self.mode)
+        self.deck_area.queue_draw()
+
+    def _toggle_att(self, _b):
+        self.engine.att_enabled = not self.engine.att_enabled
+        self._set_btn_active(self.btn_att, self.engine.att_enabled)
+        self.engine.apply_dsp_params()
+        self.deck_area.queue_draw()
+
+    def _toggle_agc(self, _b):
+        self.engine.agc_slow = not self.engine.agc_slow
+        self._set_btn_active(self.btn_agc, self.engine.agc_slow)
+
+    def _toggle_lock(self, _b):
+        self.dial_locked = not self.dial_locked
+        self._set_btn_active(self.btn_lock, self.dial_locked)
+        self.deck_area.queue_draw()
+
+    def _toggle_mute(self, _b):
+        self.engine.muted = not self.engine.muted
+        self._set_btn_active(self.btn_mute, self.engine.muted)
+        self.engine._update_af_gate()
+
+    def _on_rec_clicked(self, _b):
+        on, path = self.engine.toggle_recording()
+        ctx = self.btn_rec.get_style_context()
+        if on:
+            ctx.add_class("btn-rec-on")
+            self._set_status(f"RECORDING WAV -> {path}")
+        else:
+            ctx.remove_class("btn-rec-on")
+            self._set_status(f"SAVED AIRCHECK -> {path}")
+        self.deck_area.queue_draw()
+
+    # ---- 12-Channel Hold-to-Save Memory Bank ----
+    def _refresh_memory_labels(self):
+        for i, mb in enumerate(self.mem_btns):
+            m = self.memories[i]
+            mb.set_label(f"M{i+1:02d}\n{m.get('label', 'MEM')[:7]}")
+            mb.set_tooltip_text(f"M{i+1:02d}: {m.get('title', '')}\n(Click: Recall | Hold 0.65s: Save Current)")
+            ctx = mb.get_style_context()
+            if i == self.active_mem_idx:
+                ctx.add_class("mem-active")
+            else:
+                ctx.remove_class("mem-active")
+
+    def _on_mem_press(self, _w, ev, idx: int):
+        if ev.button != 1:
+            return False
+        self._mem_held_fired.discard(idx)
+        tid = GLib.timeout_add(650, self._store_memory_on_hold, idx)
+        self._mem_hold_timer[idx] = tid
+        return False
+
+    def _store_memory_on_hold(self, idx: int):
+        self._mem_hold_timer.pop(idx, None)
+        self._mem_held_fired.add(idx)
+        short = f"{self.freq_khz/1000.0:.2f}M" if self.freq_khz >= 30000 else f"{int(self.freq_khz)}k"
+        self.memories[idx] = {
+            "label": short[:7],
+            "title": self.station_title,
+            "freq_khz": self.freq_khz,
+            "mode": self.mode,
+            "source": self.source_kind,
+            "url": self.current_url,
+        }
+        self.active_mem_idx = idx
+        self._save_memories()
+        self._refresh_memory_labels()
+        self._flash_vfd(f"★ MEMORY M{idx+1:02d} STORED ({short})")
+        self._set_status(f"STORED FAVORITE TO M{idx+1:02d}: {self.station_title[:46]}")
+        return False
+
+    def _on_mem_release(self, _w, ev, idx: int):
+        if ev.button != 1:
+            return False
+        tid = self._mem_hold_timer.pop(idx, None)
+        if tid is not None:
+            GLib.source_remove(tid)
+        if idx in self._mem_held_fired:
+            self._mem_held_fired.discard(idx)
+            return True
+        self.active_mem_idx = idx
+        self._refresh_memory_labels()
+        self._apply_channel_dict(self.memories[idx])
+        return False
+
+    # ---- Telemetry, Alerts & S-Meter Ballistics ----
+    def _flash_vfd(self, msg: str, dur: float = 2.2):
+        self.flash_vfd_msg = msg
+        self.flash_until = time.time() + dur
+        self.deck_area.queue_draw()
+
+    def _on_audio_level(self, rms_db: float, norm: float, _sq_open: bool):
+        # Add realistic gentle HF atmospheric micro-flutter around RMS level
+        self.peak_db = rms_db
+        self.target_s_norm = max(0.04, min(0.98, norm * self.engine.rf_gain * (0.55 if self.engine.att_enabled else 1.05)))
+
+    def _on_stream_meta(self, txt: str):
+        self.live_meta = txt
+        self.deck_area.queue_draw()
+
+    def _set_status(self, txt: str):
+        self.status_lbl.set_text(txt)
+
+    def _tick_meter_and_vfd(self):
+        # Analog needle ballistics: fast attack, Fast/Slow AGC release
+        diff = self.target_s_norm - self.needle_norm
+        if diff > 0:
+            self.needle_norm += diff * 0.42
+        else:
+            decay = 0.08 if self.engine.agc_slow else 0.22
+            self.needle_norm += diff * decay
+        # Gentle decay toward noise floor if stream pauses
+        self.target_s_norm = max(0.03, self.target_s_norm * 0.96)
+        self.deck_area.queue_draw()
+        return True
+
+    def _bg_fetch_kiwis_and_solar(self):
+        # 1. Fetch NOAA SWPC Solar Flux & Kp Index
+        try:
+            sfi_raw = urllib.request.urlopen(
+                urllib.request.Request("https://services.swpc.noaa.gov/json/f107_cm_flux.json", headers={"User-Agent": UA}),
+                timeout=6.0,
+            ).read()
+            sfi_arr = json.loads(sfi_raw)
+            sfi_val = int(float(sfi_arr[-1].get("flux", 0))) if sfi_arr else 0
+
+            kp_raw = urllib.request.urlopen(
+                urllib.request.Request("https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json", headers={"User-Agent": UA}),
+                timeout=6.0,
+            ).read()
+            kp_arr = json.loads(kp_raw)
+            kp_val = kp_arr[-1][1] if len(kp_arr) > 1 else "?"
+            GLib.idle_add(self._set_solar_badge, f"SFI {sfi_val} · Kp {kp_val}")
+        except Exception:
+            pass
+
+        # 2. Fetch live open KiwiSDRs from rx.linkfanel.net
+        try:
+            js = urllib.request.urlopen(
+                urllib.request.Request("http://rx.linkfanel.net/kiwisdr_com.js", headers={"User-Agent": UA}),
+                timeout=9.0,
+            ).read().decode("utf-8", errors="ignore")
+            entries = re.findall(r'\{[^{}]*"url"\s*:\s*"http://[^"]+"[^{}]*\}', js)
+            found: list[tuple[int, str, str]] = []
+            for raw in entries:
+                try:
+                    o = json.loads(raw)
+                except Exception:
+                    continue
+                u = o.get("url", "")
+                if ".proxy.kiwisdr.com" in u and not re.search(r":\d+$", u):
+                    continue  # Avoid HTTP 307 redirects on port-80 proxy aliases
+                users = int(o.get("users", 99))
+                umax = int(o.get("users_max", 0))
+                if o.get("offline") == "no" and 0 <= users < umax <= 12:
+                    loc = o.get("loc", "")
+                    nm = o.get("name", "")
+                    prio = 100 if any(k in (loc + " " + nm).upper() for k in ("USA", ", US", "CANADA", "ONTARIO", "UTAH", "TEXAS", "MA", "WA", "VA", "NY", "CA")) else 10
+                    found.append((prio + (umax - users), u, f"{nm[:22]} ({users}/{umax})"))
+            found.sort(reverse=True)
+            merged = list(SEED_KIWISDRS)
+            seen_u = {u for u, _ in merged}
+            for _sc, u, lbl in found[:24]:
+                if u not in seen_u:
+                    seen_u.add(u)
+                    merged.append((u, lbl))
+            GLib.idle_add(self._update_kiwi_combo, merged)
+        except Exception:
+            pass
+
+    def _set_solar_badge(self, txt: str):
+        self.solar_badge = txt
+        self.deck_area.queue_draw()
+
+    def _update_kiwi_combo(self, servers: list[tuple[str, str]]):
+        self.engine.kiwi_servers = servers
+        cur = self.kiwi_combo.get_active()
+        self.kiwi_combo.remove_all()
+        self.kiwi_combo.append_text("AUTO HF ANTENNA")
+        for _u, lbl in servers:
+            self.kiwi_combo.append_text(lbl[:28])
+        self.kiwi_combo.set_active(max(0, cur))
+
+    def _bg_fetch_fema_and_eas_alerts(self):
+        parts = []
+        try:
+            req = urllib.request.Request(
+                "https://www.fema.gov/api/open/v2/DisasterDeclarationsSummaries?$orderby=declarationDate%20desc&$top=2",
+                headers={"User-Agent": UA, "Accept": "application/json"},
+            )
+            data = json.loads(urllib.request.urlopen(req, timeout=6.0).read())
+            for d in data.get("DisasterDeclarationsSummaries", [])[:2]:
+                st = d.get("state", "")
+                ttl = d.get("declarationTitle", "")
+                if st and ttl:
+                    parts.append(f"FEMA [{st}]: {ttl}")
+        except Exception:
+            pass
+        try:
+            req2 = urllib.request.Request(
+                "https://api.weather.gov/alerts/active?severity=Extreme,Severe&limit=2",
+                headers={"User-Agent": UA, "Accept": "application/geo+json"},
+            )
+            data2 = json.loads(urllib.request.urlopen(req2, timeout=6.0).read())
+            for feat in data2.get("features", [])[:2]:
+                hl = feat.get("properties", {}).get("headline", "")
+                if hl:
+                    parts.append(hl)
+        except Exception:
+            pass
+        if parts:
+            GLib.idle_add(self._on_stream_meta, "  •  ".join(parts))
+
+    # ---- Automated Self-Test Mode (--self-test) ----
+    def _run_self_test(self, step: int):
+        if step == 0:
+            self._on_noaa_clicked(self.btn_noaa)
+            GLib.timeout_add(900, self._run_self_test, 1)
+        elif step == 1:
+            self._on_fema_clicked(self.btn_fema)
+            GLib.timeout_add(900, self._run_self_test, 2)
+        elif step == 2:
+            # Test KiwiSDR live 10.000 MHz WWV tuning + Clarifier + NB
+            self._toggle_nb(self.btn_nb)
+            self.knob_clar.set_value(0.55, notify=True)
+            self._apply_channel_dict(STATION_BANKS[0][1][0])
+            GLib.timeout_add(1400, self._run_self_test, 3)
+        else:
+            print("DTRADIO_SELF_TEST_OK")
+            sys.stdout.flush()
+            self.destroy()
+        return False
+
+    def _on_destroy(self, _w):
+        self._save_state()
+        self.engine.stop_pipeline()
+        Gtk.main_quit()
+
+
+def main():
+    self_test = "--self-test" in sys.argv[1:]
+    win = DtRadioWindow(self_test=self_test)
+    win.show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
